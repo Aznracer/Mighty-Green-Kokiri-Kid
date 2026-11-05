@@ -36,8 +36,7 @@ int main(void) { @autoreleasepool {
     uint8_t *mem = mmap(NULL, GB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (mem == MAP_FAILED) abort();
     uint64_t base = (uint64_t)(uintptr_t)mem;
     int pools0 = g_npool;
-    // each pool as a game that took its buffer address (nvnMemoryPoolGetBufferAddress): only such pools are in the raw global memory table (gmem_map_gpu)
-    mtl_pool_add(mem, GB); mtl_pool_buffer_addr(mem, GB);
+    mtl_pool_add(mem, GB);
     CHECK("no buffer until a lookup", g_npool == pools0 && g_nbig == 1);
     CHECK("overlapping buffers: barriers carry alias visibility", resource_vis() & MTL4VisibilityOptionResourceAlias);
     id<MTLBuffer> a = look(base + 100, 4096);
@@ -89,7 +88,7 @@ int main(void) { @autoreleasepool {
     CHECK("lookups take it", look(base + 900 * MB, 4096).length == GB);
     // A smaller pool is one buffer, and the removal of the large one takes all its entries
     uint8_t *small = mmap(NULL, 64 * MB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (small == MAP_FAILED) abort();
-    int n3 = g_npool; mtl_pool_add(small, 64 * MB); mtl_pool_buffer_addr(small, 64 * MB); CHECK("one entry", g_npool == n3 + 1 && g_nbig == 1);
+    int n3 = g_npool; mtl_pool_add(small, 64 * MB); CHECK("one entry", g_npool == n3 + 1 && g_nbig == 1);
     CHECK("its buffer is the whole pool", look((uint64_t)(uintptr_t)small + 10, 16).length == 64 * MB);
     mtl_pool_del(mem); mtl_drain();
     CHECK("no large pool left", g_nbig == 0);
@@ -99,7 +98,7 @@ int main(void) { @autoreleasepool {
     // More pools than DMSH_GMEM_MAP_ENTRIES (Ocarina of Time loads its save with up to about 4,500): each still has an entry, found by the search
     enum { MANY = 5000, PG = 16384 };
     uint8_t *many = mmap(NULL, (size_t)MANY * 2 * PG, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (many == MAP_FAILED) abort();
-    for (int i = 0; i < MANY; i++) { mtl_pool_add(many + (size_t)i * 2 * PG, PG); mtl_pool_buffer_addr(many + (size_t)i * 2 * PG, PG); }   // a page apart: a range each
+    for (int i = 0; i < MANY; i++) mtl_pool_add(many + (size_t)i * 2 * PG, PG);   // a page apart: a range each
     mtl_sub_begin(); CHECK("pool table rebuilt", gmem_map_gpu() != 0); finish();
     id<MTLBuffer> map = g_gmem_buf; unsigned cap = (unsigned)(map.length / DMSH_GMEM_MAP_ENTRY); const uint32_t *mw = map.contents;
     CHECK("the table grows to a power of two that holds every pool", cap >= MANY + 2 && !(cap & (cap - 1)) && cap < 2 * (MANY + 2) && mw[4] == cap);
