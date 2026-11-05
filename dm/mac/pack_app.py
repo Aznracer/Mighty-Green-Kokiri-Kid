@@ -349,7 +349,8 @@ def pack(a):
     if msl_dst.name.startswith('b-'): info['DMChain'] = msl_dst.name[2:]   # the library chain the app carries (a Vulkan or GL game's vk / gl has none)
     (c / 'Info.plist').write_bytes(plistlib.dumps(info))
     (c / 'PkgInfo').write_text('APPL????')
-    step(f'signing ({"ad-hoc" if a.sign == "-" else a.sign})'); sign(tmp, a.sign, codesign)
+    if a.sign == 'none': step('not signed (--sign none): the launcher and the host keep their linker signatures')
+    else: step(f'signing ({"ad-hoc" if a.sign == "-" else a.sign})'); sign(tmp, a.sign, codesign)
     had_old = out.exists()
     replace_app(tmp, out)
     key_tmp = key_file.with_name(key_file.name + '.partial')
@@ -386,7 +387,7 @@ def parse(argv):
     ap.add_argument('--title-id', required=True); ap.add_argument('--name', required=True)
     ap.add_argument('--version'); ap.add_argument('--bundle-id'); ap.add_argument('--category'); ap.add_argument('--lang'); ap.add_argument('--marker', help='the profile\'s romfs_marker')
     ap.add_argument('--icon', help='the game icon (icon.jpg from the control data)')
-    ap.add_argument('--sign', default='-', help='codesign identity (default: - = ad-hoc)')
+    ap.add_argument('--sign', default='-', help='codesign identity (default: - = ad-hoc; none = not signed, the executables keep their linker signatures)')
     return ap.parse_args(argv)
 
 
