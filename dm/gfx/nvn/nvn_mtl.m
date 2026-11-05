@@ -415,7 +415,7 @@ static want_list g_bf_want = {"DM_NVN_BF_WANT", PTHREAD_MUTEX_INITIALIZER}, g_du
 void bf_want_note(const char *key) { want_note(&g_bf_want, key); }
 
 // ---------- Memory pools ----------
-typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; uintptr_t end; uint64_t unk; } pool_ent;   // res: already in the residency set (on demand, see pool_res); end, unk: a large pool's chunk (see BIG_MIN)
+typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; uint64_t born; uintptr_t end; uint64_t unk; } pool_ent;   // res: already in the residency set (on demand, see pool_res); end, unk: a large pool's chunk (see BIG_MIN)
 static pool_ent *g_pools; static int g_npool, g_cap;
 static int g_pidx_ok, g_plast = -1;   // whether the address→pool index is valid, the last hit (pool_find)
 static NSMutableArray *g_keep;                  // Holds the buffer references (pool_ent has non-owning pointers)
@@ -647,7 +647,7 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     pthread_mutex_lock(&g_mu);
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc_or_die(g_pools, g_cap * sizeof *g_pools, "the memory pool table"); }
     g_pidx_ok = 0; g_plast = -1; atomic_fetch_add(&g_pool_gen, 1);   // the address index and the per-thread caches are invalid (pool_find, pc_get)
-    g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem, 0, hi, 1};   // not in the residency set yet: put in the first time it is addressed (pool_res)
+    g_pools[g_npool++] = (pool_ent){lo, hi, a, buf, buf.gpuAddress, mem, 0, clock_gettime_nsec_np(CLOCK_MONOTONIC), hi, 1};   // not in the residency set yet: put in the first time it is addressed (pool_res)
     g_pool_adds++;
     [g_keep addObject:buf];
     pthread_mutex_unlock(&g_mu);
@@ -698,7 +698,7 @@ static int big_new(big_pool *b, uintptr_t lo, uintptr_t hi, uintptr_t end, uint6
     if (!buf) { MLOG("[RED] memory pool %p: the zero-copy buffer over %#lx..%#lx was refused", b->mem, (unsigned long)lo, (unsigned long)end); return -1; }
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc_or_die(g_pools, g_cap * sizeof *g_pools, "the memory pool table"); }
     g_pidx_ok = 0; atomic_fetch_add(&g_pool_gen, 1);
-    g_pools[g_npool++] = (pool_ent){lo < b->lo ? b->lo : lo, hi > b->hi ? b->hi : hi, lo, buf, buf.gpuAddress, b->mem, 0, end > b->hi ? b->hi : end, unk};
+    g_pools[g_npool++] = (pool_ent){lo < b->lo ? b->lo : lo, hi > b->hi ? b->hi : hi, lo, buf, buf.gpuAddress, b->mem, 0, clock_gettime_nsec_np(CLOCK_MONOTONIC), end > b->hi ? b->hi : end, unk};
     [g_keep addObject:buf];
     return g_npool - 1;
 }
@@ -8228,113 +8228,116 @@ static uint64_t support_gpu(void) { static uint64_t gpu; if (!gpu) gpu = support
 // Layout (dmsh_abi.h DMSH_GMEM_MAP_*): sorted by start, entry 0 empty, then the pools as disjoint ranges (a pool overlapping an earlier one keeps only its part past that one's end: every
 // pool wraps the guest's own pages, so any pool holding an address gives its GPU address), unused entries starting at ~0. Rebuilt when the pools change; the replaced table goes through
 // deferred release, so submissions encoded with it keep it. Every pool is made resident, as the shader may reach any of them
+// As many entries as the pools need: a power of two of at least DMSH_GMEM_MAP_ENTRIES, the count in entry 0's delta, where the shader's binary search starts. The table used to have
+// 4,096 entries whatever the pools: loading a save in Ocarina of Time made up to 4,522 pools, the ones past the last entry were left out, and a task shader that read both ends of a
+// range through them as 0 looped (0 - 1) >> 5 times, a GPU hang (docs/reference/shaders.md, More memory pools than the raw pool table had entries)
+enum { GMEM_MAP_MAX = 1 << 20 };   // entries at most (a 32 MB table, if ever a game had that many pools); pools past them are still left out, with a red line
 static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen;
-static id<MTLBuffer> gmem_map(void) {
+static uint64_t gmem_map_gpu(void) {
     uint64_t gen = atomic_load(&g_pool_gen);
-    if (g_gmem_buf && g_gmem_gen == gen) return g_gmem_buf;
-    id<MTLBuffer> b = [g_dev newBufferWithLength:DMSH_GMEM_MAP_ENTRIES * DMSH_GMEM_MAP_ENTRY options:MTLResourceStorageModeShared];
-    uint8_t *t = (uint8_t *)b.contents; memset(t, 0, b.length);
-    for (int k = 1; k < DMSH_GMEM_MAP_ENTRIES; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
-    int n = 1, over = 0; uint64_t end = 0;
+    if (g_gmem_buf && g_gmem_gen == gen) return g_gmem_buf.gpuAddress;
+    int n = 1, over = 0; uint64_t end = 0, over_lo = 0, over_bytes = 0;
     pthread_mutex_lock(&g_mu);
     for (int k = 0; k < g_nbig; k++) if (!g_big[k].full) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }   // the pool table reaches all of a large pool
     gen = atomic_load(&g_pool_gen); pidx_sort();
+    uint64_t (*rng)[3] = malloc(((size_t)g_npool + 1) * sizeof *rng); if (!rng) abort();   // the ranges (start, end, delta), taken under g_mu and written into the table after it
     for (int k = 0; k < g_npool; k++) {
         pool_ent *p = &g_pools[g_pidx[k]];
         if (!p->res) { res_add(p->buf); p->res = 1; g_pool_res_n++; }
         uint64_t lo = MAX((uint64_t)p->lo, end), hi = p->hi;
         if (lo >= hi) continue;
-        if (n == DMSH_GMEM_MAP_ENTRIES) { over++; continue; }
-        uint64_t e[3] = {lo, hi, p->gpu - p->base}; memcpy(t + (size_t)n++ * DMSH_GMEM_MAP_ENTRY, e, sizeof e); end = hi;
+        if (n == GMEM_MAP_MAX) { if (!over++) over_lo = lo; over_bytes += hi - lo; continue; }
+        rng[n][0] = lo; rng[n][1] = hi; rng[n][2] = p->gpu - p->base; n++; end = hi;
     }
     pthread_mutex_unlock(&g_mu);
-    // A hint can name a pool only if the entire chunk is inside its entry. Collisions replace the hint; the shader checks the chunk tag before using it.
-    for (int k = 1; k < n; k++) {
-        const uint64_t *range = (const void *)(t + (size_t)k * DMSH_GMEM_MAP_ENTRY);
-        const uint64_t chunk_size = 1ull << DMSH_GMEM_HINT_SHIFT;
-        uint64_t first = range[0] / chunk_size + (range[0] % chunk_size != 0);
-        uint64_t last = MIN(range[1] / chunk_size, (UINT32_MAX + 1ull) / DMSH_GMEM_MAP_ENTRIES);
-        for (uint64_t chunk = first; chunk < last; chunk++) {
-            size_t off = (chunk & (DMSH_GMEM_MAP_ENTRIES - 1)) * DMSH_GMEM_MAP_ENTRY + 6 * sizeof(uint32_t);
-            uint32_t hint = (uint32_t)(chunk * DMSH_GMEM_MAP_ENTRIES + (unsigned)k);
-            memcpy(t + off, &hint, sizeof hint);
-        }
-    }
-    if (over) RED_ONCE(140, "raw global memory: %d more memory pools than the %d entries of the pool table; addresses in them are not reached", over, DMSH_GMEM_MAP_ENTRIES - 1);
+    unsigned cap = DMSH_GMEM_MAP_ENTRIES; while (cap < (unsigned)n) cap <<= 1;
+    id<MTLBuffer> b = [g_dev newBufferWithLength:(NSUInteger)cap * DMSH_GMEM_MAP_ENTRY options:MTLResourceStorageModeShared];
+    uint8_t *t = (uint8_t *)b.contents; memset(t, 0, b.length);
+    { uint32_t count = cap; memcpy(t + 4 * sizeof(uint32_t), &count, sizeof count); }   // entry 0's delta: the count (entry 0 is never a pool: it ends at 0)
+    for (unsigned k = 1; k < cap; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
+    for (int k = 1; k < n; k++) memcpy(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, rng[k], sizeof rng[k]);
+    free(rng);
+    if (over) RED_ONCE(140, "raw global memory: %d more pool ranges than the %d entries the pool table may have; addresses in them are not reached (the first at %#llx, %llu KB in all)",
+                       over, GMEM_MAP_MAX - 1, (unsigned long long)over_lo, (unsigned long long)(over_bytes >> 10));
     res_add(b); res_commit();
+    unsigned old = g_gmem_buf ? (unsigned)(g_gmem_buf.length / DMSH_GMEM_MAP_ENTRY) : 0;
     if (g_gmem_buf) defer_obj_release(g_gmem_buf);
     g_gmem_buf = b; g_gmem_gen = gen;
-    { static int said; if (!said++) MLOG("raw global memory: pool table of %d ranges (pool generation %llu), rebuilt whenever a pool comes or goes", n - 1, (unsigned long long)gen); }
-    return b;
+    { static int said; if (!said++) MLOG("raw global memory: pool table of %d ranges in %u entries (pool generation %llu), rebuilt whenever a pool comes or goes", n - 1, cap, (unsigned long long)gen); }
+    if (old && cap > old) MLOG("raw global memory: the pool table grows to %u entries for %d ranges", cap, n - 1);
+    return b.gpuAddress;
 }
-// The bitmap records the table entries the GPU actually used. NDVE's full-frame writes overflowed the old page hash log even within one pool.
-// Until the learned set stays unchanged for two logs, the stores count as writes anywhere. Later misses add their ranges and check the shadows that used the prediction.
-// Restarting learning after each miss made subsequent geometry draws wait on the GPU (geo_cpu_hazard), giving Donkey Kong Bananza streaks of 400-2,000 ms frames.
-enum { GML_WORDS = DMSH_GMEM_MAP_ENTRIES / 32, GML_BYTES = GML_WORDS * sizeof(uint32_t), GML_MAX = 4096, GML_STABLE = 2 };
+// Where those stores land is known only once the GPU has run them, while the host's uniform shadows and its CPU reads of guest memory must not miss a GPU write (sbw / gw). Counted as a
+// write anywhere, they refused every shadow of the submission and of the next ones: Donkey Kong Bananza's tunnel ran at 70 ms a frame, 4,533 passes a frame ended to land deferred updates.
+// So each store also puts its guest page in a write log (DMSH_KIND_GMEM_LOG, a set of pages), each draw or dispatch with such stores gets its own log from a small pool, and the host
+// learns the memory pools holding those pages: until the learned set has stayed the same over GML_STABLE logs in a row (a log that overflowed counts as a change), the stores count as
+// a write anywhere; then as writes over the learned pools. A log read on completion that shows a page in no learned pool adds that pool (before the set has settled, it starts the count again); if that submission
+// had used the prediction, the shadows that relied on it are checked against the pages it missed (g_gsr): [RED] only when one covers such a page. The missed pools are old ones
+// the stores reach for the first time as the level streams in, not new ones (Donkey Kong Bananza: added 3.5-294 s before; no shadow covered a missed page in 7 misses). Pools, not pages: the game allocates new records as the level streams in, in the same pools
+// (learned page by page, Donkey Kong Bananza's tunnel still met a new page 213 logs in)
+// GML_STABLE: 2 logs. While the set is learned every geometry draw after the stores waits for the GPU (geo_cpu_hazard): 8 logs gave Donkey Kong Bananza 9 frames of 300-540 ms
+// when gameplay began. A pool found later is checked against the shadows that relied on it (g_gsr), and none of about 20 such misses so far was under one
+enum { GML_SLOTS = 1 << DMSH_GMEM_LOG_LOG2, GML_BYTES = 4 * (1 + GML_SLOTS), GML_MAX = 4096, GML_STABLE = 2 };
 static pthread_mutex_t g_gml_mu = PTHREAD_MUTEX_INITIALIZER;
-static uint64_t g_gml_lo[GML_MAX], g_gml_hi[GML_MAX];
-static int g_gml_n, g_gml_stable, g_gml_over;
-static uint64_t g_gml_logs, g_gml_miss;
+static uint64_t g_gml_lo[GML_MAX], g_gml_hi[GML_MAX]; static int g_gml_n, g_gml_stable, g_gml_over;   // the learned pools' ranges; over: the set filled: a write anywhere from then on
+static uint64_t g_gml_logs, g_gml_miss, g_gml_full;
 static NSMutableArray<id<MTLBuffer>> *g_gml_free;
-static void gml_read(id<MTLBuffer> b, id<MTLBuffer> map, int predicted, uint64_t fence) {
-    const uint32_t *w = b.contents;
-    const uint64_t *ranges = map.contents;
-    int added = 0, missed = 0, shadowed = 0;
-    int nr = 0, unchecked = 0;
-    static uint64_t rlo[GSR_N], rhi[GSR_N];   // completion handlers run one at a time
-    if (predicted >= 0) {
-        pthread_mutex_lock(&g_gsr_mu);
+static void gml_read(id<MTLBuffer> b, int predicted, uint64_t fence) {
+    const uint32_t *w = (const uint32_t *)b.contents; int full = w[0] != 0;
+    int added = 0, mpages = 0, mshadowed = 0; double age_lo = 1e30, age_hi = -1;
+    uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    int nr = 0, unchecked = 0; static uint64_t rlo[GSR_N], rhi[GSR_N];   // the shadows that relied on this submission's writes (completion handlers run one at a time)
+    if (predicted) { pthread_mutex_lock(&g_gsr_mu);
         uint64_t n = g_gsr_n, first = n > GSR_N ? n - GSR_N : 0;
-        if (first && g_gsr[first % GSR_N].fence >= fence) unchecked = 1;
-        for (uint64_t i = first; i < n; i++) if (g_gsr[i % GSR_N].fence >= fence) {
-            rlo[nr] = g_gsr[i % GSR_N].lo; rhi[nr++] = g_gsr[i % GSR_N].hi;
-        }
-        pthread_mutex_unlock(&g_gsr_mu);
-    }
+        if (first && g_gsr[first % GSR_N].fence >= fence) unchecked = 1;   // the ring no longer holds all of them
+        for (uint64_t i = first; i < n; i++) if (g_gsr[i % GSR_N].fence >= fence) { rlo[nr] = g_gsr[i % GSR_N].lo; rhi[nr++] = g_gsr[i % GSR_N].hi; }
+        pthread_mutex_unlock(&g_gsr_mu); }
     pthread_mutex_lock(&g_gml_mu);
-    g_gml_logs++;
-    for (unsigned i = 0; i < GML_WORDS; i++) for (uint32_t bits = w[i]; bits; bits &= bits - 1) {
-        unsigned entry = i * 32 + (unsigned)__builtin_ctz(bits);
-        const uint64_t *range = ranges + entry * (DMSH_GMEM_MAP_ENTRY / sizeof *ranges);
-        uint64_t lo = range[0], hi = range[1];
-        if (lo >= hi) continue;
-        int k = 0;
-        while (k < g_gml_n && !(lo >= g_gml_lo[k] && hi <= g_gml_hi[k])) k++;
-        if (predicted >= 0 && k >= predicted) {
-            missed++;
-            for (int j = 0; j < nr; j++) if (lo < rhi[j] && rlo[j] < hi) { shadowed++; break; }
-        }
-        if (k == g_gml_n) {
-            if (g_gml_n == GML_MAX) { g_gml_over = 1; continue; }
-            g_gml_lo[g_gml_n] = lo; g_gml_hi[g_gml_n++] = hi; added++;
-        }
+    g_gml_logs++; g_gml_full += full;
+    int n0 = g_gml_n;   // the set this log's submission predicted with
+    for (int i = 1; i <= GML_SLOTS && !g_gml_over; i++) {
+        uint64_t a = (uint64_t)w[i] << 12; int known = !w[i];
+        for (int k = 0; k < n0 && !known; k++) known = a >= g_gml_lo[k] && a < g_gml_hi[k];
+        if (!known && predicted) { mpages++; for (int j = 0; j < nr; j++) if (a < rhi[j] && rlo[j] < a + 4096) { mshadowed++; break; } }   // a page the prediction left out, under a shadow?
+        for (int k = n0; k < g_gml_n && !known; k++) known = a >= g_gml_lo[k] && a < g_gml_hi[k];
+        if (known) continue;
+        if (g_gml_n == GML_MAX) { g_gml_over = 1; break; }
+        uint64_t lo = a, hi = a + 4096;   // the pool holding the page (it was in one: the shader's table found it), else the page alone
+        pthread_mutex_lock(&g_mu); int p = pool_find(a, 1); double age = -1;
+        if (p >= 0) { lo = g_pools[p].lo; hi = g_pools[p].hi; age = (double)(now - g_pools[p].born) / 1e6; } pthread_mutex_unlock(&g_mu);
+        if (age >= 0) { if (age < age_lo) age_lo = age; if (age > age_hi) age_hi = age; }
+        g_gml_lo[g_gml_n] = lo; g_gml_hi[g_gml_n++] = hi; added++;
     }
-    if (g_gml_stable < GML_STABLE) g_gml_stable = added ? 0 : g_gml_stable + 1;
-    g_gml_miss += (unsigned)missed;
-    uint64_t logs = g_gml_logs, miss = g_gml_miss; int learned = g_gml_n, over = g_gml_over;
+    // Once the prediction has begun, a pool found late is added and the prediction goes on: going back to a write anywhere until more logs agreed (8 then) made every geometry draw
+    // after the stores wait for the GPU (geo_cpu_hazard), 400-2,000 ms frames for a second or more after each miss in Donkey Kong Bananza, and bought nothing, as the next late
+    // pool is missed the same way and every miss is checked (g_gsr). Only a log that ran out of slots, whose pages are not all known, starts the learning again
+    if (full || (added && g_gml_stable < GML_STABLE)) g_gml_stable = 0; else if (g_gml_stable < INT_MAX) g_gml_stable++;
+    if (predicted && added) g_gml_miss += added;
+    uint64_t logs = g_gml_logs, miss = g_gml_miss, fulls = g_gml_full; int learned = g_gml_n, over = g_gml_over;
     [g_gml_free addObject:b];
     pthread_mutex_unlock(&g_gml_mu);
     if (over) RED_ONCE(141, "raw global memory: the stores wrote in more than %d pools: they count as a write anywhere from now on", GML_MAX);
-    if (missed) {
-        static int lines; int bad = shadowed || unchecked;
-        if (bad || lines++ < 8) MLOG("%sraw global memory: %d written pool range(s) outside the prediction (log %llu, %llu misses, %d learned), %d overlap the %d uniform shadows taken from that submission on%s",
-            bad ? "[RED] " : "", missed, (unsigned long long)logs, (unsigned long long)miss, learned, shadowed, nr,
-            shadowed ? ": those shadows may have missed a write" : unchecked ? ": the shadow record had wrapped" : "");
-    }
+    if (full) { static int lines; if (lines++ < 4) MLOG("[RED] raw global memory: a write log ran out of slots (%llu of %llu logs so far): its stores count as a write anywhere until the pages are learned", (unsigned long long)fulls, (unsigned long long)logs); }
+    if (predicted && added) {   // learned after the fact: harmful only if a shadow that relied on this submission's writes covers a page they missed
+        static int lines; int bad = mshadowed || unchecked;
+        if (bad || lines++ < 8) MLOG("%sraw global memory: the stores wrote in %d pool(s) the host had not learned (log %llu, %llu such pools so far, %d learned; the pools were added %.0f-%.0f ms before): "
+            "%d page(s) outside the prediction, %d of them under the %d uniform shadows taken from that submission on%s", bad ? "[RED] " : "", added, (unsigned long long)logs,
+            (unsigned long long)miss, learned, age_lo < 1e30 ? age_lo : -1.0, age_hi, mpages, mshadowed, nr,
+            mshadowed ? ": those shadows may have missed the write" : unchecked ? "; the shadow record had already wrapped, so not all could be checked" : ""); }
 }
-static uint64_t gml_take(id<MTLBuffer> map) {
+static uint64_t gml_take(void) {
     pthread_mutex_lock(&g_gml_mu);
     if (!g_gml_free) g_gml_free = [NSMutableArray array];
     id<MTLBuffer> b = g_gml_free.lastObject; if (b) [g_gml_free removeLastObject];
-    int predicted = !g_gml_over && g_gml_stable >= GML_STABLE ? g_gml_n : -1;
-    { static int said; if (predicted >= 0 && !said++) MLOG("raw global memory: the stores' writes are predicted from now on: %d pool(s) learned over %llu logs", predicted, (unsigned long long)g_gml_logs); }
-    for (int i = 0; i < predicted; i++) sbw_note(g_gml_lo[i], g_gml_hi[i] - g_gml_lo[i], SBW_GPU);
+    int predict = !g_gml_over && g_gml_stable >= GML_STABLE;
+    { static int said; if (predict && !said++) MLOG("raw global memory: the stores' writes are predicted from now on: %d pool(s) learned over %llu logs", g_gml_n, (unsigned long long)g_gml_logs); }
+    if (predict) for (int i = 0; i < g_gml_n; i++) sbw_note(g_gml_lo[i], g_gml_hi[i] - g_gml_lo[i], SBW_GPU);
     pthread_mutex_unlock(&g_gml_mu);
-    if (predicted < 0) sbw_note(0, 0, SBW_GPU);
+    if (!predict) sbw_note(0, 0, SBW_GPU);
     if (!b) { b = [g_dev newBufferWithLength:GML_BYTES options:MTLResourceStorageModeShared]; res_add(b); res_commit(); }
     memset(b.contents, 0, GML_BYTES);
-    g_gml_on = 1; uint64_t fence = g_fence + 1;
-    [g_commit_blocks addObject:^{ gml_read(b, map, predicted, fence); }];
+    g_gml_on = 1; uint64_t fence = g_fence + 1;   // this submission's fence (mtl_sub_commit)
+    [g_commit_blocks addObject:^{ gml_read(b, predict, fence); }];
     return b.gpuAddress;
 }
 static id<MTLBuffer> zero_bank(void) { static __strong id<MTLBuffer> b; if (!b) { b = [g_dev newBufferWithLength:65536 options:MTLResourceStorageModeShared]; res_add(b); } return b; }
@@ -8409,7 +8412,6 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
     static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;   // Record on every new encode (otherwise only the first time per pass per stage)
     int bl = passdump() && (bl_all || g_kd_force || bl_pass[nvn_stage] != g_stat_pass);
     if (bl) { bl_pass[nvn_stage] = g_stat_pass; PD("K %llu st%d key=%s nb=%d", g_stat_pass, nvn_stage, sh->key[0] ? sh->key : sh->builtin ? sh->builtin : "?", sh->rf.nb); }
-    id<MTLBuffer> raw_map = nil;   // the log and shader use the same map even if pools change during encoding
     uint32_t bmask = 0; float bk[DMSH_BORDER_SAMPLERS][4];   // the border colour block (see nvn_border.h): the twins that correct, their factors
     os_unfair_lock_lock(&g_rmu);   // The texture / sampler registration tables may be being grown or rewritten by the game thread
     for (int i = 0; i < sh->rf.nb; i++) {
@@ -8590,10 +8592,11 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             id<MTLBuffer> cb = sh->c1buf ? sh->c1buf : zero_bank();   // c1 has length 0 (600 of them in the whole library) yet the shader still declares it: reads 0
             slots[aid] = (sh->c1buf ? sh->c1_gpu : zero_bank_gpu()) + (sh->c1buf ? sh->c1off : 0);
             USE(cb, MTLResourceUsageRead);
-        } else if (b->kind == NVN_RB_GMEM || b->kind == NVN_RB_GMEML) {
-            if (!raw_map) raw_map = gmem_map();
-            slots[aid] = b->kind == NVN_RB_GMEM ? raw_map.gpuAddress : gml_take(raw_map);
-            if (bl && b->kind == NVN_RB_GMEM) PD("B %llu st%d gmem %s", g_stat_pass, nvn_stage, b->rw ? "rw" : "ro");
+        } else if (b->kind == NVN_RB_GMEM) {   // B: the memory pool table for addresses traced to no storage buffer (gmem_map_gpu)
+            slots[aid] = gmem_map_gpu();
+            if (bl) PD("B %llu st%d gmem %s", g_stat_pass, nvn_stage, b->rw ? "rw" : "ro");
+        } else if (b->kind == NVN_RB_GMEML) {   // B: the write log of those stores; their writes are noted as gml_take learned them
+            slots[aid] = gml_take();
         } else if (b->kind == NVN_RB_SUPPORT) {   // support_buffer: scale 1.0, BGRA swap 0, viewport transform not disabled (viewport fields are not read)
             slots[aid] = support_gpu();
             USE(support_buf(), MTLResourceUsageRead);

@@ -780,15 +780,20 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
         }
 
         // nxnative: the memory pool table the host binds for raw global memory (dmsh_abi.h DMSH_GMEM_MAP_*): a storage buffer reserved under this sentinel constant buffer
-        // slot, which no constant buffer of the game has (dmsh_build.py turns it into DMSH_KIND_GMEM_MAP). 1 << GmemMapLog2 entries of GmemMapEntryWords words each,
-        // {start lo, start hi, end lo, end hi, delta lo, delta hi, hint, 0}, sorted by start; entry 0 is empty (start 0, end 0) and unused entries start at ~0
+        // slot, which no constant buffer of the game has (dmsh_build.py turns it into DMSH_KIND_GMEM_MAP). Entries of GmemMapEntryWords words each,
+        // {start lo, start hi, end lo, end hi, delta lo, delta hi, 0, 0}, sorted by start; entry 0 is empty (start 0, end 0) and unused entries start at ~0.
+        // The host sizes the table to its pools: a power of two of entries, at least DMSH_GMEM_MAP_ENTRIES, the count in entry 0's delta low word (GmemMapCountWord), which no
+        // lookup uses. A fixed 4,096 entries left the pools past them out (Ocarina of Time loads its save with about 4,100 to 4,500 pools), and the shaders that read their addresses got zeros
         public const int GmemMapCbSlot = 0xff;
-        private const int GmemMapLog2 = 12;
+        private const int GmemMapCountWord = 4;
         private const int GmemMapEntryWords = 8;
-        private const int GmemHintShift = 21;
 
-        // nxnative: the write log is a bitmap indexed by the entry the access uses. NDVE's full-frame writes used to overflow the page hash table even in a single pool.
+        // nxnative: the write log (dmsh_abi.h DMSH_GMEM_LOG_*), reserved under the same sentinel slot at offset 1: the set of guest pages (address >> 12) the stores and atomics wrote,
+        // as an open-addressing hash set of 1 << GmemLogLog2 words from word 1 (0 = empty), word 0 set when a page found no free slot in GmemLogProbes tries. The host cannot know where
+        // a store through a loaded pointer lands before the GPU runs it; it learns the pages from the log. A set, not a list: one draw of Donkey Kong Bananza stores 7,325 times into a few dozen pages
         private const int GmemLogCbOffset = 1;
+        private const int GmemLogLog2 = 10;
+        private const int GmemLogProbes = 8;
 
         // nxnative: a global memory access whose address the search traced to no storage buffer, an address the shader loaded from memory (Donkey Kong Bananza: gsys's vertex
         // shader that resets the terrain's indirect draw records reads each record's address from a storage buffer). Ryujinx drops such an access (a load reads 0). Here it
@@ -847,24 +852,17 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 return context.Load(StorageKind.StorageBuffer, mapBinding, Const(0), context.IAdd(entry, Const(word)));
             }
 
-            // The host's tagged hint covers a whole chunk inside one entry. NDVE repeatedly accesses the same large pools from adjacent lanes.
-            Operand chunk = context.BitwiseOr(context.ShiftLeft(addrHigh, Const(32 - GmemHintShift)), context.ShiftRightU32(addrLow, Const(GmemHintShift)));
-            Operand indexMask = Const((1 << GmemMapLog2) - 1);
-            Operand hint = MapWord(context.IMultiply(context.BitwiseAnd(chunk, indexMask), Const(GmemMapEntryWords)), 6);
-            Operand hintIndex = context.BitwiseAnd(hint, indexMask);
-            Operand hintFits = context.BitwiseAnd(context.ICompareNotEqual(hintIndex, Const(0)), context.ICompareEqual(context.ShiftRightU32(hint, Const(GmemMapLog2)), chunk));
-            hintFits = context.BitwiseAnd(hintFits, context.ICompareLessUnsigned(addrHigh, Const(1 << (GmemHintShift - GmemMapLog2))));
-            Operand selected = Local();
-            Operand lblFound = Label();
-            context.Copy(selected, hintIndex);
-            context.BranchIfTrue(lblFound, hintFits);
+            // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one): a binary search over the host's count of entries, a power of two,
+            // log2 of it steps. A count of 0 or 1 makes one step that stays at entry 0 (no pool)
+            Operand index = Local();
+            Operand step = Local();
+            context.Copy(index, Const(0));
+            context.Copy(step, context.ShiftRightU32(MapWord(Const(0), GmemMapCountWord), Const(1)));
+            Operand lblSearch = Label();
+            context.MarkLabel(lblSearch);
 
-            // The last entry whose start is at or below the address (entry 0 starts at 0, so there always is one).
-            Operand index = Const(0);
-
-            for (int step = 1 << (GmemMapLog2 - 1); step != 0; step >>= 1)
             {
-                Operand candidate = context.IAdd(index, Const(step));
+                Operand candidate = context.IAdd(index, step);
                 Operand entry = context.IMultiply(candidate, Const(GmemMapEntryWords));
                 Operand startLow = MapWord(entry, 0);
                 Operand startHigh = MapWord(entry, 1);
@@ -873,12 +871,13 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                     context.ICompareLessUnsigned(startHigh, addrHigh),
                     context.BitwiseAnd(context.ICompareEqual(startHigh, addrHigh), context.ICompareLessOrEqualUnsigned(startLow, addrLow)));
 
-                index = context.ConditionalSelect(atOrBelow, candidate, index);
+                context.Copy(index, context.ConditionalSelect(atOrBelow, candidate, index));
+                context.Copy(step, context.ShiftRightU32(step, Const(1)));
             }
 
-            context.Copy(selected, index);
-            context.MarkLabel(lblFound);
-            Operand found = context.IMultiply(selected, Const(GmemMapEntryWords));
+            context.BranchIfTrue(lblSearch, context.ICompareNotEqual(step, Const(0)));
+
+            Operand found = context.IMultiply(index, Const(GmemMapEntryWords));
             Operand endLow = MapWord(found, 2);
             Operand endHigh = MapWord(found, 3);
 
@@ -891,9 +890,21 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
             if (writes)
             {
-                Operand word = context.ShiftRightU32(selected, Const(5));
-                Operand bit = context.ShiftLeft(Const(1), context.BitwiseAnd(selected, Const(31)));
-                context.AtomicOr(StorageKind.StorageBuffer, logBinding, Const(0), word, bit);
+                // A page in a pool is never 0 (the guest's first page is not mapped), so 0 marks an empty slot
+                Operand page = context.BitwiseOr(context.ShiftLeft(addrHigh, Const(20)), context.ShiftRightU32(addrLow, Const(12)));
+                Operand hash = context.ShiftRightU32(context.IMultiply(page, Const(unchecked((int)0x9e3779b1))), Const(32 - GmemLogLog2));
+
+                Operand lblLogged = Label();
+
+                for (int probe = 0; probe < GmemLogProbes; probe++)
+                {
+                    Operand slot = context.IAdd(context.BitwiseAnd(context.IAdd(hash, Const(probe)), Const((1 << GmemLogLog2) - 1)), Const(1));
+                    Operand old = context.AtomicCompareAndSwap(StorageKind.StorageBuffer, logBinding, Const(0), slot, Const(0), page);
+                    context.BranchIfTrue(lblLogged, context.BitwiseOr(context.ICompareEqual(old, Const(0)), context.ICompareEqual(old, page)));
+                }
+
+                context.Store(StorageKind.StorageBuffer, logBinding, Const(0), Const(0), Const(1));
+                context.MarkLabel(lblLogged);
             }
 
             // A small integer is read or written in its 32-bit word
