@@ -2429,7 +2429,7 @@ static void pkg_absorb_take(NvPkg *pk, const tex_t *t) {
 // not say which images a shader will use atomically
 static inline int pf_r32i(MTLPixelFormat pf) { return pf == MTLPixelFormatR32Uint || pf == MTLPixelFormatR32Sint; }
 static MTLTextureUsage img_usage(const tex_t *t, MTLPixelFormat pf) {
-    if (!(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE)) return 0;
+    if (!(t->d.flags & NVN_TEXTURE_FLAGS_IMAGE) || fmt_compressed(t->d.format)) return 0;   // block encoders write uncompressed aliases (PR #1404)
     return MTLTextureUsageShaderWrite | (pf_r32i(pf) ? MTLTextureUsageShaderAtomic : 0);
 }
 // Metal leaves MTLTextureUsageShaderAtomic out of a texture's usage property (0x3 for a texture made with 0x23), so it cannot be read back: every shader-writable R32Uint / R32Sint
@@ -8436,7 +8436,8 @@ static int tex_storage_live(const tex_t *t) {
 // Whether a registered ID's texture cannot be of Metal type dtt, from its descriptor alone (1D and 2D with their arrays, cube and cube array, the multisample pair count as one class, as
 // the host may make either of a pair). The walk below used to make a Metal texture for every registered ID before it compared the type: PRAGMATA's cube-texture pool (5 of its 13,568 IDs
 // cubes) uploaded every texture the game had registered, used by a draw or not
-static int ttype_class(long t) { return t >= 0 && t <= 3 ? 0 : t == 4 || t == 8 ? 1 : t == 5 || t == 6 ? 2 : t == 7 ? 3 : -1; }   // 1D and 2D (arrays too) / multisample / cube / 3D
+// Cube storage is a 2D array in this backend. It must remain eligible for the 2D-array handle table (probe analysis reads cube faces that way; PR #1404)
+static int ttype_class(long t) { return (t >= 0 && t <= 3) || t == 5 || t == 6 ? 0 : t == 4 || t == 8 ? 1 : t == 7 ? 3 : -1; }   // 1D, 2D and cube (arrays too) / multisample / 3D
 static int ttype_apart(const treg_t *r, int dtt) {
     int tg = r->has_v && r->v.set_target ? r->v.target : r->t.d.target; if (tg == 10) return 1;   // a buffer texture
     int a = ttype_class((long)ttype(tg, -1)), b = ttype_class(dtt);
