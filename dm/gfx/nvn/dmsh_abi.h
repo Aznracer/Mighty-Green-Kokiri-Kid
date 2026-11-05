@@ -78,13 +78,14 @@
 // The table is sorted by start: entry 0 is empty (start 0, end 0) and unused entries start at ~0. The host gives it a power of two entries, as many as its pools need and at least
 // DMSH_GMEM_MAP_ENTRIES, and writes that count into entry 0's delta (low word, GlobalToStorage.GmemMapCountWord), which the shader's binary search takes
 #define DMSH_GMEM_MAP_ENTRIES 4096       // the least count of entries
-#define DMSH_GMEM_MAP_ENTRY 32           // bytes of an entry: start, end (exclusive) and delta (the pool's Metal GPU address minus its guest address), 64 bits each, then 8 bytes of padding
-// Where such a store or atomic lands is known only when the GPU runs it, so each one also puts its guest page (address >> 12) in a write log, reserved under the same slot at offset 1
-// (Ryujinx GlobalToStorage.GmemLogCbOffset, GmemLogLog2): 32-bit words, word 0 set when a page found no free slot, then a hash set of 1 << DMSH_GMEM_LOG_LOG2 pages (0 = empty).
-// The host learns the pages from it
+#define DMSH_GMEM_MAP_ENTRY 32           // bytes of an entry: start, end (exclusive) and delta (the pool's Metal GPU address minus its guest address), 64 bits each, then the hint: two 32-bit words
+// The hint (PR #1299, on the growing table): one per 2 MiB chunk of guest addresses (DMSH_GMEM_HINT_SHIFT), in entry (chunk % DMSH_GMEM_MAP_ENTRIES), which every table has: chunk + 1, then the
+// index of the entry that holds the whole chunk (0: none). A hit skips the binary search; the shader compares the tag (Ryujinx GlobalToStorage.GmemHintShift, GmemHintSlots)
+#define DMSH_GMEM_HINT_SHIFT 21
+// Where such a store or atomic lands is known only when the GPU runs it, so each one also sets a bit in a write log, reserved under the same slot at offset 1 (Ryujinx
+// GlobalToStorage.GmemLogCbOffset): a bitmap of the table's entries, bit i in word i / 32 for entry i (PR #1299). The host reads it against the exact table the shader used
 #define DMSH_KIND_GMEM_LOG "gmem_log"    // that write log: the host gives each draw or dispatch its own, cleared (nvn_mtl.m gml_take)
 #define DMSH_GMEM_LOG_CB_OFFSET 1
-#define DMSH_GMEM_LOG_LOG2 10
 
 // A pool binding points at a buffer the host keeps (nvn_mtl.m pool_gpu): a 32-bit bound n (the highest index the shader may read), then from DMSH_POOL_HEAD one 8-byte resource ID per ID
 #define DMSH_POOL_HEAD 8                 // bytes before element 0 of a pool buffer

@@ -8765,6 +8765,16 @@ static uint64_t gmem_map_gpu(void) {
     { uint32_t count = cap; memcpy(t + 4 * sizeof(uint32_t), &count, sizeof count); }   // entry 0's delta: the count (entry 0 is never a pool: it ends at 0)
     for (unsigned k = 1; k < cap; k++) memset(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, 0xff, 8);
     for (int k = 1; k < n; k++) memcpy(t + (size_t)k * DMSH_GMEM_MAP_ENTRY, rng[k], sizeof rng[k]);
+    // The hints (PR #1299, on this growing table): each 2 MiB chunk wholly inside one entry, in entry chunk % DMSH_GMEM_MAP_ENTRIES (every table has those): chunk + 1, then the entry.
+    // Chunks that share a slot leave the last one there; the shader compares the tag and searches otherwise. Tags are words: chunks below 2^32 (addresses below 2^53)
+    for (int k = 1; k < n; k++) {
+        uint64_t first = (rng[k][0] + (1ull << DMSH_GMEM_HINT_SHIFT) - 1) >> DMSH_GMEM_HINT_SHIFT, last = rng[k][1] >> DMSH_GMEM_HINT_SHIFT;   // [first, last): the chunks wholly in it
+        if (last > UINT32_MAX) last = UINT32_MAX;
+        for (uint64_t c = first; c < last; c++) {
+            uint32_t h[2] = {(uint32_t)(c + 1), (uint32_t)k};
+            memcpy(t + (size_t)(c & (DMSH_GMEM_MAP_ENTRIES - 1)) * DMSH_GMEM_MAP_ENTRY + 6 * sizeof(uint32_t), h, sizeof h);
+        }
+    }
     free(rng);
     if (over) RED_ONCE(140, "raw global memory: %d more pool ranges than the %d entries the pool table may have; addresses in them are not reached (the first at %#llx, %llu KB in all)",
                        over, GMEM_MAP_MAX - 1, (unsigned long long)over_lo, (unsigned long long)(over_bytes >> 10));
@@ -8787,13 +8797,13 @@ static uint64_t gmem_map_gpu(void) {
 // (learned page by page, Donkey Kong Bananza's tunnel still met a new page 213 logs in)
 // GML_STABLE: 2 logs. While the set is learned every geometry draw after the stores waits for the GPU (geo_cpu_hazard): 8 logs gave Donkey Kong Bananza 9 frames of 300-540 ms
 // when gameplay began. A pool found later is checked against the shadows that relied on it (g_gsr), and none of about 20 such misses so far was under one
-enum { GML_SLOTS = 1 << DMSH_GMEM_LOG_LOG2, GML_BYTES = 4 * (1 + GML_SLOTS), GML_MAX = 4096, GML_STABLE = 2 };
+enum { GML_MAX = 4096, GML_STABLE = 2 };   // a log is a bitmap of the entries of the table its shader used (PR #1299): one bit per entry, as many words as the table has entries / 32
 static pthread_mutex_t g_gml_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_gml_lo[GML_MAX], g_gml_hi[GML_MAX]; static int g_gml_n, g_gml_stable, g_gml_over;   // the learned pools' ranges; over: the set filled: a write anywhere from then on
 static uint64_t g_gml_logs, g_gml_miss, g_gml_full;
 static NSMutableArray<id<MTLBuffer>> *g_gml_free;
-static void gml_read(id<MTLBuffer> b, int predicted, uint64_t fence) {
-    const uint32_t *w = (const uint32_t *)b.contents; int full = w[0] != 0;
+static void gml_read(id<MTLBuffer> b, id<MTLBuffer> map, int predicted, uint64_t fence) {   // map: the table the shaders of this log used, kept by the commit block
+    const uint32_t *w = (const uint32_t *)b.contents; const uint8_t *tab = (const uint8_t *)map.contents; unsigned cap = (unsigned)(map.length / DMSH_GMEM_MAP_ENTRY); int full = 0;   // a bitmap does not overflow
     int added = 0, mpages = 0, mshadowed = 0; double age_lo = 1e30, age_hi = -1;
     uint64_t now = clock_gettime_nsec_np(CLOCK_MONOTONIC);
     int nr = 0, unchecked = 0; static uint64_t rlo[GSR_N], rhi[GSR_N];   // the shadows that relied on this submission's writes (completion handlers run one at a time)
@@ -8805,14 +8815,16 @@ static void gml_read(id<MTLBuffer> b, int predicted, uint64_t fence) {
     pthread_mutex_lock(&g_gml_mu);
     g_gml_logs++; g_gml_full += full;
     int n0 = g_gml_n;   // the set this log's submission predicted with
-    for (int i = 1; i <= GML_SLOTS && !g_gml_over; i++) {
-        uint64_t a = (uint64_t)w[i] << 12; int known = !w[i];
+    for (unsigned i = 1; i < cap && !g_gml_over; i++) {
+        if (!(w[i >> 5] >> (i & 31) & 1)) continue;
+        uint64_t r[2]; memcpy(r, tab + (size_t)i * DMSH_GMEM_MAP_ENTRY, sizeof r);   // the entry's range [start, end), within one pool
+        uint64_t a = r[0]; int known = 0;
         for (int k = 0; k < n0 && !known; k++) known = a >= g_gml_lo[k] && a < g_gml_hi[k];
-        if (!known && predicted) { mpages++; for (int j = 0; j < nr; j++) if (a < rhi[j] && rlo[j] < a + 4096) { mshadowed++; break; } }   // a page the prediction left out, under a shadow?
+        if (!known && predicted) { mpages++; for (int j = 0; j < nr; j++) if (r[0] < rhi[j] && rlo[j] < r[1]) { mshadowed++; break; } }   // a range the prediction left out, under a shadow?
         for (int k = n0; k < g_gml_n && !known; k++) known = a >= g_gml_lo[k] && a < g_gml_hi[k];
         if (known) continue;
         if (g_gml_n == GML_MAX) { g_gml_over = 1; break; }
-        uint64_t lo = a, hi = a + 4096;   // the pool holding the page (it was in one: the shader's table found it), else the page alone
+        uint64_t lo = r[0], hi = r[1];   // the pool holding the entry's range, else the range alone
         pthread_mutex_lock(&g_mu); int p = pool_find(a, 1); double age = -1;
         if (p >= 0) { lo = g_pools[p].lo; hi = g_pools[p].hi; age = (double)(now - g_pools[p].born) / 1e6; } pthread_mutex_unlock(&g_mu);
         if (age >= 0) { if (age < age_lo) age_lo = age; if (age > age_hi) age_hi = age; }
@@ -8831,23 +8843,25 @@ static void gml_read(id<MTLBuffer> b, int predicted, uint64_t fence) {
     if (predicted && added) {   // learned after the fact: harmful only if a shadow that relied on this submission's writes covers a page they missed
         static int lines; int bad = mshadowed || unchecked;
         if (bad || lines++ < 8) MLOG("%sraw global memory: the stores wrote in %d pool(s) the host had not learned (log %llu, %llu such pools so far, %d learned; the pools were added %.0f-%.0f ms before): "
-            "%d page(s) outside the prediction, %d of them under the %d uniform shadows taken from that submission on%s", bad ? "[RED] " : "", added, (unsigned long long)logs,
+            "%d table range(s) outside the prediction, %d of them under the %d uniform shadows taken from that submission on%s", bad ? "[RED] " : "", added, (unsigned long long)logs,
             (unsigned long long)miss, learned, age_lo < 1e30 ? age_lo : -1.0, age_hi, mpages, mshadowed, nr,
             mshadowed ? ": those shadows may have missed the write" : unchecked ? "; the shadow record had already wrapped, so not all could be checked" : ""); }
 }
-static uint64_t gml_take(void) {
+static uint64_t gml_take(id<MTLBuffer> map) {   // map: the table this draw's shaders get (encode_args_ raw_map), which the log is read against
+    NSUInteger bytes = MAX(map.length / DMSH_GMEM_MAP_ENTRY / 8, (NSUInteger)16);
     pthread_mutex_lock(&g_gml_mu);
     if (!g_gml_free) g_gml_free = [NSMutableArray array];
-    id<MTLBuffer> b = g_gml_free.lastObject; if (b) [g_gml_free removeLastObject];
+    id<MTLBuffer> b = nil;
+    while ((b = g_gml_free.lastObject)) { [g_gml_free removeLastObject]; if (b.length >= bytes) break; defer_obj_release(b); b = nil; }   // one from before the table grew is too short
     int predict = !g_gml_over && g_gml_stable >= GML_STABLE;
     { static int said; if (predict && !said++) MLOG("raw global memory: the stores' writes are predicted from now on: %d pool(s) learned over %llu logs", g_gml_n, (unsigned long long)g_gml_logs); }
     if (predict) for (int i = 0; i < g_gml_n; i++) sbw_note(g_gml_lo[i], g_gml_hi[i] - g_gml_lo[i], SBW_GPU);
     pthread_mutex_unlock(&g_gml_mu);
     if (!predict) sbw_note(0, 0, SBW_GPU);
-    if (!b) { b = [g_dev newBufferWithLength:GML_BYTES options:MTLResourceStorageModeShared]; res_add(b); res_commit(); }
-    memset(b.contents, 0, GML_BYTES);
+    if (!b) { b = [g_dev newBufferWithLength:bytes options:MTLResourceStorageModeShared]; res_add(b); res_commit(); }
+    memset(b.contents, 0, bytes);
     g_gml_on = 1; uint64_t fence = g_fence + 1;   // this submission's fence (mtl_sub_commit)
-    [g_commit_blocks addObject:^{ gml_read(b, predict, fence); }];
+    [g_commit_blocks addObject:^{ gml_read(b, map, predict, fence); }];
     return b.gpuAddress;
 }
 static id<MTLBuffer> zero_bank(void) { static __strong id<MTLBuffer> b; if (!b) { b = [g_dev newBufferWithLength:65536 options:MTLResourceStorageModeShared]; res_add(b); } return b; }
@@ -8921,6 +8935,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
     // DM_NVN_PASSDUMP: on the first new encode per pass per stage, records the shader key (K) and the actual source of each binding (B: UBO address / length / first 4 floats, texture ID and serial, or "dummy")
     static uint64_t bl_pass[6]; static int bl_all = -1; if (bl_all < 0) bl_all = getenv("DM_NVN_PASSDUMP_ALL") != NULL;   // Record on every new encode (otherwise only the first time per pass per stage)
     int bl = passdump() && (bl_all || g_kd_force || bl_pass[nvn_stage] != g_stat_pass);
+    id<MTLBuffer> raw_map = nil;   // the raw pool table and the write log read against it: one table for both even if pools change while this is encoded (PR #1299)
     if (bl) { bl_pass[nvn_stage] = g_stat_pass; PD("K %llu st%d key=%s nb=%d", g_stat_pass, nvn_stage, sh->key[0] ? sh->key : sh->builtin ? sh->builtin : "?", sh->rf.nb); }
     uint32_t bmask = 0; float bk[DMSH_BORDER_SAMPLERS][4];   // the border colour block (see nvn_border.h): the twins that correct, their factors
     os_unfair_lock_lock(&g_rmu);   // The texture / sampler registration tables may be being grown or rewritten by the game thread
@@ -9103,10 +9118,12 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             slots[aid] = (sh->c1buf ? sh->c1_gpu : zero_bank_gpu()) + (sh->c1buf ? sh->c1off : 0);
             USE(cb, MTLResourceUsageRead);
         } else if (b->kind == NVN_RB_GMEM) {   // B: the memory pool table for addresses traced to no storage buffer (gmem_map_gpu)
-            slots[aid] = gmem_map_gpu();
+            if (!raw_map) { gmem_map_gpu(); raw_map = g_gmem_buf; }
+            slots[aid] = raw_map.gpuAddress;
             if (bl) PD("B %llu st%d gmem %s", g_stat_pass, nvn_stage, b->rw ? "rw" : "ro");
         } else if (b->kind == NVN_RB_GMEML) {   // B: the write log of those stores; their writes are noted as gml_take learned them
-            slots[aid] = gml_take();
+            if (!raw_map) { gmem_map_gpu(); raw_map = g_gmem_buf; }
+            slots[aid] = gml_take(raw_map);
         } else if (b->kind == NVN_RB_SUPPORT) {   // support_buffer: scale 1.0, BGRA swap 0, viewport transform not disabled (viewport fields are not read)
             slots[aid] = support_gpu();
             USE(support_buf(), MTLResourceUsageRead);

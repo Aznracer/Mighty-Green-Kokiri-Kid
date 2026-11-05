@@ -89,6 +89,16 @@ int main(void) { @autoreleasepool {
     mtl_sub_begin(); CHECK("pool table made again", gmem_map_gpu() != 0); finish();
     CHECK("the whole pool has an entry", g_big[0].full > 0 && g_pools[g_big[0].full - 1].end == base + GB);
     CHECK("lookups take it", look(base + 900 * MB, 4096).length == GB);
+    // The hint (PR #1299, on the growing table) and the write log read against the table its shader used
+    { id<MTLBuffer> map = g_gmem_buf; const uint32_t *w = map.contents; const uint64_t *ranges = map.contents;
+      uint64_t chunk = (base + 900 * MB) >> DMSH_GMEM_HINT_SHIFT; size_t hw = (size_t)(chunk % DMSH_GMEM_MAP_ENTRIES) * (DMSH_GMEM_MAP_ENTRY / sizeof(uint32_t)) + 6;
+      unsigned entry = w[hw + 1]; const uint64_t *range = ranges + (size_t)entry * (DMSH_GMEM_MAP_ENTRY / sizeof *ranges);
+      CHECK("the hint names its chunk and an entry", entry && w[hw] == (uint32_t)(chunk + 1));
+      CHECK("the hinted chunk lies wholly in that entry", range[0] <= chunk << DMSH_GMEM_HINT_SHIFT && range[1] >= (chunk + 1) << DMSH_GMEM_HINT_SHIFT);
+      NSUInteger bytes = map.length / DMSH_GMEM_MAP_ENTRY / 8; id<MTLBuffer> log = [g_dev newBufferWithLength:bytes options:MTLResourceStorageModeShared]; memset(log.contents, 0, bytes);
+      ((uint32_t *)log.contents)[entry / 32] = 1u << (entry % 32);
+      int n0 = g_gml_n; gml_read(log, map, 0, 0);
+      CHECK("a log bit resolves its entry's pool in the table it was taken with", g_gml_n == n0 + 1 && g_gml_lo[n0] <= range[0] && g_gml_hi[n0] >= range[1]); }
     // A smaller pool is one buffer, and the removal of the large one takes all its entries
     uint8_t *small = mmap(NULL, 64 * MB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (small == MAP_FAILED) abort();
     int n3 = g_npool; mtl_pool_add(small, 64 * MB); CHECK("one entry", g_npool == n3 + 1 && g_nbig == 1);
