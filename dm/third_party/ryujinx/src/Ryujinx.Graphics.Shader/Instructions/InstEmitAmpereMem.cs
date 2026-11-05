@@ -29,6 +29,7 @@ namespace Ryujinx.Graphics.Shader.Instructions
             x(0x98e, InstName.Red, ARed, N, writesRd: false);
             x(0x9a8, InstName.Atom, AAtomg, N);
             x(0x3a8, InstName.Atom, AAtomg, N);
+            x(0x3a9, InstName.AtomCas, AAtomgCas, N);
             x(AmpereOpcodes.Ldl, InstName.Ldl, ALdLocalShared, N);
             x(0x984, InstName.Lds, ALdLocalShared, N);
             x(0x387, InstName.Stl, AStLocalShared, N, writesRd: false);
@@ -365,6 +366,24 @@ namespace Ryujinx.Graphics.Shader.Instructions
             (Operand lo, Operand hi) = AGlobalAddress(context, x, 70, 64, 0);
 
             Operand res = EmitAtomicOp(context, StorageKind.GlobalMemory, (AtomOp)x.Bits(87, 91), (AtomSize)x.Bits(73, 76), lo, hi, Register(x.Rb, RegisterType.Gpr));
+
+            ASet(context, x, res);
+        }
+
+        // ATOMG.CAS Rd, [Ra + offset], Rb, Rc (0x3a9): compare with Rb, swap in Rc (64..72), the old value to Rd (NAK sm70_encode.rs OpAtom, AtomOp::CmpExch: cmpr at
+        // 32, data at 64; Eden ampere_isa_table.h 0x3a9 "Atom"); address as ATOMG's (.E pair bit 72). Orbitals: 00012400001ee10b0000000a060873a9,
+        // ATOMG.E.CAS.STRONG.GPU R8, [R6.64], R10, R11. Only the 32-bit form is met: others are refused.
+        public static void AAtomgCas(EmitterContext context)
+        {
+            AmpereOp x = new(context.CurrOp);
+
+            if (x.Bits(73, 76) > 1 || x.Bit(91))
+            {
+                throw AFail(context, $"ATOMG.CAS type {x.Bits(73, 76)} or uniform address");
+            }
+
+            (Operand lo, Operand hi) = AGlobalAddress(context, x, 72, 64, 0);
+            Operand res = context.AtomicCompareAndSwap(StorageKind.GlobalMemory, lo, hi, AGpr(x.Rb), AGpr(x.Bits(64, 72)));
 
             ASet(context, x, res);
         }
