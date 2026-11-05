@@ -796,6 +796,12 @@ static int pool_find(uint64_t addr, uint64_t len) {
     for (int i = 0; i < g_npool; i++) if (addr >= g_pools[i].lo && addr + len <= g_pools[i].hi) return g_plast = i;
     return -1;
 }
+// Whether [addr, addr + len) lies in a pool the host maps, without putting that pool into the residency set as mtl_addr does: for a check that hands the GPU no address
+static int mtl_addr_mapped(uint64_t addr, uint64_t len) {
+    if (pc_get(addr, len)) return 1;
+    pthread_mutex_lock(&g_mu); int i = pool_find(addr, len); pthread_mutex_unlock(&g_mu);
+    return i >= 0;
+}
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     const pc_ent *c = pc_get(addr, len);
     if (c) { *buf = (__bridge void *)c->buf; *off = addr - c->base; return 1; }
@@ -2797,9 +2803,11 @@ static void rb_swap_rows(uint8_t *p, size_t wb, size_t rows, size_t nz, size_t r
         else for (size_t i = 0; i < wb / 2; i++) q[i] = (uint16_t)((q[i] & ~m) | (q[i] & 31u) << shift | (q[i] >> shift & 31u));
     }
 }
-// A zero-copy buffer over [addr, addr + len) of a large pool for the open upload batch, which retires it with its staging; nil outside a large pool (or if it is refused: the caller looks the address up as usual)
-static id<MTLBuffer> up_big_src(uint64_t addr, uint64_t len, uint64_t *off) {
-    pthread_mutex_lock(&g_mu); int in = big_of(addr) >= 0; pthread_mutex_unlock(&g_mu);
+static int gmem_all(void); static int bm_has(uint64_t lo);
+// A zero-copy buffer over [addr, addr + len) of a large pool for the open upload batch, which retires it with its staging; nil outside a large pool (or if it is refused: the caller looks the address up as usual).
+// The same for a texture in a pool the game took no buffer address in (texture_only set, see mtl_pool_buffer_addr): such a pool is in no pool table, and an upload must not wire it whole for good
+static id<MTLBuffer> up_big_src(uint64_t addr, uint64_t len, uint64_t *off, int texture_only) {
+    int in = texture_only; if (!in) { pthread_mutex_lock(&g_mu); in = big_of(addr) >= 0; pthread_mutex_unlock(&g_mu); }
     if (!in || !len) return nil;
     uintptr_t pg = (uintptr_t)getpagesize(), a = (uintptr_t)addr & ~(pg - 1), b = ((uintptr_t)addr + len + pg - 1) & ~(pg - 1);
     id<MTLBuffer> buf = [g_dev newBufferWithBytesNoCopy:(void *)a length:b - a options:MTLResourceStorageModeShared deallocator:nil];
@@ -2860,7 +2868,8 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     void *mb; uint64_t mo;
     // A texture in a large pool (BIG_MIN) is read through a buffer of its own, held by the upload batch: a one-time read must not leave its chunk wired for good
     id<MTLBuffer> upsrc = nil;
-    if (!rb_shift && !sparse && g_nvn_deswz_gpu && g_nbig) { up_begin(); upsrc = up_big_src((uint64_t)t->mem, t->L.size, &mo); if (upsrc) mb = (__bridge void *)upsrc; }
+    int tex_only = t->pool && !gmem_all() && !bm_has((uint64_t)t->pool->mem);
+    if (!rb_shift && !sparse && g_nvn_deswz_gpu && (g_nbig || tex_only)) { up_begin(); upsrc = up_big_src((uint64_t)t->mem, t->L.size, &mo, tex_only); if (upsrc) mb = (__bridge void *)upsrc; }
     int use_gpu = !rb_shift && !sparse && g_nvn_deswz_gpu && (upsrc || mtl_addr((uint64_t)t->mem, t->L.size, &mb, &mo));   // a sparse pool's texture is gathered through its page table on the CPU
     if (g_nvn_deswz_gpu && !use_gpu && !sparse && !rb_shift) RED_ONCE(40, "swizzled texture storage is not in a memory pool; falling back to the CPU");
     if (use_gpu) {
@@ -2884,7 +2893,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         }
         size_t stg_off;
         id<MTLBuffer> stg = up_alloc(total ? total : 16, &stg_off);
-        if (upsrc) { uint64_t mo2; id<MTLBuffer> u2 = up_big_src((uint64_t)t->mem, t->L.size, &mo2); if (u2) { upsrc = u2; mb = (__bridge void *)u2; mo = mo2; } }   // up_alloc may have flushed the batch that held the first one
+        if (upsrc) { uint64_t mo2; id<MTLBuffer> u2 = up_big_src((uint64_t)t->mem, t->L.size, &mo2, tex_only); if (u2) { upsrc = u2; mb = (__bridge void *)u2; mo = mo2; } }   // up_alloc may have flushed the batch that held the first one
         size_t off = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits;
         for (unsigned l = sk; enc_ok && l < d.mipmapLevelCount + sk; l++) {
             uint32_t w = MAX(t->d.width >> l, 1u), h = MAX(t->d.height >> l, 1u), z = t->d.target == 2 ? MAX(t->d.depth >> l, 1u) : 1;
@@ -3755,11 +3764,29 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     pthread_mutex_lock(&g_res_mu); unsigned long nr = (unsigned long)g_res_objects.count; pthread_mutex_unlock(&g_res_mu);
     int live = 0, peak = 0, cap = 0; nvn_dirty_stat(&live, &peak, &cap);
     pthread_mutex_lock(&g_smu); unsigned ns = g_by_serial.n, ashared = g_alias.n, nghost = g_ghost.n; uint64_t ghost_puts = g_ghost_puts;
-    unsigned aorph = 0;   // shared textures no live texture object or finalized serial resolves to: kept only until their storage is taken over or their pool goes (alias_take_over)
+    unsigned aorph = 0, swept = 0; uint64_t aorph_mb = 0, swept_mb = 0;   // shared textures no live texture object or finalized serial resolves to: kept until their storage is taken over or their pool goes (alias_take_over), or until the sweep below
     { CFMutableSetRef held = CFSetCreateMutable(NULL, 0, NULL);
       for (uint32_t i = 0; i < g_by_serial.cap; i++) if (g_by_serial.vals[i]) CFSetAddValue(held, g_by_serial.vals[i]);
       for (uint32_t i = 0; i < g_ghost.cap; i++) if (g_ghost.vals[i]) CFSetAddValue(held, g_ghost.vals[i]);
-      for (uint32_t i = 0; i < g_alias.cap; i++) if (g_alias.vals[i] && !CFSetContainsValue(held, g_alias.vals[i])) aorph++;
+      for (uint32_t i = 0; i < g_ghost_active.cap; i++) if (g_ghost_active.vals[i]) CFSetAddValue(held, g_ghost_active.vals[i]);
+      // The sweep: an orphan nothing has looked up for DM_NVN_ALIAS_SWEEP fences (default 3600; 0 keeps them all) goes, as a takeover would take it. A game that moves its images around
+      // a pool leaves one per old place: Ocarina of Time, 1,057 of 2,485 in Kokiri Forest, with a graphics ledger of 10.9 GB on a 16 GB Mac. One recreated later over the same storage starts empty
+      static long age = -1; if (age < 0) { const char *e = getenv("DM_NVN_ALIAS_SWEEP"); age = e ? atol(e) : 3600; }
+      alias_key ks[256]; unsigned nk = 0;
+      for (uint32_t i = 0; i < g_alias.cap; i++) if (g_alias.vals[i] && !CFSetContainsValue(held, g_alias.vals[i])) {
+          uint64_t sz = ((__bridge id<MTLTexture>)g_alias.vals[i]).allocatedSize >> 20; aorph++; aorph_mb += sz;
+          alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
+          uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, &k);
+          if (age > 0 && nk < 256 && (!seen || g_fence + 1 - seen > (uint64_t)age)) { ks[nk++] = k; swept_mb += sz; }
+      }
+      for (unsigned j = 0; j < nk; j++) {
+          void *old = nvn_hm_del(&g_alias, &ks[j]); if (!old) continue;
+          nvn_hm_del(&g_alias_seen, &ks[j]); swept++;
+          id o = CFBridgingRelease(old);
+          if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
+          defer_obj_release(o);
+      }
+      if (swept) g_ser_gen++;
       CFRelease(held); }
     pthread_mutex_unlock(&g_smu);
     unsigned long dead_n = 0; unsigned long long dead_mb = 0;
@@ -3771,6 +3798,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
     MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
+    if (swept || aorph) MLOG("shared textures no texture object holds: %u, %llu MB; %u of them swept, %llu MB (DM_NVN_ALIAS_SWEEP)", aorph, (unsigned long long)aorph_mb, swept, (unsigned long long)swept_mb);
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed, %llu copied into aligned rows (%llu MB) "
@@ -8228,7 +8256,10 @@ static int tex_storage_live(const tex_t *t) {
     const pool_t *p = t->pool; void *mb; uint64_t mo;
     if (p && p->magic != MAGIC('P', 'O', 'O', 'L')) return 0;
     if (p && nvn_sparse_pool(p)) return 1;
-    return mtl_addr((uint64_t)(uintptr_t)t->mem, t->L.size ? t->L.size : 1, &mb, &mo);
+    (void)mb; (void)mo;
+    // Only whether the storage is mapped: mtl_addr would put the pool into the residency set, and this runs for every registered texture of a pool walk, so every pool holding a
+    // registered texture stayed wired whole (Ocarina of Time: 5.3 GB of pools on top of 6.4 GB of textures, out of GPU memory in Kokiri Forest on a 16 GB Mac)
+    return mtl_addr_mapped((uint64_t)(uintptr_t)t->mem, t->L.size ? t->L.size : 1);
 }
 // Whether a registered ID's texture cannot be of Metal type dtt, from its descriptor alone (1D and 2D with their arrays, cube and cube array, the multisample pair count as one class, as
 // the host may make either of a pair). The walk below used to make a Metal texture for every registered ID before it compared the type: PRAGMATA's cube-texture pool (5 of its 13,568 IDs
@@ -8239,6 +8270,7 @@ static int ttype_apart(const treg_t *r, int dtt) {
     int a = ttype_class((long)ttype(tg, -1)), b = ttype_class(dtt);
     return a >= 0 && b >= 0 && a != b;
 }
+static int pool_skip_retired(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_POOL_SKIP_RETIRED"); v = e ? atoi(e) != 0 : DM_GAME_POOL_SKIP_RETIRED; if (v) MLOG("DM_NVN_POOL_SKIP_RETIRED: pool tables give retired texture IDs without a view the dummy"); } return v; }
 // One entry of a pool table: the resource ID of what the ID holds (0: nothing of the type). gone / transient count IDs without storage and retired ones
 static uint64_t pool_entry(int samp, int dtt, int id_, int *gone, int *transient) {
     if (id_ <= 0) return 0;
@@ -8246,6 +8278,10 @@ static uint64_t pool_entry(int samp, int dtt, int id_, int *gone, int *transient
     if (id_ >= g_ntreg || !g_treg[id_].ok) return 0;
     if (g_treg[id_].gone || (!g_treg[id_].view && !tex_storage_live(&g_treg[id_].t))) { ++*gone; return 0; }
     if (ttype_apart(&g_treg[id_], dtt)) return 0;   // PR #1319: no Metal texture for an ID whose descriptor cannot be of the walked type
+    // DM_NVN_POOL_SKIP_RETIRED=1: an ID whose texture the game has finalized (retired) and that holds no view now gets the dummy, rather than a Metal texture made again from its storage.
+    // The walk covers every registered ID (Ocarina of Time: about 33,000 in its texture pool), and at a scene change the game finalizes the old scene's textures and leaves their IDs
+    // registered: each table rebuild made them again, 1,500 textures and 2.5 GB held only through retired IDs, then as much in deferred release, and GPU memory passed Metal's working set
+    if (g_treg[id_].retired && !g_treg[id_].view && pool_skip_retired()) { ++*gone; return 0; }
     void *tv = NULL; uint64_t tr = tex_fast_rid(id_, &tv);
     if (!tv || ((__bridge id<MTLTexture>)tv).textureType != (MTLTextureType)dtt) return 0;
     *transient |= g_treg[id_].retired && g_treg[id_].transient_sub == g_sub_serial;
@@ -8471,19 +8507,70 @@ static uint64_t support_gpu(void) { static uint64_t gpu; if (!gpu) gpu = support
 // range through them as 0 looped (0 - 1) >> 5 times, a GPU hang (docs/reference/shaders.md, More memory pools than the raw pool table had entries)
 enum { GMEM_MAP_MAX = 1 << 20 };   // entries at most (a 32 MB table, if ever a game had that many pools); pools past them are still left out, with a red line
 static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen; static uint64_t g_gmem_only_mb;   // g_gmem_only_mb: pools first reached through the table (DM_NVN_GMEM_RES)
+// Buffer ranges: the pools whose buffer addresses the game took (nvnMemoryPoolGetBufferAddress, nvnBufferInitialize, nvnTextureGetTextureAddress). Raw global memory follows an address the
+// shader loaded from memory, and the game can only have written such an address after taking it from one of these. A pool it never took one from holds only textures (render targets, images) and
+// needs no entry: leaving it out also keeps it out of the residency set, where every entry is wired. Ocarina of Time (0400486024DEC000): over 4,500 pools in Kokiri Forest, all wired (10.3 GB GPU
+// allocated on a 16 GB Mac, Metal's working set 12.1 GB, frames 30-65 ms from paging). Marks are kept by address, as a virtual pool's runs are registered again on each mapping; one left by a
+// finalized pool only puts a later pool there into the table, the safe side. DM_NVN_GMEM_ALL=1 lists every pool, as before
+enum { BM_SLOTS = 1 << 15 };
+static uint64_t g_bm_lo[BM_SLOTS], g_bm_hi[BM_SLOTS]; static int g_bm_n; static pthread_mutex_t g_bm_mu = PTHREAD_MUTEX_INITIALIZER;
+static int gmem_all(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_GMEM_ALL"); v = e && atoi(e); if (v) MLOG("DM_NVN_GMEM_ALL: the raw global memory table lists every pool"); } return v; }
+void mtl_pool_buffer_addr(const void *mem, uint64_t size) {
+    uint64_t lo = (uint64_t)mem, hi = lo + (size ? size : 1);
+    if (!lo) return;
+    unsigned h = (unsigned)((lo >> 12) * 0x9E3779B1u) & (BM_SLOTS - 1);
+    pthread_mutex_lock(&g_bm_mu);
+    for (unsigned k = 0; k < BM_SLOTS; k++, h = (h + 1) & (BM_SLOTS - 1)) {
+        if (g_bm_lo[h] == lo) { if (g_bm_hi[h] < hi) { g_bm_hi[h] = hi; atomic_fetch_add(&g_pool_gen, 1); } break; }
+        if (!g_bm_lo[h]) {
+            if (g_bm_n >= BM_SLOTS * 3 / 4) { static int said; if (!said++) MLOG("[RED] raw global memory: %d buffer ranges, the mark table is full; later pools are listed as if marked", g_bm_n); g_bm_n = -1; break; }
+            if (g_bm_n < 0) break;
+            g_bm_lo[h] = lo; g_bm_hi[h] = hi; g_bm_n++; atomic_fetch_add(&g_pool_gen, 1); break;
+        }
+    }
+    pthread_mutex_unlock(&g_bm_mu);
+}
+static int bm_has(uint64_t lo) {   // a buffer address was taken in the pool starting at lo (or the mark table overflowed: every pool counts)
+    unsigned h = (unsigned)((lo >> 12) * 0x9E3779B1u) & (BM_SLOTS - 1); int r = 0;
+    pthread_mutex_lock(&g_bm_mu);
+    if (g_bm_n < 0) r = 1;
+    else for (unsigned k = 0; k < BM_SLOTS; k++, h = (h + 1) & (BM_SLOTS - 1)) { if (g_bm_lo[h] == lo) { r = 1; break; } if (!g_bm_lo[h]) break; }
+    pthread_mutex_unlock(&g_bm_mu);
+    return r;
+}
+typedef struct { uint64_t lo, hi; } bm_iv;
+static int bm_cmp(const void *a, const void *b) { uint64_t x = ((const bm_iv *)a)->lo, y = ((const bm_iv *)b)->lo; return x < y ? -1 : x > y; }
+static bm_iv *bm_sorted(int *n) {   // the marks as sorted, merged intervals; NULL with *n = -1 when every pool counts as marked
+    pthread_mutex_lock(&g_bm_mu);
+    if (g_bm_n < 0) { pthread_mutex_unlock(&g_bm_mu); *n = -1; return NULL; }
+    bm_iv *v = malloc(sizeof *v * (g_bm_n + 1)); int m = 0;
+    for (unsigned k = 0; k < BM_SLOTS; k++) if (g_bm_lo[k]) v[m++] = (bm_iv){g_bm_lo[k], g_bm_hi[k]};
+    pthread_mutex_unlock(&g_bm_mu);
+    qsort(v, m, sizeof *v, bm_cmp);
+    int o = 0; for (int i = 0; i < m; i++) { if (o && v[i].lo <= v[o - 1].hi) { if (v[i].hi > v[o - 1].hi) v[o - 1].hi = v[i].hi; } else v[o++] = v[i]; }
+    *n = o; return v;
+}
+static int bm_overlaps(const bm_iv *v, int n, uint64_t lo, uint64_t hi) {   // any interval meeting [lo, hi)
+    if (n < 0) return 1;
+    int a = 0, b = n; while (a < b) { int m = (a + b) / 2; if (v[m].hi <= lo) a = m + 1; else b = m; }
+    return a < n && v[a].lo < hi;
+}
 static uint64_t gmem_map_gpu(void) {
     uint64_t gen = atomic_load(&g_pool_gen);
     if (g_gmem_buf && g_gmem_gen == gen) return g_gmem_buf.gpuAddress;
     int n = 1, over = 0; uint64_t end = 0, over_lo = 0, over_bytes = 0;
+    int skipped = 0; uint64_t skipped_mb = 0;   // pools without a buffer address, left out (mtl_pool_buffer_addr)
+    int nbm = -1; bm_iv *bm = gmem_all() ? NULL : bm_sorted(&nbm);
     pthread_mutex_lock(&g_mu);
     static int gres = -1; if (gres < 0) { const char *e = getenv("DM_NVN_GMEM_RES"); gres = !e || atoi(e); }
     // the pool table reaches all of a large pool. Not with DM_NVN_GMEM_RES=0: a whole-pool entry is what big_lookup then hands every lookup (b->full), so it wired all of the pool
     // for any binding (PRAGMATA: a 995 MB pool whole); the table lists the chunks the lookups made instead
-    if (gres) for (int k = 0; k < g_nbig; k++) if (!g_big[k].full) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }
+    if (gres) for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && bm_overlaps(bm, nbm, g_big[k].lo, g_big[k].hi)) { int n = big_new(&g_big[k], g_big[k].a, g_big[k].b, g_big[k].b, 0); if (n >= 0) g_big[k].full = n + 1; }
     gen = atomic_load(&g_pool_gen); pidx_sort();
     uint64_t (*rng)[3] = malloc(((size_t)g_npool + 1) * sizeof *rng); if (!rng) abort();   // the ranges (start, end, delta), taken under g_mu and written into the table after it
     for (int k = 0; k < g_npool; k++) {
         pool_ent *p = &g_pools[g_pidx[k]];
+        if (!bm_overlaps(bm, nbm, p->lo, p->hi)) { skipped++; skipped_mb += (p->hi - p->lo) >> 20; continue; }
         // DM_NVN_GMEM_RES=0 (diagnostic): the table lists every pool but makes none resident; a pool comes into the residency set when a binding addresses it (pool_res).
         // How many MB only the table made resident is logged once: PRAGMATA's 190 such shaders kept all of its ~4 GB of pools wired on an 8 GB Mac
         if (!p->res && gres) { res_add(p->buf); p->res = 1; g_pool_res_n++; g_gmem_only_mb += (p->end - p->base) >> 20; }
@@ -8493,6 +8580,7 @@ static uint64_t gmem_map_gpu(void) {
         rng[n][0] = lo; rng[n][1] = hi; rng[n][2] = p->gpu - p->base; n++; end = hi;
     }
     pthread_mutex_unlock(&g_mu);
+    free(bm);
     unsigned cap = DMSH_GMEM_MAP_ENTRIES; while (cap < (unsigned)n) cap <<= 1;
     id<MTLBuffer> b = [g_dev newBufferWithLength:(NSUInteger)cap * DMSH_GMEM_MAP_ENTRY options:MTLResourceStorageModeShared];
     uint8_t *t = (uint8_t *)b.contents; memset(t, 0, b.length);
@@ -8506,7 +8594,7 @@ static uint64_t gmem_map_gpu(void) {
     unsigned old = g_gmem_buf ? (unsigned)(g_gmem_buf.length / DMSH_GMEM_MAP_ENTRY) : 0;
     if (g_gmem_buf) defer_obj_release(g_gmem_buf);
     g_gmem_buf = b; g_gmem_gen = gen;
-    { static int said; if (!said++) MLOG("raw global memory: pool table of %d ranges in %u entries (pool generation %llu), rebuilt whenever a pool comes or goes", n - 1, cap, (unsigned long long)gen); }
+    { static int said, peak; if (!said++ || n - 1 > peak + 512) { peak = n - 1; MLOG("raw global memory: pool table of %d ranges in %u entries, %d pools without a buffer address left out (%llu MB; pool generation %llu), rebuilt whenever a pool comes or goes", n - 1, cap, skipped, (unsigned long long)skipped_mb, (unsigned long long)gen); } }
     if (old && cap > old) MLOG("raw global memory: the pool table grows to %u entries for %d ranges", cap, n - 1);
         { static uint64_t last; if (g_gmem_only_mb >= last + 256) { last = g_gmem_only_mb; MLOG("raw global memory: %llu MB of pools reached first through the pool table, %s", (unsigned long long)g_gmem_only_mb, "made resident for it (DM_NVN_GMEM_RES=0 leaves them out)"); } }
     return b.gpuAddress;

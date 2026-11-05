@@ -9,6 +9,7 @@
 #include "../hle_movie_avc.c"
 #include "../hle_movie_av1.c"
 #include <assert.h>
+void dm_last_movie(char *out, size_t n) { if (n) out[0] = 0; }   // hle_fs.c (DM_MOVIE_SKIP names the movie by the file the game opened last)
 
 uint64_t now_ns(void) { return 1; }
 __thread _Atomic int dm_host_work;   // hle_thread.c
