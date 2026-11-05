@@ -141,6 +141,7 @@ static void finalized_bindless_pool(void) {
     for (int i = 0; i < N; i++) mtl_reg_tex(FIRST + i, NULL, NULL);
     h_nvnMemoryPoolFinalize(&pool);
     defer_drain(); munmap(mem, len);
+}
 // A CPU write published through a buffer must be visible to a texture sharing its
 // storage. Compare no flush, a direct pool flush, and a buffer-relative flush.
 static void flushed_buffer_upload(int flush_kind) {
@@ -183,6 +184,7 @@ static void flushed_buffer_upload(int flush_kind) {
     defer_drain(); munmap(mem,len);
 }
 int main(int argc, const char **argv) { @autoreleasepool {
+    setenv("DM_NVN_POOL_SKIP_RETIRED", "0", 1);   // finalized_bindless_pool checks that retired IDs are made again; a profile with pool_skip_retired (Ocarina of Time) gives them the dummy
     enum { N = 6442, BASE = 1000 };
     static tex_t t[N];
     for (int i = 0; i < N; i++) { t[i].serial = BASE + i; t[i].d.width = t[i].d.height = 4; t[i].d.depth = 1; t[i].d.format = 0x25; mtl_tex_init(&t[i]); }
