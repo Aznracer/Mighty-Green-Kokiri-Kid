@@ -131,6 +131,7 @@ DM_NVN_CS_HOIST	switch	`0` makes a compute dispatch between the draws of a pass 
 DM_NVN_CUT	switch	`=<draws>`: the replay commits its command buffer every that many draws, between passes (default 64; `0` one command buffer per submission, except the cut after a buffer-to-texture copy)
 DM_NVN_DEFER	switch	`0` turns off the deferred pass merging of the TBDR optimizations (which run only with `DM_NVN_TBDR=1`)
 DM_NVN_DEFER_AB	diagnostic	`=1` keeps the deferred pass merging (with `DM_NVN_TBDR=1`) off until the second screenshot has been written, then turns it on, to compare the pictures with and without it
+DM_NVN_DEMAND	switch	`=1`: a shader with no library is asked for in `<library dir>/demand.txt` instead of failing, and its draws wait until `dm/gfx/tools/dmsh_demand.py` builds it (a library built in parts, as a run reaches it)
 DM_NVN_DEPTHOVR	diagnostic	`=<fragment shader key prefix>,…`: those draws compare depth with `ALWAYS`; with `DM_NVN_HILITE`, tells "the depth test rejects every fragment" from "nothing rasterizes"
 DM_NVN_DESWZ_GPU	switch	`0` deswizzles textures on the CPU instead of the GPU, so their pools stay out of the residency set (default `1`)
 DM_NVN_DIRECT_UPLOAD	switch	0 disables bounded direct RGBA16F array uploads and keeps staged copies; on by default for supported non-sparse textures.

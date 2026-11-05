@@ -5328,16 +5328,51 @@ static NvShader *builtin_get(const char *ctl) {
     }
     return nil;
 }
+// On-demand shaders (DM_NVN_DEMAND=1: the Mac's bring-up of a game whose library is partial, dm/gfx/tools/dmsh_demand.py beside the host). A full library of a large map takes hours
+// (Yoshi: 133,154 shaders, 2.5 hours on an M4 Pro), and every change of the translation chain starts it over. Here a program stage with no library asks for its key once, in
+// <library dir>/demand.txt (key, stage), and its program is built without it (the draws that need the stage are left out, as for any missing shader); dmsh_demand.py builds the
+// keys asked for with dmsh_build.py into the same library. Every 250 ms the keys still waited for are looked up: a reflection json (dmsh_build.py writes it after the libraries)
+// takes the programs built without a stage out of the serial table, so their next use builds them with what is there; <key>.demand_failed ends the wait for a key that did not build
+static int demand_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DEMAND"); v = e && *e && strcmp(e, "0") ? 1 : 0; if (v) MLOG("on-demand shaders: missing keys go to %s/demand.txt (dmsh_demand.py builds them)", g_msl_dir.UTF8String); } return v; }
+static NSMutableSet<NSString *> *g_dm_asked; static NSMutableArray<NSString *> *g_dm_wait;   // the keys asked for; those not yet built or failed
+static uint64_t *g_dm_ser; static int g_dm_nser, g_dm_cap; static uint64_t g_dm_last;   // serials of the programs built without a stage; the last look-up
+static void demand_ask(NSString *k, NSString *stage) {
+    if (!g_dm_asked) { g_dm_asked = [NSMutableSet set]; g_dm_wait = [NSMutableArray array]; }
+    if ([g_dm_asked containsObject:k]) return;
+    [g_dm_asked addObject:k]; [g_dm_wait addObject:k];
+    FILE *f = fopen([g_msl_dir stringByAppendingPathComponent:@"demand.txt"].fileSystemRepresentation, "a");
+    if (f) { fprintf(f, "%s\t%s\n", k.UTF8String, stage.UTF8String); fclose(f); } else { static int once; if (!once++) MLOG("[RED] on-demand shaders: cannot write %s/demand.txt", g_msl_dir.UTF8String); }
+}
+static void demand_note(uint64_t serial) {
+    for (int i = 0; i < g_dm_nser; i++) if (g_dm_ser[i] == serial) return;
+    if (g_dm_nser == g_dm_cap) { g_dm_cap = g_dm_cap ? 2 * g_dm_cap : 64; g_dm_ser = realloc(g_dm_ser, sizeof *g_dm_ser * g_dm_cap); if (!g_dm_ser) { g_dm_cap = g_dm_nser = 0; return; } }
+    g_dm_ser[g_dm_nser++] = serial;
+}
+static void demand_poll(void) {
+    if (!g_dm_wait.count) return;
+    uint64_t t = bp_now(); if (t - g_dm_last < 250000000ull) return; g_dm_last = t;
+    NSFileManager *fm = [NSFileManager defaultManager]; int ready = 0;
+    for (NSInteger i = (NSInteger)g_dm_wait.count - 1; i >= 0; i--) {
+        NSString *k = g_dm_wait[(NSUInteger)i];
+        if ([fm fileExistsAtPath:[NSString stringWithFormat:@"%@/%@_b.json", g_msl_dir, k]]) { ready++; [g_dm_wait removeObjectAtIndex:(NSUInteger)i]; }
+        else if ([fm fileExistsAtPath:[NSString stringWithFormat:@"%@/%@.demand_failed", g_msl_dir, k]]) { MLOG("[RED] on-demand shader %s did not build (see dmsh_demand.py's output)", k.UTF8String); [g_dm_wait removeObjectAtIndex:(NSUInteger)i]; }
+    }
+    if (!ready) return;
+    static uint64_t n; n += ready; MLOG("on-demand shaders: %d more built (%llu in all, %lu still waited for); %d programs built again at their next use", ready, n, (unsigned long)g_dm_wait.count, g_dm_nser);
+    for (int i = 0; i < g_dm_nser; i++) serial_del(g_dm_ser[i]);   // a deferred release, as when the game finalizes a program; the next prog_get builds it again
+    g_dm_nser = 0;
+}
 static void up_mfx_read_color(NvShader *cs, const NVNshaderData *sd);
 static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only on the submit thread
     prog_t *p = (prog_t *)cp;
     static const prog_t *lp; static uint64_t lser, lgen; static NvProg *lpr;   // Last result: same object, same serial and unchanged serial table means it is used directly
+    if (demand_on()) demand_poll();   // before the generation is read: a finished key takes programs out of the table
     uint64_t gen = g_prog_gen;
     if (p == lp && p->serial == lser && gen == lgen && lpr) return lpr;
     __unsafe_unretained NvProg *have = p->serial ? serial_get(p->serial) : nil;
     if (have) { lp = p; lser = p->serial; lgen = gen; lpr = have; return have; }
     shmap_load();
-    NvProg *o = [NvProg new];
+    NvProg *o = [NvProg new]; int incomplete = 0;
     for (unsigned i = 0; i < p->nstage; i++) {
         // Key = sha256(first 0x880 bytes of the control section + code area): many of Mario's shaders share a control section but differ in code (dm/gfx/tools/shader_split.py). It was computed at SetShaders (hle_nvn.c): by now the game may have freed the control section
         uint8_t md[8]; prog_key(p, i, md);
@@ -5357,12 +5392,15 @@ static __unsafe_unretained NvProg *prog_get(const prog_t *cp) {   // Called only
         }
         int st = stage_of(stage);
         NvShader *sh = st >= 0 ? shader_get([k stringByAppendingString:@"_b"], st) : nil;
-        if (sh) o->sh[st] = sh; else MLOG("[RED] shader %s (%s) failed to load: build the shaders with dm/gfx/tools/dmsh_build.py first", k.UTF8String, stage.UTF8String);
+        if (sh) o->sh[st] = sh;
+        else if (st >= 0 && demand_on()) { demand_ask(k, stage); incomplete = 1; }
+        else MLOG("[RED] shader %s (%s) failed to load: build the shaders with dm/gfx/tools/dmsh_build.py first", k.UTF8String, stage.UTF8String);
         if (sh && st == 5) up_mfx_read_color(sh, &p->sd[i]);
         if (!sh && st == 2) strlcpy(o->gs_miss, k.UTF8String, sizeof o->gs_miss);
     }
     prog_fold_gs(o);   // a slice-writing geometry shader: the vertex shader's layer entry points instead
     if (p->serial) serial_put(p->serial, o);
+    if (incomplete && p->serial) demand_note(p->serial);   // built again once a key it waits for is built (demand_poll)
     return o;
 }
 void mtl_prog_release(prog_t *p) { if (p->serial) serial_del(p->serial); }
