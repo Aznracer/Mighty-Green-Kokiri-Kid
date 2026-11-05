@@ -41,6 +41,7 @@ On `main` docked, every 3D target is 768x432 from the first frame of the title t
 - [The camera commands of SDK 21's own camera module](../../../docs/reference/services.md#the-camera-commands-of-sdk-21s-own-camera-module): the game's own camera module, a console with no camera plugged in.
 - [The graphics scale is the GPU share, not the operation mode](../../../docs/reference/services.md#the-graphics-scale-is-the-gpu-share-not-the-operation-mode): the 768x432 scene docked.
 - [The display's largest layer](../../../docs/reference/services.md#the-displays-largest-layer): the 1920x1080 output on a 4K screen.
+- [sRGB textures loaded and stored raw through an image](../../../docs/reference/rendering.md#srgb-textures-loaded-and-stored-raw-through-an-image): the pale picture with grey blacks (the upscaler network's encoded store was encoded again); measured on a build of our fork, not on `main`.
 - [The DLSS network resized](../../../docs/reference/rendering.md#the-dlss-network-resized): `nvnDlssNetworkResize`.
 - [TXD through a uniform register kept no handle](../../../docs/reference/shaders.md#txd-through-a-uniform-register-kept-no-handle): 281 pixel shaders, the fur shells among them.
 - [A handle pair ORed sampler word first](../../../docs/reference/shaders.md#a-handle-pair-ored-sampler-word-first): 62 pixel shaders.
