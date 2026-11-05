@@ -1,4 +1,4 @@
-// Host CMIF services. Buffers here are MapAlias descriptors, not Pointer / AutoSelect buffers.
+// Host CMIF services. X buffers are input Pointer descriptors; A/B are MapAlias.
 // hle_sf owns returned child objects and calls close when their last session/domain reference goes away.
 #pragma once
 #include "hle.h"
@@ -12,7 +12,7 @@ typedef struct {
     int send_pid;
     uint64_t pid;   // authenticated guest process identity, never the client's placeholder PID
     uint32_t copies[15], moves[15]; // borrowed input handle values; handlers validate/retain what they use
-    sf_buffer a[15], b[15];
+    sf_buffer x[15], a[15], b[15];
 } sf_request;
 
 typedef struct sf_reply sf_reply;
@@ -34,3 +34,4 @@ sf_object sf_auddmg_root(void);
 sf_object sf_audsmx_root(void);
 Result sf_audsmx_attach(uint64_t process, uint32_t stream, uint32_t device);
 Result sf_audsmx_detach(uint64_t process, uint32_t stream);
+sf_object sf_prepo_root(unsigned permissions);

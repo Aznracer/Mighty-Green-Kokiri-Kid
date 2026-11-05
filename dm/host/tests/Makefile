@@ -47,6 +47,7 @@ run: $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_to
 	$(B)/t_auddmg
 	$(B)/t_audio_input_ring
 	$(B)/t_audsmx
+	$(B)/t_prepo
 	$(B)/t_time
 	$(B)/t_sync_wait
 	$(B)/t_shared_font
@@ -402,3 +403,7 @@ coverage:
 	rm -rf $(B)/cov/prof
 	LLVM_PROFILE_FILE="$(call cov_profile,$(B)/cov)" $(MAKE) -i B=$(B)/cov SAN="$(COV_FLAGS)" run
 	@$(call cov_export,$(B)/cov)
+
+run: $(B)/t_prepo
+$(B)/t_prepo: t_prepo.c t_condvar_stub.c ../hle_prepo.c ../hle_sf.c ../hle_thread.c ../sf_service.h ../dm.h $(GAME_H) | $(B)
+	$(CLANG) -O1 -g -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_prepo.c t_condvar_stub.c
