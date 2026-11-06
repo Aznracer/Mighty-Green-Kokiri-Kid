@@ -26,6 +26,9 @@ zip_store	.bwav:.webm:.zs:.metallib
 # Result 0, sdk+0x16cb54). 8 GB leaves room for its fragmentation; the reserve grows by the same 5.6 GB so the heap keeps its size
 mem_reserve	0x468000000
 mem_alias	0x200000000
+# A map that would take the process past the application pool fails with ResultLimitReached, as on Horizon: the SDK's allocator keeps freed pages mapped until a map fails,
+# then gives them back. Without it PR #1444 reports crashes entering Hyrule Castle, Kakariko Village and Death Mountain and a black screen leaving the Deku Tree
+mem_map_limit	on
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x3000000
