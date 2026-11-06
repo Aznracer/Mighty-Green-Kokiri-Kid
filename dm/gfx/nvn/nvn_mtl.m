@@ -9136,6 +9136,10 @@ static int ttype_apart(const treg_t *r, int dtt) {
 }
 static int pool_skip_retired(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_POOL_SKIP_RETIRED"); v = e ? atoi(e) != 0 : DM_GAME_POOL_SKIP_RETIRED; if (v) MLOG("DM_NVN_POOL_SKIP_RETIRED: pool tables give retired texture IDs without a view the dummy"); } return v; }
 // One entry of a pool table: the resource ID of what the ID holds (0: nothing of the type). gone / transient count IDs without storage and retired ones
+static int g_tex_lazy = -1; static uint64_t g_stat_lazy_skip;
+static uint64_t g_tex_lazy_min;
+static int tex_lazy(void) { int v = g_tex_lazy; if (v < 0) { const char *e = getenv("DM_TEX_LAZY"); v = e ? atoi(e) : 0; const char *m = getenv("DM_TEX_LAZY_MIN_KB"); g_tex_lazy_min = m ? (uint64_t)atoll(m) << 10 : 0;
+    if (v) MLOG("DM_TEX_LAZY=%d: pool walks make no host texture for %s of %llu KB or more (DM_TEX_LAZY_MIN_KB)", v, v == 2 ? "IDs in CPU_NO_ACCESS pools" : "any ID", (unsigned long long)(g_tex_lazy_min >> 10)); g_tex_lazy = v; } return v; }
 static uint64_t pool_entry(int samp, int dtt, int id_, int *gone, int *transient) {
     if (id_ <= 0) return 0;
     if (samp) return id_ < g_nsreg && g_sreg_ok[id_] && samp_fast(id_) ? g_srid[id_] : 0;
@@ -9146,6 +9150,9 @@ static uint64_t pool_entry(int samp, int dtt, int id_, int *gone, int *transient
     // The walk covers every registered ID (Ocarina of Time: about 33,000 in its texture pool), and at a scene change the game finalizes the old scene's textures and leaves their IDs
     // registered: each table rebuild made them again, 1,500 textures and 2.5 GB held only through retired IDs, then as much in deferred release, and GPU memory passed Metal's working set
     if (g_treg[id_].retired && !g_treg[id_].view && pool_skip_retired()) { ++*gone; return 0; }
+    { int lz = tex_lazy(); if (lz && !g_treg[id_].view && g_treg[id_].t.L.size >= g_tex_lazy_min && (lz != 2 || (g_treg[id_].t.pool && (g_treg[id_].t.pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS))) && !tex_get(g_treg[id_].t.serial)) {
+        if (!(++g_stat_lazy_skip & (g_stat_lazy_skip - 1)) && g_stat_lazy_skip >= 64) MLOG("DM_TEX_LAZY: %llu pool table entries left without a host texture so far", (unsigned long long)g_stat_lazy_skip);
+        return 0; } }
     if (g_treg[id_].tt && g_treg[id_].tt != (uint8_t)(dtt + 1)) { g_stat_pool_tt_skip++; return 0; }   // PR #1428: a texture of another type, without making its view again
     void *tv = NULL; uint64_t tr = tex_fast_rid(id_, &tv);
     if (!tv || ((__bridge id<MTLTexture>)tv).textureType != (MTLTextureType)dtt) return 0;
@@ -14586,7 +14593,9 @@ static int fx_wanted(MTLViewport vp, NSUInteger cw, NSUInteger ch) {
 }
 // Encodes the upscale of the rectangle r of raw into cb (see above); returns the scaled picture, which the present pass draws 1:1 into vp, or nil (the bilinear pass).
 // remake_wait: fx is the present thread's, whose textures presents still on the GPU may read: a new scaler waits for them and for FX_REMAKE_PRESENTS presents since the last
-static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTexture> raw, const NSUInteger r[4], MTLViewport vp, MTLPixelFormat out_pf, int remake_wait) {
+// direct: the drawable, when the picture fills it 1:1 (direct_ok): the scaler writes it and the present pass is not drawn (*wrote = 1). iPad Pro 13" M4, Breath of the Wild 1920x1440 → 2752x2064:
+// that pass read the scaler's output and wrote the drawable, about 0.3 ms of the present's 2.2
+static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTexture> raw, const NSUInteger r[4], MTLViewport vp, MTLPixelFormat out_pf, int remake_wait, id<MTLTexture> direct, int *wrote) {
     NSUInteger cw = r[2], ch = r[3], ow = (NSUInteger)vp.width, oh = (NSUInteger)vp.height;
     if (fx_mode() != 1 || !fx_wanted(vp, cw, ch)) return nil;
     if (!fx->sc || fx->in.width != cw || fx->in.height != ch || fx->in.pixelFormat != raw.pixelFormat || fx->out.width != ow || fx->out.height != oh || fx->out.pixelFormat != out_pf) {
@@ -14620,11 +14629,19 @@ static id<MTLTexture> fx_encode(fx_state *fx, id<MTL4CommandBuffer> cb, id<MTLTe
     }
     id<MTL4ComputeCommandEncoder> ce = [cb computeCommandEncoder];
     [ce barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageBlit visibilityOptions:resource_vis()];   // after the frame's work
-    [ce copyFromTexture:raw sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(r[0], r[1], 0) sourceSize:MTLSizeMake(cw, ch, 1) toTexture:fx->in destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
-    [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the scaler's encoders come after the copy
+    // The picture at the swapchain texture's origin, in a texture the scaler can read: it reads that texture, no copy (the copy only moved the rectangle to the origin)
+    static int inp_ok = -1; if (inp_ok < 0) { const char *e = getenv("DM_FX_INPLACE"); inp_ok = !(e && !strcmp(e, "0")); }
+    int in_place = inp_ok && !r[0] && !r[1] && raw.width == cw && raw.height == ch && raw.pixelFormat == fx->in.pixelFormat && (raw.usage & fx->sc.colorTextureUsage) == fx->sc.colorTextureUsage && raw.storageMode == MTLStorageModePrivate;
+    if (!in_place) [ce copyFromTexture:raw sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(r[0], r[1], 0) sourceSize:MTLSizeMake(cw, ch, 1) toTexture:fx->in destinationSlice:0 destinationLevel:0 destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [ce barrierAfterStages:MTLStageBlit beforeQueueStages:MTLStageAll visibilityOptions:resource_vis()];   // the scaler's encoders come after the copy (or the frame's work)
     [ce endEncoding];
-    fx->sc.colorTexture = fx->in; fx->sc.inputContentWidth = cw; fx->sc.inputContentHeight = ch; fx->sc.outputTexture = fx->out;
+    { static int once; if (in_place && !once++) MLOG("present upscaling: MetalFX reads the swapchain texture in place (%lux%lu of %lux%lu), no copy", (unsigned long)cw, (unsigned long)ch, (unsigned long)raw.width, (unsigned long)raw.height); }
+    int dir = direct && direct.width == ow && direct.height == oh && direct.pixelFormat == out_pf && (direct.usage & fx->sc.outputTextureUsage) == fx->sc.outputTextureUsage;
+    fx->sc.colorTexture = in_place ? raw : fx->in; fx->sc.inputContentWidth = cw; fx->sc.inputContentHeight = ch; fx->sc.outputTexture = dir ? direct : fx->out;
     [fx->sc encodeToCommandBuffer:cb];
+    if (direct && !dir) { static int nl; if (!nl++) MLOG("present upscaling: MetalFX cannot write the drawable (%lux%lu format %lu usage %#lx storage %lu; scaler output %lux%lu format %lu usage %#lx)",
+        (unsigned long)direct.width, (unsigned long)direct.height, (unsigned long)direct.pixelFormat, (unsigned long)direct.usage, (unsigned long)direct.storageMode, (unsigned long)ow, (unsigned long)oh, (unsigned long)out_pf, (unsigned long)fx->sc.outputTextureUsage); }
+    if (dir) { *wrote = 1; static int once; if (!once++) MLOG("present upscaling: MetalFX writes the drawable itself (%lux%lu), no present pass after it (DM_FX_DIRECT=0 keeps the pass)", (unsigned long)ow, (unsigned long)oh); }
     return fx->out;
 }
 // ---------- A game's own upscaler drawn by MetalFX (DM_UPSCALER) ----------
@@ -14864,7 +14881,12 @@ static int present_encode_m4(id<MTL4CommandBuffer> cb, id<MTLTexture> src, id<MT
     double dw = dst.width, dh = dst.height;
     MTLViewport vp = present_fit(src, dw, dh);
     int full = vp.originX == 0 && vp.originY == 0 && vp.width == dw && vp.height == dh;
-    id<MTLTexture> tex = present_raw_src(src), up = fx ? fx_encode(fx, cb, tex, r, vp, dst.pixelFormat, fx == &g_fx_present) : nil;
+    static int direct_ok = -1; if (direct_ok < 0) { const char *e = getenv("DM_FX_DIRECT"); direct_ok = !(e && !strcmp(e, "0")); }
+    int wrote = 0;   // the drawable as MetalFX's output: the picture fills it and is not flipped, so the pass would only copy it 1:1
+    id<MTLTexture> direct = direct_ok && full && fx == &g_fx_present && !atomic_load_explicit(&g_origin_ll, memory_order_relaxed) ? dst : nil;
+    id<MTLTexture> tex = present_raw_src(src), up = fx ? fx_encode(fx, cb, tex, r, vp, dst.pixelFormat, fx == &g_fx_present, direct, &wrote) : nil;
+    if (wrote) return PRESENT_METALFX;
+    { static int nl; if (fx == &g_fx_present && !direct && direct_ok && !nl++) MLOG("present upscaling: the drawable is not MetalFX's output: full %d flipped %d", full, atomic_load(&g_origin_ll)); }
     if (up) { tex = up; r[0] = r[1] = 0; r[2] = up.width; r[3] = up.height; }   // the scaled picture, the viewport's size: drawn 1:1
     MTL4RenderPassDescriptor *rp = [MTL4RenderPassDescriptor new];
     rp.colorAttachments[0].texture = dst;
