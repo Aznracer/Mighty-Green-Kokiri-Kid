@@ -761,3 +761,10 @@ Games read this count as a position in their own command memory and size their h
 - **Fix:** after whole-map creation succeeds, remove obsolete entries and queue their buffers through the existing fence-deferred release. Repair the moved entries' chunk/full indices, clear obsolete chunk indices and invalidate address caches. A refused whole mapping leaves existing chunks intact.
 - **Found on:** Ocarina of Time scene-load memory investigation (#1299). This complements #1319's earlier retirement of replaced chunks; it does not change chunk thresholds or raw-address exposure policy.
 - **Check:** `t_pool_retire` covers two large pools, a separate small pool, a lengthened chunk, consolidation, fence-delayed residency removal, repaired lookups and a GPU copy from the surviving whole mapping. No isolated game-memory or FPS saving is claimed.
+### Deferred releases repeatedly shift pending entries
+
+- **Symptom:** a large mixed queue of completed and pending GPU references stalls cleanup on the CPU.
+- **Cause:** removing each completed entry from the middle of an array repeatedly shifts the pending tail, with quadratic cost for interleaved fences.
+- **Fix:** partition the queue once under its existing mutex, then retire ready entries outside the lock in the original reverse order. Fence eligibility, keep-resident semantics and pending order are unchanged.
+- **Found on:** Ocarina of Time (Switch 2, #1299) scene-load investigation. This PR has synthetic lifetime validation, not an isolated gameplay FPS measurement.
+- **Check:** `t_deferred_release` queues 100,000 probes with alternating fences, verifies exact release/pending order and lifetimes, then drains the remaining fence and an empty queue.
