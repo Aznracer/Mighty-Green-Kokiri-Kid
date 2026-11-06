@@ -108,6 +108,8 @@ DM_MOTION_LOG	diagnostic	`=1` logs player 1's mapped motion sample once a second
 DM_MOVIE_SKIP	player	`=<part>[,<part>…]` (`1` or `all` = every movie): a movie whose file name (the .webm / .mp4 the game opened last, hle_fs.c) contains a part ends at its first picture, as if it had played to the end (Ocarina of Time's opening and title movies)
 DM_MOVIE_TRACE	diagnostic	When set, the movie decoder logs every call with its thread and decoder (by default the first 12 calls, then every 2^k-th)
 DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain version>/` or the one file `b-<chain version>.img` beneath it, Vulkan from `vk/`, GL from `gl/`; the app and the Mac launcher set it
+DM_NDSR	switch	Ocarina of Time's four-dispatch NDSR upscale (agl, 1536x864 to 2048x1152): `metalfx` (default) draws it with MetalFX's spatial scaler instead, `off` with a bilinear draw, `game` runs the game's shaders
+DM_NDSR_COLOR	switch	With `DM_NDSR=metalfx`: `hdr` (default) scales the colour as linear, `perceptual` as encoded
 DM_NICK	switch	The account nickname the game sees (default `Player`)
 DM_NRO	switch	`0` turns off loading of the NRO modules the game's NRR files register (on by default): every `nn::ro::LoadModule` then fails
 DM_NRO_CAPTURE	diagnostic	folder: a `nn::ro::LoadModule` with no rewritten copy writes the image to `<folder>/<SHA-256>.nro` and ends the run (the NSP script's capture of an NRO the game decodes at run time)
