@@ -178,6 +178,7 @@ static void cp_report(void) {
 #define AP_B uint64_t _ap0 = g_allocprof > 0 ? g_dev.currentAllocatedSize : 0; cp_stamp _cp0 = cp_begin()
 #define AP_E(i) do { if (g_allocprof > 0) { uint64_t _n = g_dev.currentAllocatedSize; if (_n > _ap0) g_ap_fn[i] += _n - _ap0; } cp_end(i, _cp0); } while (0)   // Per-frame arenas created so far (4 MiB each; for the memory report)
 static _Atomic int g_last_commit_error;
+static _Atomic int g_cb_err_sticky;   // command buffer errors this run, never reset: the indirect task / mesh breaker (mesh_tasks_draw, DM_NVN_MESH_GUARD)
 static _Atomic int g_up_pending;
 
 // macOS revokes a process's GPU access after GPU hangs or faults it caused: from then on every command buffer comes back MTL4CommandQueueErrorAccessRevoked ("Ignored (for causing
@@ -2062,7 +2063,7 @@ uint64_t mtl_sub_commit(void) {
         cbn_failed(&cbn, cb.error);
         if (ws_on()) ws_fb(fence, cb.GPUEndTime);
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
-        if (cb.error) { atomic_store(&g_last_commit_error, 1); res_top_once(cb.error); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
+        if (cb.error) { atomic_store(&g_last_commit_error, 1); atomic_fetch_add(&g_cb_err_sticky, 1); res_top_once(cb.error); static int n, nv; int victim = [cb.error.description containsString:@"InnocentVictim"]; if (victim ? nv++ < 1 : n++ < 8) MLOG("[RED] command buffer error details fence=%llu: %s | GPU %.3f→%.3f", (unsigned long long)fence, cb.error.description.UTF8String, cb.GPUStartTime, cb.GPUEndTime); if (!victim) MLOG("[RED] state of the failed submission fence=%llu: %s", (unsigned long long)fence, cctx.UTF8String); MLOG("[RED] command buffer execution error: %s", cb.error.localizedDescription.UTF8String); }
         gpu_lost_check(lost_test ? gpu_lost_test_error() : cb.error, "submission");
         post_complete(fence, c0, c1);
         if (atomic_load(&g_gpu_lost)) gpu_lost_release();   // the GPU signals none of these fences
@@ -2143,7 +2144,7 @@ void mtl_drain(void) { present_drop_for_suspend(); mtl_present_flush(); snap_dra
 
 // ================= Render replay =================
 #include "../../host/front.h"
-static int g_red_once[154];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+static int g_red_once[155];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
 #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
 // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
 // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
@@ -11390,6 +11391,9 @@ typedef struct { uint64_t ind, ibuf; int32_t prim, itype; uint64_t args, ixb; ui
 static ixc_ent g_ixc[IXC_MAX]; static int g_ixc_n; static uint64_t g_ixc_epoch, g_ixc_sub, g_ixc_runs, g_ixc_splits;
 static const uint8_t *g_ixc_stop;   // the uniform update that writes a record converted ahead of it: replay drops the conversions there (ixc_run, as mdx_run's g_mdx_stop)
 // The kernels: dm/gfx/msl/ixc.metal
+// DM_NVN_MESH_IND_MAXN=<n> (default 4096): a DrawMeshTasksIndirect record's count is capped at n task workgroups (ixc.metal), and a record whose count or first is over 65535 is
+// not a draw (count 0). Ocarina of Time's foliage task shaders return at once from a workgroup numbered past 4095, so 4096 loses nothing there (Peak8D's oot-full-build)
+static uint32_t mesh_ind_cap(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_MESH_IND_MAXN"); v = e && atoi(e) > 0 ? MIN(atoi(e), 65535) : 4096; MLOG("indirect task / mesh records: count capped at %d, a count or first past 65535 draws nothing (DM_NVN_MESH_IND_MAXN)", v); } return (uint32_t)v; }
 static int ixc_wanted(const p_draw *dw, const p_draw_idx *di) {
     if (dw) return dw->ind && (dw->prim == 6 || dw->prim == 7 || dw->prim == DM_PRIM_MESH_TASKS);
     return di->ind && (di->prim == 6 || di->prim == 7 || di->itype == 0);
@@ -11465,7 +11469,7 @@ static void ixc_run(const p_draw *dw, const p_draw_idx *di) {
         if (e->prim == DM_PRIM_MESH_TASKS) {
             if (rec & 3) continue;
             e->args = ag + 32 * (uint64_t)i;
-            aj[na++] = (ajob){rec, e->args, DM_PRIM_MESH_TASKS, 0};
+            aj[na++] = (ajob){rec, e->args, DM_PRIM_MESH_TASKS, mesh_ind_cap()};
         } else if (e->itype < 0) {   // DrawArraysIndirect quads / fans: the shared index buffers, one thread per record
             if (e->prim == 7) quad_ib_make(); else fan_ib_make();
             e->ixb = e->prim == 7 ? g_quad_gpu : g_fan_gpu; e->ixlen = (uint32_t)(e->prim == 7 ? g_quad_ib.length : g_fan_ib.length);
@@ -13254,7 +13258,7 @@ static void sub_cut(void) {
         gpu_tag_done(f, cb.GPUStartTime, cb.GPUEndTime);
         cbn_failed(&cbn, cb.error);
         if (sc) { if (k < SEG_CLK_N) { atomic_store(&sc->t[k][0], gpu_s_guest_ns(cb.GPUStartTime)); atomic_store(&sc->t[k][1], gpu_s_guest_ns(cb.GPUEndTime)); } seg_clk_put(sc); }
-        if (cb.error) { atomic_store(&g_last_commit_error, 1); static int k; if (k++ < 8) MLOG("[RED] segment command buffer execution error: %s", cb.error.description.UTF8String); res_top_once(cb.error); gpu_lost_check(cb.error, "segment"); }
+        if (cb.error) { atomic_store(&g_last_commit_error, 1); atomic_fetch_add(&g_cb_err_sticky, 1); static int k; if (k++ < 8) MLOG("[RED] segment command buffer execution error: %s", cb.error.description.UTF8String); res_top_once(cb.error); gpu_lost_check(cb.error, "segment"); }
     }];
     gmem_commit_patch();
     res_commit();

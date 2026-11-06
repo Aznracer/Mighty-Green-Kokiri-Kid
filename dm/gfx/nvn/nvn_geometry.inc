@@ -614,6 +614,11 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
     else [en drawMeshThreadgroups:MTLSizeMake(g_mtk.count, 1, 1) threadsPerObjectThreadgroup:ot threadsPerMeshThreadgroup:mt];
 }
 static void mesh_tasks_draw(const p_draw *dw) {
+    // The breaker (DM_NVN_MESH_GUARD=0 turns it off; Peak8D's oot-full-build): Ocarina of Time's foliage task shaders loop over a {start, end} range they read through the raw
+    // global memory table, unsigned, so a range read wrong loops 2^27 times and the GPU hangs. Once any command buffer of the run failed, indirect task / mesh draws are skipped for
+    // the rest of it: one hang, not a series (repeated GPU hangs have taken macOS down with them)
+    static int guard = -1; if (guard < 0) { const char *e = getenv("DM_NVN_MESH_GUARD"); guard = !(e && !strcmp(e, "0")); MLOG("indirect task / mesh breaker %s (DM_NVN_MESH_GUARD)", guard ? "on" : "off"); }
+    if (dw->ind && guard && atomic_load(&g_cb_err_sticky)) { RED_ONCE(154, "indirect task / mesh draws: a command buffer failed, so they are skipped for the rest of the run (breaker, DM_NVN_MESH_GUARD)"); return; }
     if (!S.prog || (!dw->ind && dw->count <= 0)) return;
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
     NvShader *ts = pr ? pr->sh[3] : nil, *ms = pr ? pr->sh[4] : nil;
