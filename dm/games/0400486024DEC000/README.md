@@ -32,7 +32,7 @@ The game sizes its output from fixed 2560x1440 (docked) constants, so a 21:9 scr
 
 ## Dynamic frame step
 
-The game steps its world by a fixed 1/60 (or 1/30) a frame, so below its frame rate it runs in slow motion. Building with `DM_DYNAMIC_FPS=1` registers two cuts for main e0f3ccfaf50065ae ([patches.py](patches.py)) from the community Dynamic-fps exefs mod for this build: the step at main+0x6e6cc4 calls a stub in the padding after the text, which takes the real time since the last frame (smoothed, at most 50 ms) when the frame ran more than 3 % late. The stub reads `cntvct_el0` where the mod reads `cntpct_el0`: past the text the rewriter routes no counter read to the host, and `cntfrq_el0` gives the Mac's own rate.
+The game steps its world by a fixed 1/60 (or 1/30) a frame, so below its frame rate it runs in slow motion. Building with `DM_DYNAMIC_FPS=1` registers a frame step stub for main e0f3ccfaf50065ae ([patches.py](patches.py), from the community Dynamic-fps exefs mod for this build): the step at main+0x6e6cc4 branches to the stub in the patch area, which takes the real time since the last frame (the counter, smoothed by 1/8, at most 50 ms) when the frame ran more than 3 % late, and branches back. Its two counters are on the frame step state page (+0x100, +0x108), which the rewriter adds for it; with no frame-rate target the page changes nothing else. The stub reads `cntpct_el0` and `cntfrq_el0` as they are: code in the patch area is not rewritten, and on the Mac both read the same clock.
 
 ## Found on this game
 
