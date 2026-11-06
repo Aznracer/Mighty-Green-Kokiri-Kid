@@ -30,9 +30,9 @@ For a run past the opening, copy the committed save folder to the new run's `DM_
 
 The game sizes its output from fixed 2560x1440 (docked) constants, so a 21:9 screen showed a 16:9 picture with bars. Building with `DM_ULTRAWIDE=<width>x<height>` (the screen, e.g. `3440x1440`) registers cuts for main e0f3ccfaf50065ae ([patches.py](patches.py)) that give the output size, the render sizes and the output resolution table widths from the screen's ratio at the game's own heights. The 3D view takes its aspect from the render size, so the view widens (Hor+) and nothing is stretched; the HUD and subtitles stay centred, movies stay 16:9 in the middle. Checked on a CB342CK at 3440x1440 (Mac mini M4 Pro, v131072): swap chain 3440x1440, WindowCrop 2752x1152 (2.389:1), title screen, the opening and Link's house fill the screen. Start it with `DM_FULLSCREEN=1`.
 
-## Dynamic frame step
+## Real speed below 60 fps
 
-The game steps its world by a fixed 1/60 (or 1/30) a frame, so below its frame rate it runs in slow motion. Building with `DM_DYNAMIC_FPS=1` registers a frame step stub for main e0f3ccfaf50065ae ([patches.py](patches.py), from the community Dynamic-fps exefs mod for this build): the step at main+0x6e6cc4 branches to the stub in the patch area, which takes the real time since the last frame (the counter, smoothed by 1/8, at most 50 ms) when the frame ran more than 3 % late, and branches back. Its two counters are on the frame step state page (+0x100, +0x108), which the rewriter adds for it; with no frame-rate target the page changes nothing else. The stub reads `cntpct_el0` and `cntfrq_el0` as they are: code in the patch area is not rewritten, and on the Mac both read the same clock.
+The game's frame loop steps a constant per frame, so it played in slow motion below 60 fps. A stub now takes the measured frame time when that is longer ([A fixed step per frame runs slowly below the target](../../../docs/reference/frame-rate.md#a-fixed-step-per-frame-runs-slowly-below-the-target)); `DM_FRAME_DELTA=0` turns it off. Found by gunvalk in [Lichii PR #216](https://github.com/zortos293/Lichii/pull/216).
 
 ## Found on this game
 

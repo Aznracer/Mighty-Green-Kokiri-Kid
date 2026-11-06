@@ -11,7 +11,7 @@
 # Without it the swap chain is 2560x1440 and the game's crop 16:9 (2048x1152 at its usual 80 % dynamic resolution); with 3440x1440 the swap chain is 3440x1440 and the crop
 # 2752x1152 (2.389:1). Movies and the opening title stay 16:9 in the middle of the wider picture.
 import os, struct
-from nso_asm import ADRP, ADDI, B
+from nso_asm import ADRP, B
 
 CUTS = {}
 _uw = os.environ.get('DM_ULTRAWIDE', '')
@@ -31,60 +31,32 @@ if _uw:
         (0x3f58540, struct.pack('<14I', *_table).hex(), struct.pack('<14I', *_wide).hex(), 'ultrawide: output resolution table widths from their heights'),
     ])
 
-# Dynamic FPS (opt-in at build time): DM_DYNAMIC_FPS=1 keeps the game's speed right when it renders below its frame rate (no slow motion). Ported from the Dynamic-fps IPS mod for
-# main e0f3ccfaf50065ae (v131072), which patched main+0x6e6cc4 (IPS offset 0x6e6dc4, less the 0x100 NSO header) with a call into a code cave. The game's per-frame step there is
-# `fdiv s8, s1, s0`. The stub runs it, then reads the hardware counter (cntpct_el0 / cntfrq_el0), caps the real time since the last call at 50 ms, smooths it (1/8 weight) and, when it
-# exceeds the step by more than 3 % (the cave's 1.03), uses it as the step: s8 = max(s8, smoothed real time * s1). The mod kept its two counters at main+0x4e9fe00; here they are in the
-# frame step state page (+0x100 last counter, +0x108 smoothed ticks), zero in the file. The stub branches to and from the patch area (no link register is touched). Not run: the
-# site's original bytes are asserted at build time.
-_dyn_words = [
-    0x1e201828,   # fdiv s8, s1, s0
-    None,         # adrp x10,state page (the mod: adrp x10,main+0x4e9f000)
-    None,         # add x10,x10,#0x100 (the mod: #0xe00)
-    0xd53be02b,   # mrs x11, cntpct_el0
-    0xf940014c,   # ldr x12, [x10]
-    0xf900014b,   # str x11, [x10]
-    0xb40002cc,   # cbz x12, #0x3c46270
-    0xcb0c016b,   # sub x11, x11, x12
-    0xd53be00d,   # mrs x13, cntfrq_el0
-    0xd280028e,   # mov x14, #0x14
-    0x9ace09ae,   # udiv x14, x13, x14
-    0xeb0e017f,   # cmp x11, x14
-    0x9a8b81cb,   # csel x11, x14, x11, hi
-    0xf940054c,   # ldr x12, [x10, #8]
-    0xb500004c,   # cbnz x12, #0x3c46240
-    0xaa0b03ec,   # mov x12, x11
-    0xcb0c016e,   # sub x14, x11, x12
-    0x8b8e0d8c,   # add x12, x12, x14, asr #3
-    0xf900054c,   # str x12, [x10, #8]
-    0x9e230182,   # ucvtf s2, x12
-    0x9e2301a3,   # ucvtf s3, x13
-    0x1e231842,   # fdiv s2, s2, s3
-    0x1e210842,   # fmul s2, s2, s1
-    0x1c0000c3,   # ldr s3, #0x3c46274
-    0x1e230903,   # fmul s3, s8, s3
-    0x1e232040,   # fcmp s2, s3
-    0x5400004d,   # b.le #0x3c46270
-    0x1e204048,   # fmov s8, s2
-    None,         # ret → b main+0x6e6cc8 (the instruction after the site)
-    0x3f83d70a,   # 1.03f, read by the ldr s3 literal
-]
-def _dynamic_fps(ctx):
-    ctx.site(0x6e6cc4, '2818201e')   # fdiv s8,s1,s0
-    start = ctx.here()
-    for w in _dyn_words:
-        at = ctx.here() - start
-        if w is not None: ctx.emit(w)
-        elif at == 4: ctx.emit(ADRP(10, ctx.here(), ctx.state))
-        elif at == 8: ctx.emit(ADDI(10, 10, 0x100))
-        else: ctx.emit(B(ctx.here(), 0x6e6cc8))
-    ctx.put(0x6e6cc4, [B(0x6e6cc4, start)], 'dynamic frame step: the game step becomes the smoothed real frame time when it runs more than 3 % late (DM_DYNAMIC_FPS)')
+# Real-time speed. The frame loop (main+0x6e6be0) computes each frame's step as a constant over its target frame rate and never reads the clock: s1 is 60, or 30 in one mode of the game
+# (the fcsel at main+0x6e6cc0), s0 the target, so one frame is one step however long it took and everything runs slowly below the target. Found by gunvalk (zortos293/Lichii PR #216).
+# The stub keeps that division and takes the larger of it and s1 x the measured frame time (state +0x38, float seconds, hle_nvn.c): 0 there leaves the game's own step, and the step is
+# never below it. It marks state +0x3c so the host measures only for a main that reads the value. x16, x17 and s0 are not read again before they are written after the site
+def real_speed(ctx):
+    here, emit = ctx.here, ctx.emit
+    ctx.site(0x6e6cc4, '2818201e')
+    start = here()
+    emit(0x1e201828)                       # fdiv s8,s1,s0        the game's own step
+    emit(ADRP(16, here(), ctx.state))
+    for w in (0x52800031,   # mov w17,#1
+              0xb9003e11,   # str w17,[x16,#0x3c]  this main reads the frame time
+              0xbd403a00,   # ldr s0,[x16,#0x38]   seconds; 0 = at the target
+              0x1e210800,   # fmul s0,s0,s1
+              0x1e204908):  # fmax s8,s8,s0
+        emit(w)
+    emit(B(here(), 0x6e6cc8))
+    ctx.put(0x6e6cc4, [B(0x6e6cc4, start)], 'frame step from the measured frame time, never below the game\'s own (state +0x38)')
 
-FRAME_STEP = {'e0f3ccfaf50065ae4ea01eb5aeb13b1a': _dynamic_fps} if os.environ.get('DM_DYNAMIC_FPS', '') not in ('', '0') else {}
+
+FRAME_STEP = {'e0f3ccfaf50065ae4ea01eb5aeb13b1a': real_speed}   # 1.1.1 (v131072), the main of v0 too
 
 BINDING = [
     {'what': 'ultrawide output and render sizes (opt-in, DM_ULTRAWIDE)', 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
      'why': "the game's own size constants; a function-matched rule could carry them over the game's updates"},
-    {'what': 'dynamic frame step: the world steps by the smoothed real frame time when a frame runs more than 3 % late (opt-in, DM_DYNAMIC_FPS)', 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
-     'why': "a frame step stub in the patch area with its state on the frame step page, from the community Dynamic-fps mod for this build"},
+    {'what': 'frame step from the measured frame time', 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "this game's own frame loop; the frame-step state page is general",
+     'blocked': 'frame-step stubs have no function-matched form yet'},
 ]
