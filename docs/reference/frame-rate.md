@@ -365,6 +365,14 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Check:** `make -C dm/gfx/tests GAME=<id> check_t_tex_recycle`: a taken-over target is binned once its fence has passed and stays resident, a target of its description at another address takes it back, one a live object holds is never binned, another description gets a new texture, the guard's flush empties the bin; with it off nothing is reused. `t_alias_retire` and `t_res_guard` check that memory the retirement and the guard free is not kept.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game) (Hyrule Castle Town, walking with the camera turning).
 
+### Storage takeovers rebuild every pool table
+
+- **Symptom:** while transient render targets come and go (walking, turning the camera), the pool table line (`pool for handles traced to no slot`) counts thousands of whole builds, nearly all for `a change without a note`, about 2 ms each for a 33,025-entry texture pool.
+- **Cause:** a new shared texture that takes over the storage of others (`alias_take_over`) bumped `g_ser_gen` with no note. A bump without a note makes every pool table be built whole (`pool_gpu`) and sends every texture ID down the slow path (`ser_sync`).
+- **Fix:** with `pool_skip_retired` (a retired ID's entry is the dummy), a takeover writes a note that names no texture (`ser_note(0)`): it changes no live serial's texture (`serial_table_holds` keeps those, and one a finalized serial's ghost holds is only unref'd), so a table built before is kept or patched for its other changes. Without `pool_skip_retired` a retired ID may hold a shared texture made from its storage, so the bump stays. The idea is from PR #1489 (0c7e88b9), which also notes memory pool changes and retired IDs on main's walk; that walk differs from this tree's, so only the takeover note is taken.
+- **Check:** `make -C dm/gfx/tests GAME=<id> t_alias_takeover`: the takeover leaves one note naming no texture with `pool_skip_retired`, and a bare bump with `DM_NVN_POOL_SKIP_RETIRED=0`.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game) (Hyrule Castle Town, with [A new Metal texture for every transient render target](#a-new-metal-texture-for-every-transient-render-target)).
+
 ### Arena buffer ownership on allocation
 
 - **Symptom:** autorelease work takes a measurable share of replay time, with temporary arena-buffer ownership traffic a few times per draw.

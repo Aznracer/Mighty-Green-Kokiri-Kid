@@ -2508,6 +2508,7 @@ static void alias_let_go(const alias_key *ks, uint32_t n) {
         if (serial_holds(&g_ghost, o) || serial_holds(&g_ghost_active, o)) defer_obj_unref(o); else defer_obj_release(o);   // #1299: the active ghost ring holds its own
     }
 }
+static int pool_skip_retired(void);
 static void alias_take_over(const alias_key *nk) {
     nvn_texlayout L; nvn_tex_layout(&nk->d, &L);
     if (!L.size) return;
@@ -2523,7 +2524,11 @@ static void alias_take_over(const alias_key *nk) {
         ks[n++] = k;
     }
     alias_let_go(ks, n);
-    if (n) { g_ser_gen++; g_alias_taken += n; }
+    // A takeover changes no live serial's texture (serial_table_holds keeps those; one a finalized serial's ghost holds is only unref'd). With pool_skip_retired a retired ID's entry
+    // is the dummy, so no pool table entry names what was let go, and the note names no texture: a table built before is kept or patched for its other changes. A bare bump made every
+    // table be built whole: walking through Ocarina of Time's Hyrule Castle Town, where transient targets take over each other's storage, about 3 builds a frame of its 33,025-entry
+    // table (the idea is from PR #1489, 0c7e88b9). Without pool_skip_retired a retired ID may hold a shared texture made from its storage, so the bump stays
+    if (n) { if (pool_skip_retired()) ser_note(0); else g_ser_gen++; g_alias_taken += n; }
 }
 // Shared textures no live texture object has resolved to lately are retired when GPU memory runs short (DM_NVN_ALIAS_RETIRE=0 turns it off). A game may leave the descriptors of
 // textures it finalized registered, and every texture pool walk resolves them: Ocarina of Time (Switch 2) keeps its pools for good, loads the next scene into other parts of them and
