@@ -6,3 +6,4 @@ int front_display_pixels(int *w, int *h) { if (!g_w) return 0; *w = g_w; *h = g_
 uint64_t dm_nvn_frame_count(void) { return 0; }
 void front_screen_edr(float *potential, float *current) { *potential = *current = 1; }
 float front_launch_edr_potential(void) { return 1; }
+void mtl_present_layer(uint32_t w, uint32_t h) { (void)w; (void)h; }   // a sized layer's shape for the present: nothing here presents
