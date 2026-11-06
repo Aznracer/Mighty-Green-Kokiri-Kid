@@ -255,7 +255,9 @@ static int discard_run(uintptr_t a, size_t len, int prot, int method) {
     if (!(prot & PROT_WRITE)) mprotect((void *)a, len, prot);
     return ok;
 }
+__attribute__((weak)) int dm_guest_in_files(void) { return 0; }   // hle_svc.c's answers in the host; tests that link no host have none
 size_t nvn_dirty_discard(const void *addr, size_t len, int tracked, int method) {
+    if (dm_guest_in_files()) return 0;   // the guest in files: fresh anonymous pages would be charged to the footprint again, as guest_release says
     uintptr_t a = ((uintptr_t)addr + getpagesize() - 1) & ~(uintptr_t)(getpagesize() - 1), b = ((uintptr_t)addr + len) & ~(uintptr_t)(getpagesize() - 1);
     if (!len || a >= b) return 0;
     int prot = tracked ? PROT_READ : PROT_READ | PROT_WRITE; size_t done = 0;
