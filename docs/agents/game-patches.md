@@ -55,6 +55,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `build` → `game` | 60 fps frame step and render scale | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [The Legend of Zelda: Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md) | the game's own timing object |
 | `build` → `game` | 60 fps frame step and render scale (ksys::VFR) | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [The Legend of Zelda: Breath of the Wild](../../dm/games/01007EF00011E000/README.md) | the game's own frame code; the frame-step state page is general |
 | `build` → `game` | 60 fps frame step: the KIDS frame task and frame-rate block | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md) | the game's own frame code; only the host's frame-step state page is shared. Fire Emblem: Three Houses and Taiko Risshiden V DX run on KTGL too, with other frame code |
+| `build` → `game` | dynamic-resolution ceiling | rendering | blocked: the store and its role are verified for this main build only | checked: v131072 main E0F3CCFAF50065AE4EA01EB5AEB13B1A, original store and surrounding code, 2026-11-06 | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | the game's final scale store follows its dynamic and fixed-mode choices |
 | `build` → `game` | frame step floor 2 → 1 vsync, and its frame step | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) | the game's own clock floor and step |
 | `build` → `game` | frame step from the measured frame time | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) | this game's own frame loop; the frame-step state page is general |
 | `build` → `game` | screen shape: the sizes, the view, the layouts' projection and their edge widgets (DM_SCREEN_ASPECT) | rendering | blocked: the stubs have no function-matched form yet | judgement | 1 | [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) | the output size is the host's, but where the game takes its sizes, its cameras and its layouts are this build's code |
@@ -90,7 +91,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [Taiko Risshiden V DX](#taiko-risshiden-v-dx) | 1 | 0 | 0 | 2 | 0 | `game` |
 | [The Legend of Zelda: Breath of the Wild](#the-legend-of-zelda-breath-of-the-wild) | 7 | 0 | 43 | 0 | 0 | `build` → `game` ×2 |
 | [The Legend of Zelda: Link's Awakening](#the-legend-of-zelda-links-awakening) | 1 | 0 | 0 | 0 | 0 | `build` → `game` |
-| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 0 | 0 | 1 | 0 | 0 | `build` → `game` ×2 |
+| [The Legend of Zelda: Ocarina of Time](#the-legend-of-zelda-ocarina-of-time) | 0 | 0 | 2 | 0 | 0 | `build` → `game` ×3 |
 | [The Legend of Zelda: Tears of the Kingdom](#the-legend-of-zelda-tears-of-the-kingdom) | 0 | 0 | 9 | 0 | 0 | `build` → `game` |
 | [Xenoblade Chronicles 3](#xenoblade-chronicles-3) | 6 | 0 | 0 | 0 | 0 | `build` → `game` |
 
@@ -598,9 +599,12 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 
 - **`build` → `game`**, rendering, gap, judgement: ultrawide output and render sizes (opt-in, DM_ULTRAWIDE). The game's own size constants; a function-matched rule could carry them over the game's updates
 - **`build` → `game`**, frame rate, blocked: frame-step stubs have no function-matched form yet, judgement: frame step from the measured frame time. This game's own frame loop; the frame-step state page is general
+- **`build` → `game`**, rendering, blocked: the store and its role are verified for this main build only, checked: v131072 main E0F3CCFAF50065AE4EA01EB5AEB13B1A, original store and surrounding code, 2026-11-06: dynamic-resolution ceiling. The game's final scale store follows its dynamic and fixed-mode choices
 
 - **v0 `main`** `e0f3ccfa…` ([patches.py:26](../../dm/games/0400486024DEC000/patches.py#L26))
   - frame step `+0x6e6cc4`: frame step from the measured frame time, never below the game's own (state +0x38)
+  - frame step `+0x31d3f48`: dynamic resolution capped by the host render scale (1.0 = original)
+  - render scale stub (the launcher offers DM_RENDER_SCALE)
 
 ### The Legend of Zelda: Tears of the Kingdom
 

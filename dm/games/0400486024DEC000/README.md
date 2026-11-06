@@ -34,6 +34,14 @@ The game sizes its output from fixed 2560x1440 (docked) constants, so a 21:9 scr
 
 The game's frame loop steps a constant per frame, so it played in slow motion below 60 fps. A stub now takes the measured frame time when that is longer ([A fixed step per frame runs slowly below the target](../../../docs/reference/frame-rate.md#a-fixed-step-per-frame-runs-slowly-below-the-target)); `DM_FRAME_DELTA=0` turns it off. Found by gunvalk in [Lichii PR #216](https://github.com/zortos293/Lichii/pull/216).
 
+## Render-scale ceiling
+
+Update v131072 (`main` build `e0f3ccfaf50065ae4ea01eb5aeb13b1a`) accepts `DM_RENDER_SCALE=0.5` through `1.0`. The default `1.0` keeps the game's original scale. Lower values cap the scale the engine has selected, so dynamic resolution can still reduce it further. The output size and the game's upscaler follow their existing paths. For example, a host ceiling of `0.5` keeps a game-selected `0.4` and caps a game-selected `0.75` to `0.5`.
+
+The rewriter checks the instruction at `main+0x31d3f48` before replacing its final scale store. The stub reads the existing host state page at `+0x10`, preserves the store's registers and condition flags, and advertises `RENDER_SCALE` so the launcher offers its existing Render scale control. Other builds receive no fixed-address hook. This is a deliberate game rendering option whose scale calculation lives in the game binary. It uses the existing shader libraries.
+
+Validation on the M1 Pro exercised the original cap at 50% on the house-to-Kokiri Forest route. The isolated stub additionally preserves the source SIMD register, checked by ARM64 execution across caps, game-selected scales and condition flags. The test also checks the launcher setting against rewritten metadata. Sustained frame-rate gains, later areas and iOS remain unmeasured for this isolated change.
+
 ## Found on this game
 
 - The online library's [eventfd for its poller](../../../docs/reference/services.md#eventfds-served-offline) and the [virtual audio input list](../../../docs/reference/audio.md#no-virtual-audio-input-devices-sdk-22) blocked startup.
