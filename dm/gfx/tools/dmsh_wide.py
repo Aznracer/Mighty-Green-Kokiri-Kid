@@ -73,3 +73,217 @@ def wide_loads(msl):
         indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
         lines[i] = ''.join(indent + d + '\n' for d in pre) + ln
     return '\n'.join(lines)
+
+
+# Raw-load quads (PR #1405 by nanotchec, as Peak8D's oot-full-build carries it): a wide load the translator split reaches Metal as four scalar raw global
+# reads, each searching the pool table on its own. Four reads at +0, +4, +8 and +12 from one address, with only address copies between them, share one
+# lookup (dm_raw_load4). The call sites are #1405's; the scalar helper is this tree's (#1360's growing table with #1299's chunk hint before its search),
+# whose tail (the entry's end, its delta, the read) is #1405's, so the lookup before that tail is taken as it is. Ocarina of Time: its first compute
+# encoder of a frame and its NDSR upscale read most of their inputs this way
+_RAW_ID = r'_\d+'
+_RAW_FUNCTION = re.compile(
+    r'(?m)^static inline __attribute__\(\(always_inline\)\)\n'
+    rf'int (?P<name>{_RAW_ID})\(thread const int& (?P<lo>{_RAW_ID}), '
+    rf'thread const int& (?P<hi>{_RAW_ID}), device (?P<type>{_RAW_ID})& (?P<table>{_BUF})\)\n'
+    r'\{\n(?P<body>.*?)^\}', re.S)
+
+
+
+
+_RAW_TAIL = (
+    r'int @row = @index \* 8;',
+    r'int @end_l = @row \+ 2;',
+    r'float @end_lb = as_type<float>\(@table\._m0\[@end_l\]\);',
+    r'int @end_h = @row \+ 3;',
+    r'float @end_hb = as_type<float>\(@table\._m0\[@end_h\]\);',
+    r'bool @end_high = uint\(@hi\) < as_type<uint>\(@end_hb\);',
+    r'bool @end_equal = @hi == as_type<int>\(@end_hb\);',
+    r'bool @end_low = uint\(@lo\) < as_type<uint>\(@end_lb\);',
+    r'bool @end_same = @end_equal && @end_low;',
+    r'bool @inside = @end_high \|\| @end_same;',
+    r'if \(@inside\)',
+    r'\{',
+    r'int @delta_l = @row \+ 4;',
+    r'float @delta_lb = as_type<float>\(@table\._m0\[@delta_l\]\);',
+    r'int @host_l = @lo \+ as_type<int>\(@delta_lb\);',
+    r'bool @wrap = uint\(@host_l\) < uint\(@lo\);',
+    r'int @carry = int\(@wrap\);',
+    r'int @delta_h = @row \+ 5;',
+    r'float @delta_hb = as_type<float>\(@table\._m0\[@delta_h\]\);',
+    r'int @high_sum = @hi \+ as_type<int>\(@delta_hb\);',
+    r'int @host_h = @high_sum \+ @carry;',
+    r'uint @word = \*\(reinterpret_cast<device uint\*>\(as_type<ulong>\(uint2\(uint\(@host_l\), uint\(@host_h\)\)\)\)\);',
+    r'float @bits = as_type<float>\(@word\);',
+    r'return as_type<int>\(@bits\);',
+    r'\}',
+    r'return 0;',
+)
+
+
+def _raw_split(body, low, high, table):
+    """This tree's scalar helper as (the lookup before its tail, the index it leaves), or None: the tail is #1405's (entry end, delta, read) and
+    the lookup before it reads the table and writes nothing (no return, store, atomic or call but the helper's own reads)"""
+    lines = [ln for ln in body.split('\n') if ln.strip()]
+    for at in range(len(lines) - len(_RAW_TAIL), -1, -1):
+        head = re.fullmatch(rf'int ({_RAW_ID}) = ({_RAW_ID}) \* 8;', lines[at].strip())
+        if head: break
+    else: return None
+    names = {'lo': low, 'hi': high, 'table': table, 'index': head[2]}
+    for template, line in zip(_RAW_TAIL, lines[at:]):
+        pattern = re.sub(r'@([a-z_]+)', lambda m: re.escape(names[m[1]]) if m[1] in names else rf'(?P<{m[1]}>{_RAW_ID})', template)
+        got = re.fullmatch(pattern, line.strip())
+        if not got: return None
+        names.update(got.groupdict())
+    if len(lines) - at != len(_RAW_TAIL): return None
+    prefix = lines[:at]
+    if any(re.search(r'\breturn\b|atomic|reinterpret_cast|\]\s*=(?!=)', ln) for ln in prefix): return None
+    if any(re.search(r'\b(?!as_type|uint|int|float|bool)\w+\s*\(', re.sub(r'\b(?:as_type<\w+>|uint|int|float)\(', '(', ln)) and not re.match(r'\s*(?:do|while|if|\}|\{)', ln) for ln in prefix): return None
+    return '\n'.join(prefix), names['index']
+
+
+def raw_load_quads(msl, table_slot):
+    """Four adjacent raw reads from one address share the pool-table lookup (see _raw_split); msl as it was where nothing matches"""
+    table = f'cp_s{table_slot}'
+    for scalar in _RAW_FUNCTION.finditer(msl):
+        if scalar['table'] != table: continue
+        typ = scalar['type']
+        if not re.search(rf'struct {typ}\s*\{{\s*uint _m0\[1\];\s*\}};', msl) or not re.search(rf'(?m)^\s*device {typ}\* {table} \[\[id\(\d+\)\]\];', msl): continue
+        split = _raw_split(scalar['body'], scalar['lo'], scalar['hi'], table)
+        if not split: continue
+        following = msl[scalar.end():]
+        output = _raw_quads(following, scalar['name'], table)
+        if output == following: continue
+        return msl[:scalar.end()] + _raw_quad_helper(scalar, *split) + output
+    return msl
+
+
+def _raw_quad_helper(scalar, search, index):
+    table, typ, name, low, high = (scalar[k] for k in ('table', 'type', 'name', 'lo', 'hi'))
+    return f'''
+
+static inline __attribute__((always_inline))
+int dm_raw_find(int {low}, int {high}, device {typ}& {table})
+{{
+{search}
+    return {index};
+}}
+
+static inline __attribute__((always_inline))
+ulong dm_raw_word_pair(device {typ}& table, uint word)
+{{
+    return as_type<ulong>(uint2(table._m0[word], table._m0[word + 1u]));
+}}
+
+static inline __attribute__((always_inline))
+int dm_raw_load_word(ulong address, device {typ}& table)
+{{
+    uint2 words = as_type<uint2>(address);
+    return {name}(as_type<int>(words.x), as_type<int>(words.y), table);
+}}
+
+// The 16 bytes in one entry, none of the next entry's (the search takes the nearest start before an address), and in one 2 MiB chunk of the hint
+// (dmsh_abi.h DMSH_GMEM_HINT_SHIFT), so the four scalar lookups would have found this entry too; else each word as the scalar helper reads it
+static inline __attribute__((always_inline))
+int4 dm_raw_load4(int low, int high, device {typ}& table)
+{{
+    const ulong limit = ~0ul - 15ul;
+    const ulong address = as_type<ulong>(uint2(as_type<uint>(low), as_type<uint>(high)));
+    if (!(address & 3ul) && address <= limit && !((address ^ (address + 15ul)) >> 21)) {{
+        const uint index = uint(dm_raw_find(low, high, table));
+        const uint word = 8u * index;
+        const ulong end = dm_raw_word_pair(table, word + 2u);
+        const ulong next = index + 1u < table._m0[4] ? dm_raw_word_pair(table, word + 8u) : ~0ul;
+        if (end >= address && end - address >= 16ul && next > address + 15ul) {{
+            const ulong gpu_address = address + dm_raw_word_pair(table, word + 4u);
+            if (!(gpu_address & 3ul) && gpu_address <= limit) {{
+                const device uint* data = reinterpret_cast<const device uint*>(gpu_address);
+                return int4(as_type<int>(data[0]), as_type<int>(data[1]), as_type<int>(data[2]), as_type<int>(data[3]));
+            }}
+        }}
+    }}
+    return int4(dm_raw_load_word(address, table), dm_raw_load_word(address + 4ul, table), dm_raw_load_word(address + 8ul, table), dm_raw_load_word(address + 12ul, table));
+}}
+'''
+
+def _raw_address(lines, low, high):
+    """Find the inputs of the two plain address copies immediately before a read."""
+    low_alias, high_alias = lines
+    low_alias = re.fullmatch(rf'\s*int {low} = ({_RAW_ID});', low_alias)
+    high_alias = re.fullmatch(rf'\s*int {high} = ({_RAW_ID});', high_alias)
+    if low_alias and high_alias:
+        return low_alias[1], high_alias[1]
+    return None
+
+
+def _raw_quads(msl, helper, table):
+    call = re.compile(rf'^(?P<indent> +)int (?P<out>{_RAW_ID}) = {helper}\('
+                      rf'(?P<lo>{_RAW_ID}), (?P<hi>{_RAW_ID}), \(\*spvDescriptorSet0\.{table}\)\);$')
+    lines = msl.split('\n')
+    assignments = {}
+    changed = set()
+    safe_line = []
+    builtin = re.compile(r'\b(?:as_type<(?:float|int|uint)>|int|uint|float|fma|extract_bits|precise::clamp|spvMulExtended<_\d+, uint>)\(')
+    call_token = re.compile(r'\b\w+\s*(?:<[^;]+>)?\(')
+    for i, line in enumerate(lines):
+        declaration = re.fullmatch(rf'\s*(int|bool|uint|float) ({_RAW_ID}) = ([^;]+);', line)
+        expression = declaration[3] if declaration else line
+        pure = declaration and not call_token.search(builtin.sub('(', expression)) and not re.search(r'(?<![=!<>])' + _OP, expression)
+        safe_line.append(bool(pure or call.fullmatch(line)))
+        if declaration:
+            typ, name, _ = declaration.groups()
+            if name in assignments:
+                changed.add(name)
+            assignments[name] = (i, expression, typ)
+        for write in re.finditer(rf'({_RAW_ID})\s*{_OP}|(?:\+\+|--)\s*({_RAW_ID})|({_RAW_ID})\s*(?:\+\+|--)', expression):
+            changed.add(next(name for name in write.groups() if name))
+        changed.update(re.findall(rf'(?<!\w)&\s*({_RAW_ID})\b', line))
+
+    def expr(name):
+        return assignments.get(name, (-1, '', ''))[1] if name not in changed else ''
+
+    def same_address(pair, base, offset, line):
+        low, high = pair
+        base_low, base_high = base
+        addition = re.fullmatch(rf'{base_high} \+ ({_RAW_ID})', expr(high))
+        carry = re.fullmatch(rf'int\(({_RAW_ID})\)', expr(addition[1])) if addition else None
+        names = (low, high, base_low, base_high)
+        if not carry or not addition:
+            return False
+        names += (carry[1], addition[1])
+        declarations = [assignments.get(name, (-1, '', '')) for name in names]
+        indices = [entry[0] for entry in declarations]
+        types = [entry[2] for entry in declarations]
+        return (types == ['int', 'int', 'int', 'int', 'bool', 'int']
+                and not any(name in changed for name in names) and min(indices) >= 0
+                and max(indices) < line and expr(low) == f'{base_low} + {offset}'
+                and expr(carry[1]) == f'uint({low}) < uint({base_low})'
+                and all(safe_line[min(indices):line]))
+
+    edits = []
+    for start in range(2, len(lines) - 9):
+        first = call.fullmatch(lines[start])
+        if not first:
+            continue
+        calls = [first]
+        base = _raw_address(lines[start - 2:start], first['lo'], first['hi']) or (first['lo'], first['hi'])
+        for i in range(1, 4):
+            pos = start + i * 3
+            next_call = call.fullmatch(lines[pos])
+            if next_call is None or next_call['indent'] != first['indent']:
+                break
+            pair = _raw_address(lines[pos - 2:pos], next_call['lo'], next_call['hi'])
+            if pair is None or not same_address(pair, base, 4 * i, pos):
+                break
+            calls.append(next_call)
+        else:
+            edits.append((start, calls))
+    for start, calls in edits:
+        first = calls[0]
+        result = f'{first["out"]}_words'
+        load = f'dm_raw_load4({first["lo"]}, {first["hi"]}, (*spvDescriptorSet0.{table}))'
+        for i, c in enumerate(calls):
+            lines[start + 3 * i] = f'{c["indent"]}int {c["out"]} = {result}.{"xyzw"[i]};'
+        lines[start] = f'{first["indent"]}int4 {result} = {load};\n{lines[start]}'
+    return '\n'.join(lines) if edits else msl
+
+
