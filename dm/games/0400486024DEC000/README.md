@@ -30,6 +30,10 @@ For a run past the opening, copy the committed save folder to the new run's `DM_
 
 The game sizes its output from fixed 2560x1440 (docked) constants, so a 21:9 screen showed a 16:9 picture with bars. Building with `DM_ULTRAWIDE=<width>x<height>` (the screen, e.g. `3440x1440`) registers cuts for main e0f3ccfaf50065ae ([patches.py](patches.py)) that give the output size, the render sizes and the output resolution table widths from the screen's ratio at the game's own heights. The 3D view takes its aspect from the render size, so the view widens (Hor+) and nothing is stretched; the HUD and subtitles stay centred, movies stay 16:9 in the middle. Checked on a CB342CK at 3440x1440 (Mac mini M4 Pro, v131072): swap chain 3440x1440, WindowCrop 2752x1152 (2.389:1), title screen, the opening and Link's house fill the screen. Start it with `DM_FULLSCREEN=1`.
 
+## Dynamic frame step
+
+The game steps its world by a fixed 1/60 (or 1/30) a frame, so below its frame rate it runs in slow motion. Building with `DM_DYNAMIC_FPS=1` registers two cuts for main e0f3ccfaf50065ae ([patches.py](patches.py)) from the community Dynamic-fps exefs mod for this build: the step at main+0x6e6cc4 calls a stub in the padding after the text, which takes the real time since the last frame (smoothed, at most 50 ms) when the frame ran more than 3 % late. The stub reads `cntvct_el0` where the mod reads `cntpct_el0`: past the text the rewriter routes no counter read to the host, and `cntfrq_el0` gives the Mac's own rate.
+
 ## Found on this game
 
 - The online library's [eventfd for its poller](../../../docs/reference/services.md#eventfds-served-offline) and the [virtual audio input list](../../../docs/reference/audio.md#no-virtual-audio-input-devices-sdk-22) blocked startup.

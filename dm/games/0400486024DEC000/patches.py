@@ -22,15 +22,30 @@ if _uw:
     _table = [640, 480, 720, 480, 1280, 720, 1600, 900, 1920, 1080, 2560, 1440, 3840, 2160]
     _wide = [v if i % 2 else _width(_table[i + 1]) for i, v in enumerate(_table)]
     _f = struct.unpack('<I', struct.pack('<f', float(_width(1440))))[0] >> 16
-    CUTS['e0f3ccfaf50065ae4ea01eb5aeb13b1a'] = [
+    CUTS.setdefault('e0f3ccfaf50065ae4ea01eb5aeb13b1a', []).extend([
         (0x1202ee0, _movz(2560, 8, True), _movz(_width(1440), 8, True), 'ultrawide: graphics setup output width 2560 → %d (DM_ULTRAWIDE)' % _width(1440)),
         (0x31f39f4, _movz(2560, 8, True), _movz(_width(1440), 8, True), 'ultrawide: docked render width 2560 → %d' % _width(1440)),
         (0x31f3a00, _movz(1920, 8, True), _movz(_width(1080), 8, True), 'ultrawide: handheld render width 1920 → %d' % _width(1080)),
         (0xecbc80, struct.pack('<I', 0x52A8A409).hex(), struct.pack('<I', 0x52A00009 | _f << 5).hex(), 'ultrawide: output width 2560.0f → %d.0f' % _width(1440)),
         (0x3f58540, struct.pack('<14I', *_table).hex(), struct.pack('<14I', *_wide).hex(), 'ultrawide: output resolution table widths from their heights'),
-    ]
+    ])
+
+# Dynamic frame step (opt-in at build time): DM_DYNAMIC_FPS=1. The game steps its world by a fixed 1/60 (or 1/30) a frame: main+0x6e6cc4 (fdiv s8, s1, s0) is the step in frames, so
+# below its frame rate it runs in slow motion. The community "Dynamic-fps" exefs mod for this build (an IPS) calls a stub there instead, in the zero padding after the text (main+0x3c46200,
+# mapped with the text): the same step, then the real time since the last call (the counter, smoothed by 1/8, at most 50 ms) in frames, taken when it is over 3 % longer. Its two words of
+# state are at main+0x4e9fe00 (bss). Here the stub reads cntvct_el0, not the mod's cntpct_el0: past TEXT_END the rewriter routes no counter read to the host's 31.25 MHz tick, and
+# cntfrq_el0 reads the Mac's own rate, so the virtual counter macOS lets user code read keeps the two on one clock
+if os.environ.get('DM_DYNAMIC_FPS', '') not in ('', '0'):
+    CUTS.setdefault('e0f3ccfaf50065ae4ea01eb5aeb13b1a', []).extend([
+        (0x6e6cc4, '2818201e', '4f7dd594', 'dynamic frame step: bl to the stub at main+0x3c46200 (DM_DYNAMIC_FPS)'),
+        (0x3c46200, '00' * 120,
+         '2818201eca9200b04a0138914be03bd54c0140f94b0100f9cc0200b46b010ccb0de03bd58e0280d2ae09ce9a7f010eebcb818b9a4c0540f94c0000b5ec030baa6e010ccb8c0d8e8b4c0500f9'
+         '8201239ea301239e4218231e4208211ec300001c0309231e4020231e4d0000544840201ec0035fd60ad7833f', 'dynamic frame step: the stub (the real frame time in frames when over 3 % longer)'),
+    ])
 
 BINDING = [
     {'what': 'ultrawide output and render sizes (opt-in, DM_ULTRAWIDE)', 'now': 'build', 'goal': 'game', 'purpose': 'rendering',
      'why': "the game's own size constants; a function-matched rule could carry them over the game's updates"},
+    {'what': 'dynamic frame step: the world steps by the real frame time when a frame runs late (opt-in, DM_DYNAMIC_FPS)', 'now': 'build', 'goal': 'game', 'purpose': 'frame rate',
+     'why': "a stub in the text's padding and its call site, from the community Dynamic-fps mod for this build"},
 ]
