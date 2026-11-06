@@ -11234,6 +11234,7 @@ static void fb_prepare(NvProg *pr) {
 #define IXC_CAP (3 * 16384)
 typedef struct { uint64_t ind, ibuf; int32_t prim, itype; uint64_t args, ixb; uint32_t ixlen; } ixc_ent;   // args 0: the record could not be converted
 static ixc_ent g_ixc[IXC_MAX]; static int g_ixc_n; static uint64_t g_ixc_epoch, g_ixc_sub, g_ixc_runs, g_ixc_splits;
+static const uint8_t *g_ixc_stop;   // the uniform update that writes a record converted ahead of it: replay drops the conversions there (ixc_run, as mdx_run's g_mdx_stop)
 // The kernels: dm/gfx/msl/ixc.metal
 static int ixc_wanted(const p_draw *dw, const p_draw_idx *di) {
     if (dw) return dw->ind && (dw->prim == 6 || dw->prim == 7 || dw->prim == DM_PRIM_MESH_TASKS);
@@ -11244,6 +11245,23 @@ static const ixc_ent *ixc_find(const p_draw *dw, const p_draw_idx *di) {
     uint64_t ind = dw ? dw->ind : di->ind, ib = dw ? 0 : di->ibuf; int prim = dw ? dw->prim : di->prim, it = dw ? -1 : di->itype;
     for (int i = 0; i < g_ixc_n; i++) if (g_ixc[i].ind == ind && g_ixc[i].ibuf == ib && g_ixc[i].prim == prim && g_ixc[i].itype == it) return &g_ixc[i];
     return NULL;
+}
+// Whether a draw's shader writes leave the conversions standing: every write goes through a bound storage buffer that covers no record converted (ixc_run), used or
+// not, since a record may be drawn again. Ocarina of Time's grass mesh shaders add to a counter in a storage buffer (an atomic add): taken as a write anywhere, each of them
+// dropped the conversions of the indirect mesh draws after it and the next one split its render pass. An image or raw-memory write, or an indexed expansion (whose index range
+// the CPU does not know) among the conversions, drops them as any write does
+static int ixc_writes_spare(NvProg *pr) {
+    for (int k = 0; k < g_ixc_n; k++) if (g_ixc[k].itype >= 0 && g_ixc[k].prim != DM_PRIM_MESH_TASKS) return 0;
+    for (int st = 0; st < 6; st++) { __unsafe_unretained NvShader *sh = pr->sh[st]; if (!sh) continue;
+        for (int i = 0; i < sh->rf.nb; i++) { int kind = sh->rf.b[i].kind; if (!sh->rf.b[i].rw) continue;
+            if (kind == NVN_RB_IMG || kind == NVN_RB_IMGU || kind == NVN_RB_GMEM) return 0;
+            if (kind != NVN_RB_SBUFP) continue;   // the writes prog_swrites counts
+            if (sh->rf.b[i].reg >= 16) return 0;
+            const p_bind_buf *u = &S.ssbo[st][sh->rf.b[i].reg]; if (!u->addr) continue;   // the dummy buffer
+            uint64_t lo = u->addr, hi = lo + (u->size ? u->size : 1);
+            for (int k = 0; k < g_ixc_n; k++) { const ixc_ent *e = &g_ixc[k]; uint64_t len = e->prim == DM_PRIM_MESH_TASKS ? 8 : 16;
+                if (e->ind < hi && lo < e->ind + len) return 0; } } }
+    return 1;
 }
 static void ixc_take(const p_draw *dw, const p_draw_idx *di) {
     if (g_ixc_n < IXC_MAX && !ixc_find(dw, di)) g_ixc[g_ixc_n++] = (ixc_ent){dw ? dw->ind : di->ind, dw ? 0 : di->ibuf, dw ? dw->prim : di->prim, dw ? -1 : di->itype, 0, 0, 0};
@@ -11257,21 +11275,30 @@ static void ixc_run(const p_draw *dw, const p_draw_idx *di) {
         if (!at) { failed = 1; MLOG("[RED] indirect draw conversion: cannot create the compute pipeline %s (indirect draws of quads / fans / 8-bit indices are skipped)", e.localizedDescription.UTF8String); return; } }
     // Ending a pass and landing deferred inline writes can advance the
     // epoch. Snapshot it after both, before this compute encoder opens.
-    if (g_enc) { g_ixc_splits++; PD("M %llu indirect draw conversion: render pass split here", g_stat_pass); rp_end(); }
+    if (g_enc) { g_ixc_splits++; PD("M %llu indirect draw conversion: render pass split here (conversions %d, written since %d, another submission %d)", g_stat_pass, g_ixc_n,
+        g_ixc_epoch != g_wr_epoch, g_ixc_sub != g_sub_serial); rp_end(); }
     ubd_land_compute();
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
-    if (g_ixc_epoch != g_wr_epoch || g_ixc_sub != g_sub_serial || g_ixc_n > IXC_MAX - 8) { g_ixc_n = 0; g_ixc_epoch = g_wr_epoch; g_ixc_sub = g_sub_serial; }
+    if (g_ixc_epoch != g_wr_epoch || g_ixc_sub != g_sub_serial || g_ixc_n > IXC_MAX - 8) { g_ixc_n = 0; g_ixc_stop = NULL; g_ixc_epoch = g_wr_epoch; g_ixc_sub = g_sub_serial; }
     int n0 = g_ixc_n; ixc_take(dw, di);
     if (g_exec_next && g_ret_n <= 8) {   // Later draws in replay order (current list → callers → the rest of this submission), up to the next buffer write
         fz_cursor cur = {.p = g_exec_next, .ret_n = g_ret_n}; memcpy(cur.ret, g_ret, sizeof(*g_ret) * (size_t)g_ret_n);
         const uint8_t *q; op_hdr h; const void *a;
-        for (int guard = 0; guard < 200000 && g_ixc_n < IXC_MAX && fz_next(&cur, &q, &h, &a); guard++) {
-            if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_UPDATE_UB || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B) break;
+        int guard = 0, stop = -1;
+        for (; guard < 200000 && g_ixc_n < IXC_MAX && fz_next(&cur, &q, &h, &a); guard++) {
+            if (h.op == OP_DISPATCH || h.op == OP_COPY_B2B || h.op == OP_CLEAR_BUF || h.op == OP_COPY_T2B) { stop = h.op; break; }
+            // A uniform update ends the look-ahead only if it writes a record taken so far, or if an indexed record is taken (its expansion reads indices the CPU cannot bound).
+            // Ocarina of Time updates uniforms between its indirect mesh draws (grass): stopping at every update converted each draw alone and split its render pass (5 a frame)
+            if (h.op == OP_UPDATE_UB) { uint64_t ud, un; memcpy(&ud, a, 8); memcpy(&un, (const uint8_t *)a + 8, 8); int hit = 0;
+                for (int k = 0; k < g_ixc_n && !hit; k++) { const ixc_ent *e = &g_ixc[k]; uint64_t len = e->prim == DM_PRIM_MESH_TASKS ? 8 : e->itype < 0 ? 16 : 20;
+                    hit = (e->itype >= 0 && e->prim != DM_PRIM_MESH_TASKS) || (ud < e->ind + len && e->ind < ud + un); }
+                if (hit) { g_ixc_stop = q; stop = h.op; break; } continue; }
             p_draw dt; p_draw_idx it; const p_draw *d = h.op == OP_DRAW ? draw_rec(a, h.size, &dt) : NULL; const p_draw_idx *x = h.op == OP_DRAW_IDX ? draw_idx_rec(a, h.size, &it) : NULL;
             if (d && ixc_wanted(d, NULL)) ixc_take(d, NULL);
             else if (x && ixc_wanted(NULL, x)) ixc_take(NULL, x);
         }
-    }
+        PD("M %llu indirect draw conversion: look-ahead over %d ops took %d draws, stopped at op %d (-1: the end or a limit)", g_stat_pass, guard, g_ixc_n - n0, stop);
+    } else PD("M %llu indirect draw conversion: no look-ahead (next op %d, call depth %d)", g_stat_pass, g_exec_next != NULL, g_ret_n);
     int n = g_ixc_n - n0, na = 0; if (n <= 0) return;
     typedef struct { uint64_t rec, args; uint32_t prim, cap; } ajob;
     typedef struct { uint64_t rec, ib, out, args; uint32_t prim, isz, ilen, cap; } ejob;
@@ -13286,6 +13313,7 @@ void mtl_exec(const uint8_t *p) {
                 PD("Y copy_b2b cmd=%p src=%#llx dst=%#llx bytes=%llu", p, (unsigned long long)s_, (unsigned long long)d, (unsigned long long)n); mtl_sub_copy(s_, d, n); break; }
             case OP_UPDATE_UB: { uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
                 if (p == g_mdx_stop) { g_mdx_epoch++; g_mdx_stop = NULL; }   // it writes a record or count that masked copies were made of (mdx_run)
+                if (p == g_ixc_stop) { g_ixc_n = 0; g_ixc_stop = NULL; }   // it writes a record converted ahead of it (ixc_run)
                 PD("Y update_ub cmd=%p src=%#llx dst=%#llx bytes=%llu f=%g,%g,%g,%g", p, (unsigned long long)((const uint8_t *)a + 16), (unsigned long long)d, (unsigned long long)n,
                    n >= 4 ? ((const float *)((const uint8_t *)a + 16))[0] : 0.f, n >= 8 ? ((const float *)((const uint8_t *)a + 16))[1] : 0.f, n >= 12 ? ((const float *)((const uint8_t *)a + 16))[2] : 0.f, n >= 16 ? ((const float *)((const uint8_t *)a + 16))[3] : 0.f); mtl_sub_update((const uint8_t *)a + 16, d, n); break; }
             case OP_SET_RT: {

@@ -640,7 +640,8 @@ static void mesh_tasks_draw(const p_draw *dw) {
     draw_(&triangle, NULL);
     g_geo_program = nil; g_mtk.on = 0; args_dirty_all();
     if (g_mtk.miss) return;
-    swrite_note(pr); if (prog_swrites(pr)) g_wr_epoch++;
+    swrite_note(pr);
+    if (prog_swrites(pr)) { int keep = g_ixc_epoch == g_wr_epoch && g_ixc_sub == g_sub_serial && ixc_writes_spare(pr); g_wr_epoch++; if (keep) g_ixc_epoch = g_wr_epoch; }   // see ixc_writes_spare
     if (!g_mtk_n++) MLOG("task / mesh: first %s draw, task %s mesh %s fragment %s", indirect ? "indirect" : "direct", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-");
 }
 static uint64_t g_geo_mesh_n, g_geo_mesh_wait;   // mesh draws; draws the compute path drew while their mesh pipeline was built
