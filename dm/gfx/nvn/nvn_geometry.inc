@@ -620,6 +620,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
     static int guard = -1; if (guard < 0) { const char *e = getenv("DM_NVN_MESH_GUARD"); guard = !(e && !strcmp(e, "0")); MLOG("indirect task / mesh breaker %s (DM_NVN_MESH_GUARD)", guard ? "on" : "off"); }
     if (dw->ind && guard && atomic_load(&g_cb_err_sticky)) { RED_ONCE(154, "indirect task / mesh draws: a command buffer failed, so they are skipped for the rest of the run (breaker, DM_NVN_MESH_GUARD)"); return; }
     if (!S.prog || (!dw->ind && dw->count <= 0)) return;
+    { static int skip = -1; if (skip < 0) { const char *e = getenv("DM_NVN_SKIP_MESH"); skip = e && atoi(e); if (skip) MLOG("DM_NVN_SKIP_MESH: task / mesh draws dropped (diagnostic; the picture is wrong)"); } if (skip) return; }   // diagnostic: what the task / mesh draws cost in all
     __unsafe_unretained NvProg *pr = prog_get(S.prog);
     NvShader *ts = pr ? pr->sh[3] : nil, *ms = pr ? pr->sh[4] : nil;
     if (ts && ts->mesh_kind != 1) ts = nil;

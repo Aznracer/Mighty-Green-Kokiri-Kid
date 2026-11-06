@@ -15,11 +15,11 @@ def inst(hi, lo): return struct.pack('<QQ', lo, hi)
 
 @unittest.skipUnless(os.environ.get('DMSH_TEST_XLATE'), 'set DMSH_TEST_XLATE to the offline translator')
 class Translated(unittest.TestCase):
-    def translate(self, code, **extra):
+    def translate(self, code, *, debug=True, **extra):
         with tempfile.TemporaryDirectory(prefix='ampere_mem_') as d:
             work = Path(d); (work / 'k.bin').write_bytes(code)
             # c0 layout (QueryAmpereComputeC0Layout): no uniform or storage buffers, 3 texture handles from 0x10, image handles from 0x28 (word 12 = image slot 1), 0x40 bytes
-            job = [dict(key='k', stage='cs', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, local=[32, 1, 1], debug=True, nvn2_cs=extra.pop('nvn2_cs', [0, 0, 3, 0x40, 0]), **extra)]
+            job = [dict(key='k', stage='cs', arch='sm86', code=str(work / 'k.bin'), tex={}, img={}, attr={}, fout={}, local=[32, 1, 1], debug=debug, nvn2_cs=extra.pop('nvn2_cs', [0, 0, 3, 0x40, 0]), **extra)]
             (work / 'jobs.json').write_text(json.dumps(job))
             r = subprocess.run([os.environ['DMSH_TEST_XLATE'], str(work / 'jobs.json'), d], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
@@ -283,10 +283,11 @@ class StageMemory(Translated):
     def test_the_zero_count_is_left_out(self):   # threads are not in step on Metal: it could land after the real count, and the stage memory starts at zero
         without = self.msl(self.COUNT)
         with_zero = self.msl(self.COUNT_ZERO, self.COUNT)
-        self.assertEqual(without.count('atomic_compare_exchange'), with_zero.count('atomic_compare_exchange'))
+        self.assertEqual(without.count('atomic_fetch_or'), with_zero.count('atomic_fetch_or'))
 
-    def test_a_byte_goes_through_its_word_atomically(self):   # neighbouring threads write neighbouring bytes
-        self.assertIn('atomic_compare_exchange', self.msl(self.INDEX))
+    def test_a_byte_goes_through_its_word_atomically(self):   # neighbouring threads write neighbouring bytes: an atomic AND clears the byte and an atomic OR sets it (no compare-and-swap loop)
+        msl = self.msl(self.INDEX)
+        self.assertIn('atomic_fetch_and', msl); self.assertIn('atomic_fetch_or', msl); self.assertNotIn('atomic_compare_exchange', msl)
 
     def test_outside_a_task_or_mesh_shader_it_is_refused(self):
         with self.assertRaises(AssertionError) as e: self.translate(inst(*self.PAYLOAD) + inst(*EXIT))
@@ -401,6 +402,23 @@ class Shared(Translated):
     def msl(self, *code, shared=0x400):
         msl = self.translate(b''.join(code) + inst(*EXIT), shared=shared)
         return msl[msl.index('kernel void'):]
+
+    def test_optimized_subword_stores_call_the_shared_write_helper(self):
+        for width, hi, offset in [(8, 0x000fe80000000000, 7), (16, 0x000fe80000000400, 6)]:
+            with self.subTest(width=width):
+                # STS.U8/U16 [RZ + offset], R3. Each helper replaces just its part of the shared word.
+                store = inst(hi, offset << 40 | 0x03ff007388)
+                msl = self.translate(mov(3, 37) + store + inst(*EXIT), shared=64, debug=False)
+                self.assertIn('atomic_fetch_and', msl); self.assertIn('atomic_fetch_or', msl)   # the helper clears and sets its part with an atomic AND and OR (PR #1503)
+                self.assertRegex(msl.split('kernel void')[1], rf'int (\w+) = {offset};\s+int (\w+) = 37;\s+\w+\(\1, \2, \w+\);')
+
+    def test_optimized_atomics_keep_the_write_when_their_result_is_rz(self):
+        # ATOMS.ADD/EXCH RZ, [RZ + 4], R12 still updates shared word 1.
+        for opcode, function in [(0, 'atomic_fetch_add_explicit'), (8, 'atomic_exchange_explicit')]:
+            with self.subTest(function=function):
+                atomic = inst(0x004e680000000000 | opcode << 23, 0x0000040cffff738c)
+                msl = self.translate(mov(12, 5) + atomic + inst(*EXIT), shared=64, debug=False)
+                self.assertRegex(msl, rf'{function}\(\(threadgroup atomic_uint\*\)&\w+\[1\], 5u,')
 
     def test_a_32_bit_access_scales_its_register_by_4(self):   # Element 3, not byte 3 (which is element 0)
         self.assertIn('[3] = 77u', self.msl(mov(2, 3), mov(3, 77), inst(*self.STS_SCALED_4)))
