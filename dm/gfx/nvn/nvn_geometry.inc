@@ -634,6 +634,7 @@ static void mesh_tasks_draw(const p_draw *dw) {
     if (dw->ind) {
         const ixc_ent *ix = ixc_find(dw, NULL);
         if (!ix) { ixc_run(dw, NULL); ix = ixc_find(dw, NULL); }
+        if (!g_enc) ixc_prepass();   // the pass this draw opens (see ixc_prepass)
         if (!ix || !ix->args) { RED_ONCE(88, "indirect mesh draw skipped: argument address %#llx cannot be converted", (unsigned long long)dw->ind); return; }
         indirect = ix->args;
     }
