@@ -564,6 +564,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 - the host stops with `NSInvalidArgumentException: -[NvPkg buffer]: unrecognized selector sent to instance` under `tex_by_id` (via `pool_entry`, `pool_gpu`, `encode_args_`, `draw_`, `mesh_tasks_draw`); not a GPU hang, no `kIOGPU` errors. Or a `[RED] texture serial N has a packaged entry but is not CPU-written` line. → [A packaged texture entry handed out as the texture](../reference/nvn-objects.md#a-packaged-texture-entry-handed-out-as-the-texture)
 - a large pool keeps both its contiguous raw-address mapping and earlier overlapping chunks resident. → [Whole-pool mappings leave obsolete chunks resident](../reference/nvn-objects.md#whole-pool-mappings-leave-obsolete-chunks-resident)
 - a large mixed queue of completed and pending GPU references stalls cleanup on the CPU. → [Deferred releases repeatedly shift pending entries](../reference/nvn-objects.md#deferred-releases-repeatedly-shift-pending-entries)
+- the host stops with `NSInvalidArgumentException: -[NvPkg buffer]: unrecognized selector sent to instance` under `tex_by_id` (via `pool_entry`, `pool_gpu`, `encode_args_`, `draw_`, `mesh_tasks_draw`); not a GPU hang, no `kIOGPU` errors. It came after minutes of play, right after a save or at a scene change. → [Freeing a memory pool during a texture ID walk](../reference/nvn-objects.md#freeing-a-memory-pool-during-a-texture-id-walk)
 
 ## Rendering
 
