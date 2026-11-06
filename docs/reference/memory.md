@@ -502,3 +502,10 @@ The guest address space, heaps, pools, virtual address memory and the allocators
 - **Found on:** The Legend of Zelda: Ocarina of Time (Switch 2, 0400486024DEC000; its profile is pull request #1299): about 2.3 GB given back within ten seconds of gameplay with `DM_TEX_RELEASE=2`, which with the other memory changes of the same session let walking runs survive on a 24 GB Mac. The donor copy fixed Link's hat embroidery, whose two BC4 masks are registered again at gameplay entry over the storage of boot-time textures (8 or more copies at entry, the masks' non-zero bytes as with the release off).
 - **Check:** `make -C dm/gfx/tests GAME=<id> check_t_dirty_discard`.
 
+### Pools that hold shader code made resident to key the shaders
+
+- **Symptom:** the residency set holds every memory pool a program's shader code lies in: in Ocarina of Time, 222 pools and 334 MB added through `mtl_addr` as the game sets its programs (the residency line's additions by source line).
+- **Cause:** `keys_hash` (`hle_nvn.c`) checks that a shader's code is mapped in a pool before it hashes it, and asked `mtl_addr`, which also makes the pool resident. The GPU never reads that code: the shaders run translated.
+- **Fix:** general (`nvn_mtl.m` `mtl_pool_holds`): the same pool lookup as `mtl_addr`, without the residency. A pool the GPU does read through a binding or an address is made resident there, as before. `t_pool_holds` checks it.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), whose GPU working set is over an iPad's 8 GB.
+
