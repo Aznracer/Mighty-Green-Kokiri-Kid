@@ -542,6 +542,14 @@ t_logic: t_logic.m $(MTL_T_DEP)
 check_t_logic: t_logic
 	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_logic.py --fixture "$$work"; MTL_DEBUG_LAYER=1 ./t_logic "$$work"
 
+t_tex_recycle: t_tex_recycle.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_tex_recycle.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_tex_recycle
+check_t_tex_recycle: t_tex_recycle
+	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_tex_recycle
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_tex_recycle
+	MTL_DEBUG_LAYER=1 ./t_tex_recycle off
+
 t_pool_retire: t_pool_retire.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_retire.m $(MTL_T_SRC) $(FW)
 check_t_pool_retire: RUN_ENV = MTL_DEBUG_LAYER=1

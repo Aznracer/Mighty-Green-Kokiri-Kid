@@ -439,6 +439,87 @@ static void defer_obj_unref(id obj) { defer_obj_at(obj, 1, g_fence + 1); }
 // Its own autorelease pool: mtl_sub_begin drains before it pushes the submission's pool, on the guest submit thread, whose implicit pool is never drained. The weak-table lookups and the residency-set removal
 // autorelease the retired object, so whatever that thread drained (instead of the completion handler, which wins the race only when the CPU is idle) stayed alive for good: in Metroid Dread every
 // re-upload of its map mask kept the old texture and its 32 MB upload staging block, and GPU memory grew by several GB within minutes under CPU load.
+// ---------- Recycled textures (DM_NVN_TEX_RECYCLE, on by default; 0 off) ----------
+// A game that makes its transient render targets on new texture objects at new addresses each frame got a new Metal texture for each, added to the residency set and taken out
+// again when it went. Ocarina of Time's Hyrule Castle Town, walking and turning the camera: about 1,000 a second (384x384 to 1920x1920 depth, 1920x1080 to 480x270 colour),
+// 5,000 residency additions and removals and 450-680 commits every 300 frames, and the submit thread's CPU time per frame doubled. So a texture the fallback path of tex_mtl_
+// made (newTextureWithDescriptor) goes into a bin when it is released for good (the GPU has passed its fence, no entry of g_by_serial holds it, the sharing table does not):
+// it stays allocated and resident, and the next texture of the same Metal description takes it, filled as a new one is (tex_init_fill / tex_zero_fill). The bin holds at most
+// DM_NVN_TEX_RECYCLE_MB (256) and nothing older than TRC_AGE_NS; past either, and when the GPU memory guard lets go, it is released as before.
+// Each such texture carries an NvTrc (an associated object, so it dies with the texture): its description, and whether the bin holds it. Only the bin's eviction takes one out
+// of the residency set: a release of one that a table still holds, or that the bin already holds, drops that reference alone, so a stale second release cannot take the
+// residency of a texture the bin has handed to a new owner
+@interface NvTrc : NSObject { @public uint8_t key[64]; int binned; uint64_t bytes, ns; } @end
+@implementation NvTrc @end
+static char g_trc_tag;
+enum { TRC_MAX = 1024 };
+static const uint64_t TRC_AGE_NS = 2000000000ull;
+static void *g_trc[TRC_MAX]; static int g_ntrc; static uint64_t g_trc_bytes;   // retained textures, oldest first
+static pthread_mutex_t g_trc_mu = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t g_trc_hit, g_trc_made, g_trc_put, g_trc_evict, g_trc_skip_held, g_trc_short;
+enum { TRC_LO = 70 };   // percent of the working set (ws_bytes) past which nothing is binned (trc_released)
+static _Atomic uint64_t g_trc_hold;   // releases deferred up to this fence are let go, not binned: the GPU memory guard and the retirement of shared textures free memory (trc_hold)
+static void trc_hold(void) { atomic_store(&g_trc_hold, g_fence + 1); }
+static int trc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TEX_RECYCLE"); v = !(e && !strcmp(e, "0")); } return v; }
+static uint64_t trc_cap(void) { static uint64_t v; if (!v) { const char *e = getenv("DM_NVN_TEX_RECYCLE_MB"); v = (e && atoll(e) > 0 ? (uint64_t)atoll(e) : 256) << 20; } return v; }
+static void trc_key_of(MTLTextureDescriptor *d, uint8_t key[64]) {
+    memset(key, 0, 64); uint64_t w[8] = {(uint64_t)d.textureType | (uint64_t)d.pixelFormat << 8 | (uint64_t)d.sampleCount << 40 | (uint64_t)d.mipmapLevelCount << 48,
+        (uint64_t)d.width | (uint64_t)d.height << 32, (uint64_t)d.depth | (uint64_t)d.arrayLength << 32, (uint64_t)d.usage,
+        (uint64_t)d.storageMode | (uint64_t)d.cpuCacheMode << 8 | (uint64_t)d.hazardTrackingMode << 16 | (uint64_t)d.allowGPUOptimizedContents << 24 | (uint64_t)d.compressionType << 32,
+        0, 0, 0};
+    MTLTextureSwizzleChannels sw = d.swizzle; memcpy(&w[5], &sw, sizeof sw);
+    memcpy(key, w, sizeof w);
+}
+static uint64_t now_ns_mono(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+static void res_remove(id<MTLAllocation> r);
+static int trc_held(id o);   // below: an entry of g_by_serial or the sharing table holds it (takes g_smu)
+// Takes out of the bin (caller: no lock) those past the cap or the age, all of them with all = 1; released as before: out of the residency set, then the reference
+static void trc_evict(int all, uint64_t need) {
+    void *out[TRC_MAX]; int nout = 0; uint64_t now = now_ns_mono();
+    pthread_mutex_lock(&g_trc_mu);
+    for (;;) {
+        if (!g_ntrc) break;
+        NvTrc *oldest = objc_getAssociatedObject((__bridge id)g_trc[0], &g_trc_tag);
+        if (!(all || g_trc_bytes + need > trc_cap() || g_ntrc == TRC_MAX || now - oldest->ns > TRC_AGE_NS)) break;
+        void *t = g_trc[0]; NvTrc *b = objc_getAssociatedObject((__bridge id)t, &g_trc_tag);
+        memmove(g_trc, g_trc + 1, (size_t)--g_ntrc * sizeof *g_trc); g_trc_bytes -= b->bytes; b->binned = 0; out[nout++] = t; g_trc_evict++;
+    }
+    pthread_mutex_unlock(&g_trc_mu);
+    for (int i = 0; i < nout; i++) { id t = (__bridge_transfer id)out[i]; res_remove((id<MTLAllocation>)t); }
+}
+// The texture of description d from the bin, or nil (then made marks the new one, trc_mark)
+static id<MTLTexture> trc_take(MTLTextureDescriptor *d) {
+    if (!trc_on() || !g_ntrc) return nil;
+    uint8_t key[64]; trc_key_of(d, key); void *got = NULL;
+    pthread_mutex_lock(&g_trc_mu);
+    for (int i = g_ntrc - 1; i >= 0; i--) { NvTrc *b = objc_getAssociatedObject((__bridge id)g_trc[i], &g_trc_tag);
+        if (!memcmp(b->key, key, 64)) { got = g_trc[i]; memmove(g_trc + i, g_trc + i + 1, (size_t)(--g_ntrc - i) * sizeof *g_trc); g_trc_bytes -= b->bytes; b->binned = 0; g_trc_hit++; break; } }
+    pthread_mutex_unlock(&g_trc_mu);
+    return got ? (__bridge_transfer id<MTLTexture>)got : nil;
+}
+static void trc_mark(id<MTLTexture> t, MTLTextureDescriptor *d) {
+    if (!trc_on() || !t || t.storageMode != MTLStorageModePrivate || t.parentTexture || t.buffer || t.heap) return;
+    NvTrc *b = [NvTrc new]; trc_key_of(d, b->key); b->bytes = t.allocatedSize;
+    objc_setAssociatedObject(t, &g_trc_tag, b, OBJC_ASSOCIATION_RETAIN_NONATOMIC); g_trc_made++;
+}
+// A deferred release of o whose fence has passed (defer_drain): 1 when it is handled here (binned, or only this reference dropped), 0 for the usual release
+static int trc_released(id o, uint64_t fence) {
+    NvTrc *b = trc_on() ? objc_getAssociatedObject(o, &g_trc_tag) : nil;
+    if (!b) return 0;
+    if (b->binned || trc_held(o)) { g_trc_skip_held++; return 1; }   // the bin or a table holds it: only this reference goes
+    if (fence <= atomic_load(&g_trc_hold)) { g_trc_short++; return 0; }   // released to give memory back (trc_hold)
+    // Memory short (the residency set past TRC_LO percent of the working set, below where shared textures are retired, alias_retire_idle): what is released now is let go,
+    // the bin with it, as the retirement and the GPU memory guard mean to give that memory back
+    pthread_mutex_lock(&g_res_mu); uint64_t held_bytes = g_res ? g_res.allocatedSize : 0; pthread_mutex_unlock(&g_res_mu);
+    if (held_bytes > ws_bytes() / 100 * TRC_LO) { if (g_ntrc) trc_evict(1, 0); g_trc_short++; return 0; }
+    trc_evict(0, b->bytes);
+    pthread_mutex_lock(&g_trc_mu);
+    int put = g_ntrc < TRC_MAX && g_trc_bytes + b->bytes <= trc_cap();
+    if (put) { b->binned = 1; b->ns = now_ns_mono(); g_trc[g_ntrc++] = (__bridge_retained void *)o; g_trc_bytes += b->bytes; g_trc_put++; }
+    pthread_mutex_unlock(&g_trc_mu);
+    return put;
+}
+static void trc_flush(void) { trc_evict(1, 0); }
 static void defer_drain(void) { @autoreleasepool {
     NSMutableArray<NvDeferredRelease *> *ready = [NSMutableArray array];
     pthread_mutex_lock(&g_deferred_mu);
@@ -454,6 +535,7 @@ static void defer_drain(void) { @autoreleasepool {
     pthread_mutex_unlock(&g_deferred_mu);
     for (NvDeferredRelease *d in ready.reverseObjectEnumerator) {
         id obj = d->object;
+        if (!d->keep_resident && trc_released(obj, d->fence)) { d->object = nil; continue; }   // a recycled texture: binned, or still held elsewhere (see trc_released)
         if (!d->keep_resident && [obj conformsToProtocol:@protocol(MTLResource)]) {
             pthread_mutex_lock(&g_res_mu);
             int registered = [g_res_objects containsObject:obj];
@@ -2357,6 +2439,11 @@ static CFMutableSetRef g_alias_set;   // Textures in the sharing table (non-owni
 static uint64_t g_alias_evicted;   // shared textures evicted on pool Finalize so far (for the memory report)
 static uint64_t g_stat_ghost_skip;   // finalized serials resolved to a shared texture without a ghost entry (tex_mtl_)
 static int alias_has(id o) { return g_alias_set && o && CFSetContainsValue(g_alias_set, (__bridge const void *)o); }
+static int trc_held(id o) {   // see trc_released
+    uintptr_t k = (uintptr_t)(__bridge const void *)o;
+    pthread_mutex_lock(&g_smu); int h = nvn_hm_get(&g_by_serial_held, &k) != NULL || alias_has(o); pthread_mutex_unlock(&g_smu);
+    return h;
+}
 // On memory pool Finalize, evict the textures built on that pool from the sharing table (collect the keys first, then delete: deletion shifts entries back). The sharing table used not to evict: Mario's pools stay for good, so entries are bounded;
 // Engage frees pools on scene changes and rebuilds on new ones, so the old pools' render targets and other private textures stayed in the table forever (about 0.8 GB more GPU memory over 850 s of the title demo), and linear textures built directly on a pool also kept the whole pool buffer alive.
 // Also, when a pool object's address is reused, old entries would hand a texture on the old storage to the new pool's texture at the same offset and description. Evicted textures go through deferred release; if the serial table still holds one, that is just one more reference
@@ -2488,7 +2575,7 @@ static void alias_retire_idle(void) {
         if (serial_holds(&g_ghost, o) || serial_holds(&g_ghost_active, o)) defer_obj_unref(o); else defer_obj_release(o);
         take++; freed += cs[j].bytes;
     }
-    if (take) { g_ser_gen++; g_alias_retired += take; }
+    if (take) { g_ser_gen++; g_alias_retired += take; trc_hold(); trc_flush(); }
     pthread_mutex_unlock(&g_smu);
     free(cs);
     if (take) { static int lines; if (lines++ < 8) MLOG("shared textures: %u retired (%llu MB), no live object resolved to them in %d submissions (residency set %llu MB of a %llu MB working set)", take,
@@ -4302,8 +4389,9 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         mt = image_texture(t, d);
         int filled = 0;
         if (!mt) mt = pool_heap_texture(t, d);
-        if (!mt) { mt = [g_dev newTextureWithDescriptor:d];
-            if (mt) { res_add(mt); if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); } }
+        if (!mt && (mt = trc_take(d))) { if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); }   // a recycled one: still resident (see trc_released)
+        else if (!mt) { mt = [g_dev newTextureWithDescriptor:d];
+            if (mt) { res_add(mt); trc_mark(mt, d); if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); } }
         if (mt && !filled && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && t->d.target != NVN_TEXTURE_TARGET_BUFFER) rel_push(t, 0);   // the GPU-only texture of a pool nobody reads: its guest pages mean nothing, the host never reads them
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
     }
@@ -4366,6 +4454,9 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
     MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu, idle %llu, unreferenced and idle %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_alias_idle, (unsigned long long)g_alias_retired, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
+    if (trc_on() && g_trc_made) { pthread_mutex_lock(&g_trc_mu); int n = g_ntrc; uint64_t mb = g_trc_bytes >> 20; pthread_mutex_unlock(&g_trc_mu);
+        MLOG("recycled textures (DM_NVN_TEX_RECYCLE): %llu made, %llu binned, %llu taken from the bin, %llu let go, %llu releases while held, %llu not binned for memory; the bin holds %d, %llu MB",
+             (unsigned long long)g_trc_made, (unsigned long long)g_trc_put, (unsigned long long)g_trc_hit, (unsigned long long)g_trc_evict, (unsigned long long)g_trc_skip_held, (unsigned long long)g_trc_short, n, (unsigned long long)mb); }
     if (swept || aorph) MLOG("shared textures no texture object holds: %u, %llu MB; %u of them swept, %llu MB (DM_NVN_ALIAS_SWEEP)", aorph, (unsigned long long)aorph_mb, swept, (unsigned long long)swept_mb);
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
@@ -6003,8 +6094,8 @@ static void guard_evict(int force) { @autoreleasepool {
     static uint64_t last; uint64_t f = atomic_load(&g_cur_frame) + 1;
     if (!force && last && f - last < GUARD_EVERY) return;
     last = f;
-    unsigned entries = alias_evict_idle(), spares = pkg_trim(), staging = up_trim();
-    defer_drain(); res_commit();
+    trc_hold(); unsigned entries = alias_evict_idle(), spares = pkg_trim(), staging = up_trim();
+    defer_drain(); trc_flush(); res_commit();
     static uint64_t lines; if (entries + spares + staging && lines++ < 16)
         MLOG("GPU memory guard: %llu MB (it lets go from %llu MB): %u idle sharing entries, %u spare textures, %u staging blocks let go", (unsigned long long)(guard_used() >> 20), (unsigned long long)(g_guard.evict >> 20), entries, spares, staging);
 } }

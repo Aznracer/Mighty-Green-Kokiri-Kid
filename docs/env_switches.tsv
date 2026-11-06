@@ -220,6 +220,8 @@ DM_NVN_TEXINFO	diagnostic	`=<W>x<H>` logs storage and description of every textu
 DM_NVN_TEXRAW	diagnostic	`=<serial>,…` or `info` (the textures `DM_NVN_TEXINFO` picked out): saves those textures' raw bytes at the `DM_NVN_TEXDUMP` frame, with a text header line
 DM_NVN_TEXSNAP	diagnostic	`=<in-frame pass index>,…`: with `DM_NVN_TEXDUMP`, copies those passes' colour attachments as they end and saves them with the end-of-frame dump
 DM_NVN_TEX_MIP_SKIP	switch	`=<pixels>` (`1` = 512; off by default) makes CPU-written block-compressed 2D / array / cube textures with a mip chain and both sides at least that size without their finest level, a quarter of the memory, for devices whose GPU memory cannot hold a game's textures (nvn_mtl.m mip_skip)
+DM_NVN_TEX_RECYCLE	switch	`0` makes a new Metal texture for every texture the fallback path needs and frees each released one, as before; by default a released one goes into a bin, still resident, and the next texture of its Metal description takes it (nvn_mtl.m trc_*)
+DM_NVN_TEX_RECYCLE_MB	switch	`=<MB>` (default 256): the most the bin of recycled textures (`DM_NVN_TEX_RECYCLE`) keeps; it also keeps none older than 2 s, and none while the residency set is past 70 % of the working set
 DM_NVN_TREG_ID	diagnostic	`=<n>` logs every registration of texture ID n: what it holds from then on, and the frame being recorded
 DM_NVN_TSV	diagnostic	`=<path>` writes the per-frame NVN call table and timing rows (frame, metric, value) to a TSV, read by `scripts/bench.py`
 DM_NVN_TSV_CALLS	diagnostic	`0` makes `DM_NVN_TSV` write only the timing rows, without the call counts (about two thirds of the file)
