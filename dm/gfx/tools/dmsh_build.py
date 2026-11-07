@@ -242,7 +242,14 @@ PRE_STATS = collections.Counter()
 # -O1: the front end's -O2 (CorrelatedValuePropagation, then SimplifyCFG) folds the translated shaders' repeated tests of one value into switches whose cases jump past their own join.
 # Apple's GPU backend then exceeds its control-flow ID budget ("Max Unstruct ID 758 ... exceeds supported limit", a note, not an error) and falls back to a slower lowering:
 # Odyssey's alRenderMaterialUber took 25 minutes and 17.3 MB of GPU code, 31 s and 1.3 MB at -O1. Ordinary shaders come out within a few percent either way (the backend optimizes again)
-MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance']
+# Profile shader_math (fast by default, relaxed, safe): Metal's maths mode for this game's Mac libraries. Fast lets the compiler assume no NaN / infinity, so the translated
+# shaders' isnan selects (Maxwell's NaN semantics) can fold away, and it approximates and reorders. Ocarina of Time's grass showed single blades pure white for a frame with fast and
+# with relaxed (as ios_metal.py compiles), not with safe (-fno-fast-math, 1,520 of its mesh and pixel shaders swapped in loose). One mode for every library: [[invariant]] positions
+# only agree between shaders compiled alike
+SHADER_MATH = {'fast': [], 'relaxed': ['-fmetal-math-mode=relaxed'], 'safe': ['-fno-fast-math']}
+_math = GAME.get('shader_math', 'fast') if GAME else 'fast'
+if _math not in SHADER_MATH: sys.exit(f'[RED] game.tsv shader_math: {_math} (fast, relaxed or safe)')
+MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance'] + SHADER_MATH[_math]
 MAC_RECORD = ' '.join(MAC_METAL) + '; xcrun -sdk macosx metallib'
 # -fbracket-depth: the front end stops at 256 nested brackets ("bracket nesting level exceeded maximum of 256"). Ocarina of Time's compute shaders 1f78730053feb036 and e172bd7ec218ab8e
 # (3.5 MB of MSL each) nest 259 deep in one expression and were left out. A source within the default limit compiles to the same bytes with it (checked on macOS and iOS), so, like the

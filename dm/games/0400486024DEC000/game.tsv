@@ -36,6 +36,8 @@ sys_resource	0x3000000
 # ---- Shader split ----
 shader_groups	/Shader/=shader /Lib/=lib /Effect/=effect /Layout2Shader/=layout /Movie/=movie
 shader_note	0400486024DEC000 shaders
+# Mac shader libraries without fast math (dmsh_build.py SHADER_MATH): with fast or relaxed maths single grass blades went pure white for a frame (Hyrule Field, the castle moat)
+shader_math	safe
 
 # ---- Graphics ----
 # agl wraps its depth clears in render conditions, as on Donkey Kong Bananza and Splatoon Raiders: in Kokiri Forest the main opaque pass tests EQUAL against a copy of the prepass depth
