@@ -71,6 +71,7 @@ The launcher's Render scale (`DM_RENDER_SCALE`, 0.5 to 1.0) fixes the 3D views a
 - [LDSM reads rows other lanes stored](../../../docs/reference/shaders.md#ldsm-reads-rows-other-lanes-stored): white blotches over Kokiri Forest through agl's upscaler on an M4 Pro.
 - Resolved: dotted horizontal rows across the picture in play, in fog and light (GitHub issue 1537): the agl_ndsr_vr networks' HMMA calls outside a chain overwrote an accumulator a chain held ([An HMMA outside a chain overwrote the chain's accumulator](../../../docs/reference/shaders.md#an-hmma-outside-a-chain-overwrote-the-chains-accumulator)), since chain 23a1ea1db092; found by bisecting chains on the Kokiri Forest autosave (0f510fd5's chain clean, bd9f422d's not). Under the game's upscaler they had also grown into white blotches: [LDSM reads rows other lanes stored](../../../docs/reference/shaders.md#ldsm-reads-rows-other-lanes-stored).
 - [An HMMA outside a chain overwrote the chain's accumulator](../../../docs/reference/shaders.md#an-hmma-outside-a-chain-overwrote-the-chains-accumulator): dotted rows across fog and light in play.
+- [A texture shared by its packaged texture's serials left the residency set with one of them](../../../docs/reference/nvn-objects.md#a-texture-shared-by-its-packaged-textures-serials-left-the-residency-set-with-one-of-them): GPU page faults 15-45 minutes into play (issue #1326), on 260x260 terrain tiles made GPU textures at the GPU's first write.
 
 ## Open
 

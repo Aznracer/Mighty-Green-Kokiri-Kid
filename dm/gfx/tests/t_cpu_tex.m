@@ -303,6 +303,50 @@ static void finalize_during_walk(void) {
     mtl_reg_tex(1,NULL,NULL); h_nvnTextureFinalize(&tex);
     defer_drain(); munmap(mem,len);
 }
+static int resident(id o) { pthread_mutex_lock(&g_res_mu); int r = [g_res_objects containsObject:o]; pthread_mutex_unlock(&g_res_mu); return r; }
+static void settle(void) { for (int i = 0; i < 2; i++) { g_fence++; pthread_mutex_lock(&g_mu); g_done = g_fence; pthread_mutex_unlock(&g_mu); defer_drain(); } }   // the GPU passed every fence
+// The GPU's first write over a texture taken from its storage (cpu_unc_drop): every serial that held the package now holds its texture, the package goes, and the serials go one by
+// one, the last through the ghost ring. The texture stays resident while any serial entry, live or finalized, holds it, and leaves the residency set with the last. Ocarina of Time's
+// 260x260 terrain tiles handed over this way left the set with the package, or with the first holder a ghost-ring eviction dropped, while still drawn: GPU address faults (#1326)
+static void handover_holders(void) {
+    const size_t len = 262144;
+    uint8_t *mem = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (mem == MAP_FAILED) abort();
+    memset(mem + 65536, 0x5a, 4096);   // what the CPU wrote before the first use
+    pool_t pool = {0}; pool_builder_t pb = {.mem=mem, .size=len, .flags=NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    CHECK(h_nvnMemoryPoolInitialize((NVNmemoryPool *)&pool, (const NVNmemoryPoolBuilder *)&pb), "hand-over: pool initialized");
+    NVNtextureBuilder tb; NVNtexture a = {0}, b = {0}; h_nvnTextureBuilderSetDefaults(&tb);
+    h_nvnTextureBuilderSetWidth(&tb, 4); h_nvnTextureBuilderSetHeight(&tb, 4); h_nvnTextureBuilderSetFormat(&tb, NVN_FORMAT_RGBA8);
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, 65536);
+    CHECK(h_nvnTextureInitialize(&a, &tb) && h_nvnTextureInitialize(&b, &tb), "hand-over: two texture objects over the same storage");
+    uint64_t sa = ((tex_t *)&a)->serial, sb = ((tex_t *)&b)->serial;
+    mtl_sub_begin();
+    id<MTLTexture> ta0 = tex_mtl((const tex_t *)&a), tb0 = tex_mtl((const tex_t *)&b);
+    CHECK(ta0 && tb0, "hand-over: both texture objects resolve");
+    { const tex_t *ta_ = (const tex_t *)&a; mtl_tex_gpu_written(ta_->pool, ta_->mem, ta_->L.size); }   // the GPU writes over the storage
+    cpu_unc_drop();
+    // This tree's first-use rules decide whether the two serials share one package; what each holds after the hand-over is the texture under test
+    id ha = tex_get(sa), hb = tex_get(sb);
+    CHECK([ha conformsToProtocol:@protocol(MTLTexture)] && [hb conformsToProtocol:@protocol(MTLTexture)], "hand-over: both serials hold a texture, not a package");
+    NVNtexture c = {0}; CHECK(h_nvnTextureInitialize(&c, &tb), "hand-over: a new texture object over the same storage");
+    id<MTLTexture> tc = tex_mtl((const tex_t *)&c);
+    CHECK(tc && tc != (id)ha && tc != (id)hb, "hand-over: the new object gets a texture of its own");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "hand-over: submission completed");
+    settle();
+    CHECK(resident(ha) && resident(hb), "hand-over: the packages' release leaves the textures resident for their serials");
+    h_nvnTextureFinalize(&a); settle();
+    CHECK(resident(hb), "hand-over: one serial's release leaves the other's texture resident");
+    if (ha != hb) CHECK(!resident(ha), "hand-over: a texture no entry holds any more leaves the residency set");
+    tex_put(sa, hb);   // a record of the finalized object replayed resolves to b's texture through the ghost ring
+    h_nvnTextureFinalize(&b); settle();
+    CHECK(resident(hb), "hand-over: a finalized serial in the ghost ring keeps the texture resident after the last live serial goes");
+    for (uint64_t i = 0; i < NGHOST; i++) tex_put((1ull << 61) + i, [NSObject new]);   // the ring evicts that entry
+    settle();
+    pthread_mutex_lock(&g_smu); int left = g_retire_held.n; pthread_mutex_unlock(&g_smu);
+    CHECK(!resident(hb) && !left, "hand-over: the last holder's release takes it out of the residency set");
+    h_nvnTextureFinalize(&c); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&pool); settle();
+    munmap(mem, len);
+}
 int main(int argc, const char **argv) { @autoreleasepool {
     setenv("DM_NVN_POOL_SKIP_RETIRED", "0", 1);   // finalized_bindless_pool checks that retired IDs are made again; a profile with pool_skip_retired (Ocarina of Time) gives them the dummy
     enum { N = 6442, BASE = 1000 };
@@ -329,6 +373,6 @@ int main(int argc, const char **argv) { @autoreleasepool {
     CHECK(mtl_cpu_tex_count() == N - 2, "a texture with no serial is not recorded");
     for (int i=0;i<N;i++) mtl_tex_release(&t[i]);
     retired_classification(); descriptor_replacement(); gpu_written_ranges();
-    if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); finalized_bindless_pool(); for (int i=0;i<3;i++) flushed_buffer_upload(i); packaged_entry_outside_the_set(); finalize_during_walk(); gpu_owned_after_write(); }
+    if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); finalized_bindless_pool(); for (int i=0;i<3;i++) flushed_buffer_upload(i); packaged_entry_outside_the_set(); finalize_during_walk(); gpu_owned_after_write(); handover_holders(); }
     printf("t_cpu_tex: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

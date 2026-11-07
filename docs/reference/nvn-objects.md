@@ -793,6 +793,24 @@ Games read this count as a position in their own command memory and size their h
 - **Fix:** partition the queue once under its existing mutex, then retire ready entries outside the lock in the original reverse order. Fence eligibility, keep-resident semantics and pending order are unchanged.
 - **Found on:** Ocarina of Time (Switch 2, #1299) scene-load investigation. This PR has synthetic lifetime validation, not an isolated gameplay FPS measurement.
 - **Check:** `t_deferred_release` queues 100,000 probes with alternating fences, verifies exact release/pending order and lifetimes, then drains the remaining fence and an empty queue.
+- **Symptom:** a pool walk makes gigabytes of textures from far fewer images: Ocarina of Time's 32,768 IDs name 3,607 storages, and one texture per ID came to 2 GB.
+- **Cause:** a packaged texture belongs to its serial, and the engine registers the same storage under many texture objects.
+- **Fix:** general (`nvn_mtl.m` `g_pkg_share`, `tex_alias_key`, `pkg_shared`). Packaged textures are shared by storage, layout and format through a weak table, so a new serial of the same storage takes the existing one. A pool's removal evicts its keys (`mtl_alias_drop_pool`), and the walk's budget does not count a texture that is already shared.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
+
+### A texture shared by its packaged texture's serials left the residency set with one of them
+
+- **Symptom:** after 15 to 45 minutes of play, a segment command buffer fails with `kIOGPUCommandBufferCallbackErrorPageFault` and every later submission is refused (`SubmissionsIgnored`): the picture freezes, or turns pink, while the audio goes on. With `DM_RES_CHECK=1`, `missing residency` lines name 260x260 textures before the fault.
+- **Cause:** the serials of one storage share one packaged texture ([previous entry](#texture-ids-of-one-storage-share-one-packaged-texture)). At the GPU's first write over that storage (`cpu_unc_drop`), each of them, live or finalized in the ghost ring, gets the package's texture itself (`tex_put`), and no table owns it. The package's release (`NvPkg`'s `dealloc`) took it out of the residency set at once, and so did the release of any one holder (`tex_put`'s ghost-ring eviction, `serial_put`, `serial_del`), while the other serials still drew with it. A command buffer reading it then faults. Retiring an object meant taking it out of the set, whoever else held it.
+- **Fix:** every game (`nvn_mtl.m` `defer_drain`, `g_retire_held`, `g_ghost_held`). A retired resource that a serial entry still holds, in `g_by_serial` or the ghost ring (both counted), keeps its residency and waits in `g_retire_held`. The last entry's release retires it again. The package's release goes through the same deferred release. A re-upload doesn't write into a spare that serials still hold. The sharing table's storage takeover no longer scans the ghost ring for that case, since the same rule covers it. The memory report counts the waiting textures (`retired but held by a serial`). `t_cpu_tex --metal` (`handover_holders`) hands a package over to two serials and drops the package, then each serial, the last through the ghost ring.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md) (GitHub issue #1326; diagnosis and A/B in PR #1644), v131072 on a Mac mini M4, 16 GB. The faults came at 44, 29, 24 and 15.5 minutes. A diagnostic that records where each object left the residency set named the missing textures before two faults: 260x260 terrain tiles handed over this way, released by the ghost-ring eviction. PR #1644 kept them in a table until their pool went: 107 minutes with no fault, against a fault at 37 minutes without it.
+
+### Finalizing a copy of a texture object
+
+- **Symptom:** thousands of first uploads a frame in a scene whose textures do not change: Ocarina of Time, about 15,000 a frame.
+- **Cause:** the engine copies an `NVNtexture` by value and finalizes the copy, while the original stays in use. The host keyed the texture by serial, so finalizing the copy deleted the host texture of the original, and its next use uploaded it again.
+- **Fix:** general (`nvn_mtl.m` `mtl_tex_release`). The registry keeps the address of the object that was initialized, and a finalize is ignored when that owner still holds the texture's magic and serial (read with `vm_read_overwrite`, as the owner's memory may be gone). `t_cpu_tex` checks both orders.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md).
 
 ### Freeing a memory pool during a texture ID walk
 

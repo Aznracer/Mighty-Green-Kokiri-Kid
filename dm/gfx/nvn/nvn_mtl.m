@@ -422,7 +422,7 @@ void mtl_res_stats(char *out, size_t n) {
 static NSMutableArray<NvDeferredRelease *> *g_deferred;
 static pthread_mutex_t g_deferred_mu = PTHREAD_MUTEX_INITIALIZER;
 // Deferred release has two meanings that must be kept apart (the root of the GPU memory fault on the first frame on entering Travincal):
-//   defer_obj_release = this object is retired: drop the reference after the submissions that used it complete, and remove it from the residency set;
+//   defer_obj_release = this object is retired: drop the reference after the submissions that used it complete, and remove it from the residency set once no serial entry holds it (g_retire_held);
 //   defer_obj_unref   = only the reference I hold is no longer wanted, the object itself may still be in use (the view cache of a texture ID may hold the base texture itself): only drop the reference, leave the residency set alone.
 // Previously only the former existed: when the view cache was invalidated, a texture that 'is still the current storage of some serial' was also removed from the residency set. Invalidation used to happen only when the base texture was really replaced, so it was never hit;
 // after the transparency chain's in-place composite swapped the storage of two textures, each of the two live textures was removed once this way, and afterwards they are used as attachments and sampled every frame as usual - the GPU accesses non-resident memory.
@@ -436,6 +436,7 @@ static void defer_obj_at(id obj, int keep_resident, uint64_t fence) {
 }
 static void defer_obj_release(id obj) { defer_obj_at(obj, 0, g_fence + 1); }
 static void defer_obj_unref(id obj) { defer_obj_at(obj, 1, g_fence + 1); }
+static pthread_mutex_t g_smu; static int entry_holds(const void *o); static void retire_wait(id o);   // defined below (the serial table)
 // Its own autorelease pool: mtl_sub_begin drains before it pushes the submission's pool, on the guest submit thread, whose implicit pool is never drained. The weak-table lookups and the residency-set removal
 // autorelease the retired object, so whatever that thread drained (instead of the completion handler, which wins the race only when the CPU is idle) stayed alive for good: in Metroid Dread every
 // re-upload of its map mask kept the old texture and its 32 MB upload staging block, and GPU memory grew by several GB within minutes under CPU load.
@@ -533,7 +534,24 @@ static void defer_drain(void) { @autoreleasepool {
     }
     g_deferred = pending;
     pthread_mutex_unlock(&g_deferred_mu);
+    // A retired resource a serial entry still holds keeps its residency (g_retire_held). g_smu is only tried: this runs on the completion handler's thread too, which must not wait on
+    // the submit thread's long holds; when it is busy, those entries wait for the next drain
+    NSMutableArray<NvDeferredRelease *> *res_ready = nil;
+    for (NvDeferredRelease *d in ready) if (!d->keep_resident && [d->object conformsToProtocol:@protocol(MTLResource)]) { if (!res_ready) res_ready = [NSMutableArray array]; [res_ready addObject:d]; }
+    if (res_ready && !pthread_mutex_trylock(&g_smu)) {
+        for (NvDeferredRelease *d in res_ready) if (entry_holds((__bridge void *)d->object)) { retire_wait(d->object); d->keep_resident = 1; }
+        pthread_mutex_unlock(&g_smu);
+    } else if (res_ready) {
+        pthread_mutex_lock(&g_deferred_mu); [g_deferred addObjectsFromArray:res_ready]; pthread_mutex_unlock(&g_deferred_mu);
+        NSMutableArray<NvDeferredRelease *> *rest = [NSMutableArray arrayWithCapacity:ready.count];
+        for (NvDeferredRelease *d in ready) if (d->keep_resident || ![d->object conformsToProtocol:@protocol(MTLResource)]) [rest addObject:d];
+        ready = rest;
+    }
+    // A release queued twice for one object in this pass (a holder's own release and retire_resume's) goes through once: the second could bin a texture the bin had
+    // handed out again meanwhile (trc_released)
+    CFMutableSetRef seen = CFSetCreateMutable(NULL, 0, NULL);
     for (NvDeferredRelease *d in ready.reverseObjectEnumerator) {
+        if (!d->keep_resident && d->object) { if (CFSetContainsValue(seen, (__bridge const void *)d->object)) { d->object = nil; continue; } CFSetAddValue(seen, (__bridge const void *)d->object); }
         id obj = d->object;
         if (!d->keep_resident && trc_released(obj, d->fence)) { d->object = nil; continue; }   // a recycled texture: binned, or still held elsewhere (see trc_released)
         if (!d->keep_resident && [obj conformsToProtocol:@protocol(MTLResource)]) {
@@ -544,6 +562,7 @@ static void defer_drain(void) { @autoreleasepool {
         }
         d->object = nil;
     }
+    CFRelease(seen);
 } }
 
 // Between submissions no feedback handler comes to drain the queue. A game that stops submitting out of focus (Ocarina of Time's main thread waits in oe::PopNotificationMessage) goes on mapping
@@ -2432,14 +2451,26 @@ static nvn_hmap g_alias = {.klen = sizeof(alias_key)};
 // each candidate instead: in Ocarina of Time's cutscenes, with about 7,500 serials and thousands of shared textures, that walk was the submit thread's hottest function and
 // frames took up to a second. An entry holds its object (CFBridgingRetain), so a counted address cannot be reused while counted. Under g_smu
 static nvn_hmap g_by_serial_held = {.klen = sizeof(uintptr_t)};
-static void held_add(const void *o, int d) {
-    if (!o) return;
-    uintptr_t k = (uintptr_t)o, n = (uintptr_t)nvn_hm_get(&g_by_serial_held, &k);
-    if (d > 0) nvn_hm_put(&g_by_serial_held, &k, (void *)(n + 1));
-    else if (n > 1) nvn_hm_put(&g_by_serial_held, &k, (void *)(n - 1));
-    else if (n) nvn_hm_del(&g_by_serial_held, &k);   // a slot written past these helpers (a test's table) was never counted: nothing to take away
-}
+// The same count for the ghost ring (g_ghost, finalized serials a replayed record still resolves; tex_put and the upgrade's in-place replacement write it)
+static nvn_hmap g_ghost_held = {.klen = sizeof(uintptr_t)};
+// A retired object a serial entry still holds stays in the residency set until the last such entry lets it go. Several entries can hold one texture that no table owns: at the GPU's
+// first write over storage a packaged texture was taken from (cpu_unc_drop), every serial of the package gets the package's texture itself, live serials and finalized ones in the ghost
+// ring. The package's release and each holder's retired it, taking it out of the residency set while the others still drew with it: GPU address faults 15-45 minutes into Ocarina of
+// Time, on 260x260 terrain tiles (GitHub issue #1326). So defer_drain asks whether a serial entry holds what it retires; one that does waits here (address → the object, retained), and
+// the count's last entry going retires it again (retire_resume). Under g_smu
+static nvn_hmap g_retire_held = {.klen = sizeof(uintptr_t)};
+static void retire_resume(const void *o);
 static int serial_table_holds(const void *o) { uintptr_t k = (uintptr_t)o; return nvn_hm_get(&g_by_serial_held, &k) != NULL; }
+static int entry_holds(const void *o) { uintptr_t k = (uintptr_t)o; return serial_table_holds(o) || (g_ghost_held.n && nvn_hm_get(&g_ghost_held, &k)); }
+static void count_add(nvn_hmap *m, const void *o, int d) {
+    if (!o) return;
+    uintptr_t k = (uintptr_t)o, n = (uintptr_t)nvn_hm_get(m, &k);
+    if (d > 0) nvn_hm_put(m, &k, (void *)(n + 1));
+    else if (n > 1) nvn_hm_put(m, &k, (void *)(n - 1));
+    else if (n) { nvn_hm_del(m, &k); if (g_retire_held.n && !entry_holds(o)) retire_resume(o); }   // a slot written past these helpers (a test's table) was never counted: nothing to take away
+}
+static void held_add(const void *o, int d) { count_add(&g_by_serial_held, o, d); }
+static void ghost_held_add(const void *o, int d) { count_add(&g_ghost_held, o, d); }
 static nvn_hmap g_alias_seen = {.klen = sizeof(alias_key)};   // key → g_fence + 1 at its last lookup or creation (alias_take_over spares entries looked up lately)
 static nvn_hmap g_alias_lseen = {.klen = sizeof(alias_key)};   // key → g_fence + 1 at its creation or last lookup for a live texture object (alias_retire_idle)
 static nvn_hmap g_alias_gone = {.klen = sizeof(alias_key)};   // keys alias_retire_idle retired: a finalized descriptor over one resolves to nothing instead of a new texture
@@ -2469,6 +2500,16 @@ static int trc_held(id o) {   // see trc_released
     uintptr_t k = (uintptr_t)(__bridge const void *)o;
     pthread_mutex_lock(&g_smu); int h = nvn_hm_get(&g_by_serial_held, &k) != NULL || alias_has(o); pthread_mutex_unlock(&g_smu);
     return h;
+}
+static void retire_wait(id o) {   // defer_drain: a serial entry still holds what it retires. Caller holds g_smu
+    uintptr_t k = (uintptr_t)(__bridge void *)o;
+    if (!nvn_hm_get(&g_retire_held, &k)) nvn_hm_put(&g_retire_held, &k, (void *)CFBridgingRetain(o));
+}
+static void retire_resume(const void *o) {   // the last serial entry holding a waiting object let it go: retired again, unless the sharing table took it meanwhile (it retires its own). Caller holds g_smu
+    uintptr_t k = (uintptr_t)o; void *v = nvn_hm_del(&g_retire_held, &k);
+    if (!v) return;
+    id obj = CFBridgingRelease(v);
+    if (!alias_has(obj)) defer_obj_release(obj);
 }
 // On memory pool Finalize, evict the textures built on that pool from the sharing table (collect the keys first, then delete: deletion shifts entries back). The sharing table used not to evict: Mario's pools stay for good, so entries are bounded;
 // Engage frees pools on scene changes and rebuilds on new ones, so the old pools' render targets and other private textures stayed in the table forever (about 0.8 GB more GPU memory over 850 s of the title demo), and linear textures built directly on a pool also kept the whole pool buffer alive.
@@ -2522,7 +2563,8 @@ static uint64_t g_alias_taken;   // shared textures evicted when another texture
 static uint64_t g_alias_idle;   // shared textures let go for being idle (for the memory report)
 static nvn_hmap g_ghost;   // defined below (finalized texture serials)
 static nvn_hmap g_ghost_active = {.klen = 8};   // finalized serials touched in the submission being encoded, under g_smu
-static int serial_holds(nvn_hmap *m, id o) { for (uint32_t i = 0; i < m->cap; i++) if (m->vals[i] == (__bridge void *)o) return 1; return 0; }
+// Whether an entry of the ghost tables holds o: their count (g_ghost_held), instead of a walk of both tables for every texture let go
+static int ghost_holds(id o) { uintptr_t k = (uintptr_t)(__bridge const void *)o; return g_ghost_held.n && nvn_hm_get(&g_ghost_held, &k) != NULL; }
 // These entries leave the sharing table. A finalized object resolved through the ghost tables keeps its own reference; otherwise the texture is retired. Caller holds g_smu
 static void alias_let_go(const alias_key *ks, uint32_t n) {
     for (uint32_t j = 0; j < n; j++) {
@@ -2531,7 +2573,7 @@ static void alias_let_go(const alias_key *ks, uint32_t n) {
         nvn_hm_del(&g_alias_seen, &ks[j]); nvn_hm_del(&g_alias_lseen, &ks[j]);
         id o = CFBridgingRelease(old);
         if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
-        if (serial_holds(&g_ghost, o) || serial_holds(&g_ghost_active, o)) defer_obj_unref(o); else defer_obj_release(o);   // #1299: the active ghost ring holds its own
+        if (ghost_holds(o)) defer_obj_unref(o); else defer_obj_release(o);   // #1299: the active ghost ring holds its own
     }
 }
 static int pool_skip_retired(void);
@@ -2603,7 +2645,7 @@ static void alias_retire_idle(void) {
         nvn_hm_del(&g_alias_seen, &cs[j].k); nvn_hm_del(&g_alias_lseen, &cs[j].k); nvn_hm_put(&g_alias_gone, &cs[j].k, (void *)1);
         id o = CFBridgingRelease(old);
         if (g_alias_set) CFSetRemoveValue(g_alias_set, (__bridge const void *)o);
-        if (serial_holds(&g_ghost, o) || serial_holds(&g_ghost_active, o)) defer_obj_unref(o); else defer_obj_release(o);
+        if (ghost_holds(o)) defer_obj_unref(o); else defer_obj_release(o);
         take++; freed += cs[j].bytes;
     }
     if (take) { g_ser_gen++; g_alias_retired += take; trc_hold(); trc_flush(); }
@@ -2654,7 +2696,7 @@ static __unsafe_unretained id tex_get(uint64_t k) {
     pthread_mutex_lock(&g_smu);
     __unsafe_unretained id o = hm_get_id(&g_by_serial, &k);
     if (!o && g_ghost_active.n) o = hm_get_id(&g_ghost_active, &k);
-    if (!o && g_ghost.n && (o = hm_get_id(&g_ghost, &k)) && on_sub_thread() && g_cb) hm_put_id(&g_ghost_active, &k, o);
+    if (!o && g_ghost.n && (o = hm_get_id(&g_ghost, &k)) && on_sub_thread() && g_cb) { hm_put_id(&g_ghost_active, &k, o); ghost_held_add((__bridge void *)o, 1); }
     pthread_mutex_unlock(&g_smu);
     return o;
 }
@@ -2665,20 +2707,23 @@ static void tex_put(uint64_t k, id o) {   // serials from 2^62 up are external t
     nvn_hmap *m = live ? &g_by_serial : &g_ghost;
     if (active && !hm_get_id(&g_ghost, &k)) m = &g_ghost_active;
     id old = hm_get_id(m, &k);
-    if (old && m == &g_by_serial) held_add((__bridge void *)old, -1);
+    // The counts of entries holding each object (entry_holds): the new one first, so the same object put again never reaches zero on the way
+    nvn_hmap *cnt = m == &g_by_serial ? &g_by_serial_held : &g_ghost_held;
+    count_add(cnt, (__bridge void *)o, 1);
+    if (old) count_add(cnt, (__bridge void *)old, -1);
     if (old) { if (old != o) obj_drop(old); }
     else if (m == &g_ghost) {
         uint64_t *slot = &g_ghost_ring[g_ghost_next++ % NGHOST];
         if (*slot) {
             id ev = hm_get_id(&g_ghost, slot);
+            if (ev) ghost_held_add((__bridge void *)ev, -1);
             if (ev != hm_get_id(&g_ghost_active, slot)) { obj_drop(ev); ser_note(*slot); }
             hm_del_id(&g_ghost, slot);
         }
         *slot = k; g_ghost_puts++;
     }
     hm_put_id(m, &k, o); ser_note(k);
-    if (m == &g_by_serial) held_add((__bridge void *)o, 1);
-    if (m == &g_ghost && (active || (on_sub_thread() && g_cb))) hm_put_id(&g_ghost_active, &k, o);
+    if (m == &g_ghost && (active || (on_sub_thread() && g_cb))) { ghost_held_add((__bridge void *)o, 1); if (active) ghost_held_add((__bridge void *)active, -1); hm_put_id(&g_ghost_active, &k, o); }
     pthread_mutex_unlock(&g_smu);
 }
 // A bindless pool can resolve more finalized textures than the small ghost ring holds, many times within one submission.
@@ -2689,6 +2734,7 @@ static void ghost_finish_submission(void) {
         void *v = g_ghost_active.vals[i]; if (!v) continue;
         const void *key = g_ghost_active.keys + (size_t)i * g_ghost_active.klen;
         if (nvn_hm_get(&g_ghost, key) != v) { obj_drop((__bridge id)v); uint64_t serial; memcpy(&serial, key, sizeof serial); ser_note(serial); }
+        ghost_held_add(v, -1);
         CFRelease(v);
     }
     if (g_ghost_active.n) nvn_hm_clear(&g_ghost_active, NULL);
@@ -2701,8 +2747,9 @@ static void ghost_finish_submission(void) {
 // sparse: in a sparse virtual pool, read through its page table (hle_nvn.c nvn_sparse_*), vgen the page table's generation at the upload and vseen at the last look; view: what it is bound as (sparse_view)
 // ps: its placement sparse texture (NvSparse, sparse_make), which tex is: mapped and uploaded tile by tile (sparse_sync)
 // edge: the uploaded bytes of the storage's first and last host pages where other data shares them (pkg_edges_take)
+// Its release retires its textures (defer_obj_release, not res_remove at once): serials that took its texture over (cpu_unc_drop) keep it resident (defer_drain)
 @implementation NvPkg
-- (void)dealloc { res_remove(tex); if (spare) res_remove(spare); free(edge[0]); free(edge[1]); }
+- (void)dealloc { defer_obj_release(tex); defer_obj_release(spare); free(edge[0]); free(edge[1]); }
 @end
 // A sparse texture's CPU-write check walks its page table (nvn_sparse_since). A submission sees the CPU writes and the mappings made before it (as NVN's: a map is a CPU call,
 // not a command), so the replay checks each one once a submission (sub: the submission, g_sub_serial, of its last check). Games remap streamed pages all the time, so the
@@ -2925,7 +2972,7 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
             if (tables[j]->vals[i] != (__bridge void *)base) continue;
             uint64_t serial; memcpy(&serial, tables[j]->keys + (size_t)i * tables[j]->klen, sizeof serial);
             void *old = tables[j]->vals[i]; tables[j]->vals[i] = (void *)CFBridgingRetain(upgraded);
-            if (j == 0) { held_add(old, -1); held_add((__bridge void *)upgraded, 1); }   // g_by_serial: the count moves with the name
+            nvn_hmap *cnt = j == 0 ? &g_by_serial_held : &g_ghost_held; count_add(cnt, old, -1); count_add(cnt, (__bridge void *)upgraded, 1);   // the count moves with the name
             CFRelease(old); named |= serial == t->serial;
         }
         for (uint32_t i = 0; i < g_alias.cap; i++) {
@@ -4320,7 +4367,7 @@ static void rc_reclaim(int i) {   // caller holds g_rc_mu, not g_smu
     pthread_mutex_lock(&g_smu);
     __unsafe_unretained id m = hm_get_id(&g_alias, &e->k);
     if (!m) { pthread_mutex_unlock(&g_smu); rcb_del(i); return; }
-    if (serial_holds(&g_ghost, m)) { g_rc_ghost++; pthread_mutex_unlock(&g_smu); return; }   // a finalized serial a record may still replay: kept
+    if (ghost_holds(m)) { g_rc_ghost++; pthread_mutex_unlock(&g_smu); return; }   // a finalized serial a record may still replay: kept
     for (uint32_t j = 0; j < g_by_serial.cap && nk < 64; j++) if (g_by_serial.vals[j] == (__bridge void *)m) memcpy(&keys[nk++], g_by_serial.keys + (size_t)j * g_by_serial.klen, 8);
     pthread_mutex_unlock(&g_smu);
     if (nk == 64) return;   // more holders than followed: kept
@@ -4516,6 +4563,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
             // when the GPU is done with it (see NvPkg), else a new one; the old one becomes the spare (pkg_upload_ made nt resident)
             id<MTLTexture> reuse = nil;
             if (pk->spare) { pthread_mutex_lock(&g_mu); uint64_t done = g_done; pthread_mutex_unlock(&g_mu); if (pk->spare_fence <= done && pk->spare.usage == pk->tex.usage) reuse = pk->spare; }
+            if (reuse) { pthread_mutex_lock(&g_smu); if (entry_holds((__bridge void *)reuse)) reuse = nil; pthread_mutex_unlock(&g_smu); }   // serials that took it over (cpu_unc_drop) still draw it
             uint64_t st, vg = nvn_sparse_gen(); id<MTLTexture> nt = pkg_upload(t, &st, reuse, pk->tex.usage);
             if (nt) { id<MTLTexture> old = pk->tex; pk->tex = nt;
                 if (pk->spare && pk->spare != nt) defer_obj_release(pk->spare);   // still in use, or of another shape: retired as before
@@ -4650,7 +4698,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     pthread_mutex_lock(&g_deferred_mu); unsigned long nd = (unsigned long)g_deferred.count; pthread_mutex_unlock(&g_deferred_mu);
     pthread_mutex_lock(&g_res_mu); unsigned long nr = (unsigned long)g_res_objects.count; pthread_mutex_unlock(&g_res_mu);
     int live = 0, peak = 0, cap = 0; nvn_dirty_stat(&live, &peak, &cap);
-    pthread_mutex_lock(&g_smu); unsigned ns = g_by_serial.n, ashared = g_alias.n, nghost = g_ghost.n; uint64_t ghost_puts = g_ghost_puts;
+    pthread_mutex_lock(&g_smu); unsigned ns = g_by_serial.n, ashared = g_alias.n, nghost = g_ghost.n, nwait = g_retire_held.n; uint64_t ghost_puts = g_ghost_puts;
     unsigned aorph = 0, swept = 0; uint64_t aorph_mb = 0, swept_mb = 0;   // shared textures no live texture object or finalized serial resolves to: kept until their storage is taken over or their pool goes (alias_take_over), or until the sweep below
     { CFMutableSetRef held = CFSetCreateMutable(NULL, 0, NULL);
       for (uint32_t i = 0; i < g_by_serial.cap; i++) if (g_by_serial.vals[i]) CFSetAddValue(held, g_by_serial.vals[i]);
@@ -4692,6 +4740,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
              (unsigned long long)g_trc_made, (unsigned long long)g_trc_put, (unsigned long long)g_trc_hit, (unsigned long long)g_trc_evict, (unsigned long long)g_trc_skip_held, (unsigned long long)g_trc_short, n, (unsigned long long)mb); }
     if (g_rtl_n) MLOG("lossy render targets (DM_NVN_RT_LOSSY): %llu made, %llu MB before compression", (unsigned long long)g_rtl_n, (unsigned long long)(g_rtl_bytes >> 20));
     if (swept || aorph) MLOG("shared textures no texture object holds: %u, %llu MB; %u of them swept, %llu MB (DM_NVN_ALIAS_SWEEP)", aorph, (unsigned long long)aorph_mb, swept, (unsigned long long)swept_mb);
+    if (nwait) MLOG("retired textures a serial or ghost entry still holds, kept resident until it lets them go: %u", nwait);
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
       MLOG("texture views by texture (vc_get): %u textures hold cached views; %llu views reused, %llu made in total; texture buffers bound as 2D rows for wrapped 1D fetches %llu times, %llu made, %llu failed, %llu copied into aligned rows (%llu MB) "
