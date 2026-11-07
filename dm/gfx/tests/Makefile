@@ -554,3 +554,7 @@ check_t_tex_recycle: t_tex_recycle
 t_pool_retire: t_pool_retire.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_pool_retire.m $(MTL_T_SRC) $(FW)
 check_t_pool_retire: RUN_ENV = MTL_DEBUG_LAYER=1
+
+# MUFU.SIN / COS lowered from turns through the fraction (InstEmitAmpereAlu.cs ATurnsToRadians), on the GPU against a double-precision reference
+t_mufu_turns: t_mufu_turns.m
+	clang -O1 -g -Wall -fobjc-arc -o $@ t_mufu_turns.m -framework Metal -framework Foundation
