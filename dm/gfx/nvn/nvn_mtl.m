@@ -582,7 +582,7 @@ static want_list g_bf_want = {"DM_NVN_BF_WANT", PTHREAD_MUTEX_INITIALIZER}, g_du
 void bf_want_note(const char *key) { want_note(&g_bf_want, key); }
 
 // ---------- Memory pools ----------
-typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; uint64_t born; uintptr_t end; uint64_t unk; } pool_ent;   // res: already in the residency set (on demand, see pool_res); end, unk: a large pool's chunk (see BIG_MIN)
+typedef struct { uintptr_t lo, hi; uintptr_t base; __unsafe_unretained id<MTLBuffer> buf; uint64_t gpu; const void *key; int res; uint64_t born; uintptr_t end; uint64_t unk; int noraw; } pool_ent;   // noraw: kept out of the raw global memory table unless resident (mtl_pool_noraw)   // res: already in the residency set (on demand, see pool_res); end, unk: a large pool's chunk (see BIG_MIN)
 static pool_ent *g_pools; static int g_npool, g_cap;
 static int g_pidx_ok, g_plast = -1;   // whether the address→pool index is valid, the last hit (pool_find)
 static NSMutableArray *g_keep;                  // Holds the buffer references (pool_ent has non-owning pointers)
@@ -816,7 +816,7 @@ static void pool_res(int i) {
 // pools' buffers do at shared pages; GPU addresses are not contiguous across them, so a lookup must say how far it reads. One that does not know (length 1: an indirect draw's index buffer, a raw storage
 // address) gets BIG_UNKNOWN past its address. Raw global memory, whose pool table the shader walks by itself, takes the whole pool: big_full
 enum { BIG_MIN = 128u << 20, BIG_S = 16u << 20, BIG_UNKNOWN = 64u << 20, BIG_MAX = 64 };
-typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; } big_pool;   // chunk: stride → g_pools index + 1; full: the whole pool's entry + 1
+typedef struct { uintptr_t lo, hi, a, b; const void *mem; int *chunk, full; int noraw; } big_pool;   // noraw: no whole-pool mapping, its chunks marked (mtl_pool_noraw)   // chunk: stride → g_pools index + 1; full: the whole pool's entry + 1
 static big_pool g_big[BIG_MAX]; static int g_nbig;
 static int big_of(uint64_t addr) { for (int i = 0; i < g_nbig; i++) if (addr >= g_big[i].lo && addr < g_big[i].hi) return i; return -1; }
 // A new pool over exactly the pages of a pool freed a moment ago takes back that pool's no-copy buffer while its deferred release still waits for the GPU. PRAGMATA's first
@@ -878,6 +878,29 @@ void mtl_pool_add(const void *mem, uint64_t size) {
     [g_keep addObject:buf];
     pthread_mutex_unlock(&g_mu);
 }
+// DM_NVN_GMEM_SKIP=1 (the launcher's Cheemu section; gmem_skip from cheemu21's kid-with-sword-remake): pools the raw global memory table leaves out unless something else made them
+// resident, by their NVN flags: compressible (render-target storage, which the host draws into textures of its own, and whose compressed layout a pointer cannot read), shader code
+// (the guest's Ampere binaries: the host runs its translations) and GPU no-access. Listing them made them resident: in that fork Ocarina of Time had 875 MB of compressible
+// render-target pools, 610 MB for its shadow map's sparse backing and 345 MB of shader code wired by the time Kokiri Forest loaded, with no GPU use. A pointer read into one still
+// finds it through its bind-time site (encode_args NVN_RB_GPTR makes the pool resident, and the next table lists it)
+static int gmem_skip_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_GMEM_SKIP"); v = e && atoi(e) != 0;
+    if (v) MLOG("DM_NVN_GMEM_SKIP: compressible, shader code and GPU no-access pools are left out of the raw pool table unless already resident"); } return v; }
+// DM_NVN_GMEM_NOBIG=1 (the launcher's Cheemu section; gmem_nobig from the same fork): a large pool (BIG_MIN) is not mapped whole for the raw global memory table (big_full, #1417):
+// the table lists the chunks that lookups made and made resident, so only what the GPU reaches through bindings and pointer sites is wired. Ocarina of Time's 2,432 MB main pool was
+// otherwise wired whole as soon as a raw-access shader ran. A raw read with no pointer site into a part of such a pool nothing has bound reads 0. Left in chunks, a pool lengthens
+// them all the time, which showed a use after free there (big_lookup, now fixed: t_pool_chunks)
+static int gmem_nobig_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_GMEM_NOBIG"); v = e && atoi(e) != 0;
+    if (v) MLOG("DM_NVN_GMEM_NOBIG: large pools are listed in the raw pool table by their resident chunks, never mapped whole"); } return v; }
+void mtl_pool_noraw(const void *mem, int flags) {   // hle_nvn.c, right after mtl_pool_add: the marks above
+    int skip = gmem_skip_on() && (flags & (NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE | NVN_MEMORY_POOL_FLAGS_SHADER_CODE | NVN_MEMORY_POOL_FLAGS_GPU_NO_ACCESS));
+    if (!skip && !gmem_nobig_on()) return;
+    pthread_mutex_lock(&g_mu);
+    int big = 0; for (int k = 0; k < g_nbig; k++) if (g_big[k].mem == mem) { g_big[k].noraw = 1; big = 1; }
+    if (!skip && !big) { pthread_mutex_unlock(&g_mu); return; }   // NOBIG alone: only large pools
+    uint64_t mb = 0; for (int i = 0; i < g_npool; i++) if (g_pools[i].key == mem) { g_pools[i].noraw = 1; mb += (g_pools[i].hi - g_pools[i].lo) >> 20; }
+    static uint64_t n; n++; pthread_mutex_unlock(&g_mu);
+    if (n <= 3 || !(n & (n - 1))) MLOG("DM_NVN_GMEM_SKIP / NOBIG: pool %p (flags %#x%s) left out of the raw pool table unless resident (%llu so far)", mem, flags, big ? ", large: by its chunks" : "", (unsigned long long)n);
+}
 
 static void big_moved(int i) {   // caller holds g_mu: entry i has a new index
     const pool_ent *e = &g_pools[i];
@@ -926,7 +949,7 @@ static int big_new(big_pool *b, uintptr_t lo, uintptr_t hi, uintptr_t end, uint6
     if (!buf) { MLOG("[RED] memory pool %p: the zero-copy buffer over %#lx..%#lx was refused", b->mem, (unsigned long)lo, (unsigned long)end); return -1; }
     if (g_npool == g_cap) { g_cap = g_cap ? g_cap * 2 : 64; g_pools = realloc_or_die(g_pools, g_cap * sizeof *g_pools, "the memory pool table"); }
     g_pidx_ok = 0; atomic_fetch_add(&g_pool_gen, 1);
-    g_pools[g_npool++] = (pool_ent){lo < b->lo ? b->lo : lo, hi > b->hi ? b->hi : hi, lo, buf, buf.gpuAddress, b->mem, 0, clock_gettime_nsec_np(CLOCK_MONOTONIC), end > b->hi ? b->hi : end, unk};
+    g_pools[g_npool++] = (pool_ent){lo < b->lo ? b->lo : lo, hi > b->hi ? b->hi : hi, lo, buf, buf.gpuAddress, b->mem, 0, clock_gettime_nsec_np(CLOCK_MONOTONIC), end > b->hi ? b->hi : end, unk, b->noraw};
     [g_keep addObject:buf];
     return g_npool - 1;
 }
@@ -9646,12 +9669,13 @@ static uint64_t gmem_map_gpu(void) {
     int nbm = -1, skipped = 0; uint64_t skipped_mb = 0; bm_iv *bm = gmem_all() ? NULL : bm_sorted(&nbm);   // the marks (g_bm_mu is taken under g_mu, never the other way)
     // the pool table reaches all of a large pool. Not with DM_NVN_GMEM_RES=0: a whole-pool entry is what big_lookup then hands every lookup (b->full), so it wired all of the pool
     // for any binding (PRAGMATA: a 995 MB pool whole); the table lists the chunks the lookups made instead
-    if (gres) for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && bm_overlaps(bm, nbm, g_big[k].lo, g_big[k].hi)) big_full(&g_big[k]);   // #1417: and the chunks the whole mapping replaces go
+    if (gres) for (int k = 0; k < g_nbig; k++) if (!g_big[k].full && !g_big[k].noraw && bm_overlaps(bm, nbm, g_big[k].lo, g_big[k].hi)) big_full(&g_big[k]);   // #1417: and the chunks the whole mapping replaces go (not for a pool DM_NVN_GMEM_SKIP / NOBIG marked)
     gen = atomic_load(&g_pool_gen); pidx_sort();
     uint64_t (*rng)[3] = malloc(((size_t)g_npool + 1) * sizeof *rng); if (!rng) abort();   // the ranges (start, end, delta), taken under g_mu and written into the table after it
     for (int k = 0; k < g_npool; k++) {
         pool_ent *p = &g_pools[g_pidx[k]];
         if (!bm_overlaps(bm, nbm, p->lo, p->hi)) { skipped++; skipped_mb += (p->hi - p->lo) >> 20; continue; }   // no buffer address taken in it: no entry, not resident for the table
+        if (p->noraw && !p->res) continue;   // DM_NVN_GMEM_SKIP / NOBIG: a marked pool (or chunk) is listed only once something else made it resident
         // DM_NVN_GMEM_RES=0 (diagnostic): the table lists every pool but makes none resident; a pool comes into the residency set when a binding addresses it (pool_res).
         // How many MB only the table made resident is logged once: PRAGMATA's 190 such shaders kept all of its ~4 GB of pools wired on an 8 GB Mac
         if (!p->res && gres) { res_add(p->buf); p->res = 1; g_pool_res_n++; g_gmem_only_mb += (p->end - p->base) >> 20; }

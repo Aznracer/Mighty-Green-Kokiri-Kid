@@ -6,7 +6,7 @@ The screen before the game starts shows the settings the game supports. A settin
 - [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
-- [Cheemu](#cheemu): [Softer textures](#softer-textures), [Lossy render targets](#lossy-render-targets)
+- [Cheemu](#cheemu): [Softer textures](#softer-textures), [Lossy render targets](#lossy-render-targets), [Skip unused pools](#skip-unused-pools), [Large pools by chunk](#large-pools-by-chunk), [Guest memory in files](#guest-memory-in-files-mac)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
 - [In-game menu](#in-game-menu)
 - [TV](#tv)
@@ -225,6 +225,24 @@ Large compressed textures from the game files are kept on the GPU without their 
 On Apple M2 and later, color render targets the game only draws into are kept with Metal's lossy compression, about half their memory and bandwidth. Colors lose a little precision where neighbouring pixels differ; most scenes look the same.
 
 - **When to change it:** to save a little more memory on a tight Mac; the saving is smaller than Softer textures'.
+
+### Skip unused pools
+
+Shaders that read memory through pointers look addresses up in a table of the game's memory pools, and every pool in that table is kept wired in memory. This leaves out the pools no pointer can usefully reach: render-target storage, shader code and pools the GPU cannot access. A pointer that does land in one still finds it.
+
+- **When to change it:** on a Mac with 16 GB or less; it frees memory that was wired for nothing.
+
+### Large pools by chunk
+
+The table maps each large memory pool whole, so a game's biggest pool (2.4 GB in Ocarina of Time) is wired in full as soon as one shader reads through a pointer. With this on, only the parts the game actually reaches are wired. A read through a pointer the game did not bind, into a part nothing else touched, reads zeros, which can show as missing details.
+
+- **When to change it:** on a tight Mac, together with Skip unused pools; turn it off if something looks missing.
+
+### Guest memory in files (Mac)
+
+The game's memory is kept in temporary files instead of the app's own memory, so Activity Monitor and macOS count it as cached file data: macOS can write it out to the files when it needs the room instead of compressing or swapping it. The game's memory pools stay in normal memory, as the GPU needs them wired. The cost is disk writes while you play (several GB in a session) and a little more time at loading screens. Texture release still works for the memory pools.
+
+- **When to change it:** on a Mac with 16 GB or less that shows memory pressure, with enough free disk space (at least 8 GB).
 
 ## The Mac settings window
 

@@ -256,8 +256,12 @@ static int discard_run(uintptr_t a, size_t len, int prot, int method) {
     return ok;
 }
 __attribute__((weak)) int dm_guest_in_files(void) { return 0; }   // hle_svc.c's answers in the host; tests that link no host have none
+__attribute__((weak)) int dm_guest_range_in_files(const void *mem, size_t size) { (void)mem; (void)size; return dm_guest_in_files(); }
+__attribute__((weak)) void dm_guest_pool_anon(void *mem, size_t size) { (void)mem; (void)size; }
 size_t nvn_dirty_discard(const void *addr, size_t len, int tracked, int method) {
-    if (dm_guest_in_files()) return 0;   // the guest in files: fresh anonymous pages would be charged to the footprint again, as guest_release says
+    // Guest memory in files: fresh anonymous pages over file pages would be charged to the footprint again, as guest_release says. A memory pool moved out of the files into anonymous
+    // memory (hle_svc.c dm_guest_pool_anon) is charged already, so its pages are given back like any anonymous guest memory
+    if (dm_guest_range_in_files(addr, len)) return 0;
     uintptr_t a = ((uintptr_t)addr + getpagesize() - 1) & ~(uintptr_t)(getpagesize() - 1), b = ((uintptr_t)addr + len) & ~(uintptr_t)(getpagesize() - 1);
     if (!len || a >= b) return 0;
     int prot = tracked ? PROT_READ : PROT_READ | PROT_WRITE; size_t done = 0;

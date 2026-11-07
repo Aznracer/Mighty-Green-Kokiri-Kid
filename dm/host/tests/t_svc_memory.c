@@ -66,6 +66,10 @@ static void memory_fault(int sig, siginfo_t *info, void *ctx) {
     _exit(128 + sig);
 }
 #endif
+#ifndef TEST_REAL_DIRTY   // hle_svc.c's memory pools out of the guest files (dm_guest_pool_anon) register these; this build moves no pool
+void dm_fault_hook_register(int (*fn)(void *, int, void *)) { (void)fn; }
+void dm_guest_write_prep_register(void (*fn)(void *, size_t)) { (void)fn; }
+#endif
 static _Atomic unsigned prepares, protects;
 static uintptr_t readonly_base;
 static size_t readonly_size;

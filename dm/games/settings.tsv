@@ -37,3 +37,6 @@ DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hol
 DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD
 DM_NVN_TEX_SOFT	toggle	-	0	gfxapi:nvn	Cheemu	Softer textures	Less memory; large textures look softer up close.
 DM_NVN_RT_LOSSY	toggle	-	0	gfxapi:nvn	Cheemu	Lossy render targets	Less memory on M2 and later; colors lose a little precision.
+DM_NVN_GMEM_SKIP	toggle	-	0	gfxapi:nvn	Cheemu	Skip unused pools	Less wired memory: render-target, shader-code and GPU-only pools stay out of the pointer table.
+DM_NVN_GMEM_NOBIG	toggle	-	0	gfxapi:nvn	Cheemu	Large pools by chunk	Less wired memory; a rare pointer read into an unbound part reads zeros.
+DM_GUEST_FILE	toggle	-	0	platform:mac	Cheemu	Guest memory in files	Less memory in Activity Monitor; writes several GB to disk while you play.
