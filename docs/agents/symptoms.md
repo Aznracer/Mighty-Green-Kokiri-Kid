@@ -583,6 +583,7 @@ One line per symptom in the [subsystem references](../reference/): what you see 
 - thousands of first uploads a frame in a scene whose textures do not change: Ocarina of Time, about 15,000 a frame. → [Finalizing a copy of a texture object](../reference/nvn-objects.md#finalizing-a-copy-of-a-texture-object)
 - the host stops with `NSInvalidArgumentException: -[NvPkg buffer]: unrecognized selector sent to instance` under `tex_by_id` (via `pool_entry`, `pool_gpu`, `encode_args_`, `draw_`, `mesh_tasks_draw`); not a GPU hang, no `kIOGPU` errors. It came after minutes of play, right after a save or at a scene change. → [Freeing a memory pool during a texture ID walk](../reference/nvn-objects.md#freeing-a-memory-pool-during-a-texture-id-walk)
 - what the GPU copies, fills or renders into a pool never shows, with no error and no red line: garbled text where the game copies its font textures inside one pool. `DM_NVN_POOL_CHUNKS=0` clears it when the buffer is a chunk. → [GPU writes dropped by a pool buffer made over write-protected pages](../reference/nvn-objects.md#gpu-writes-dropped-by-a-pool-buffer-made-over-write-protected-pages)
+- a consumer submitted before another queue's producer uses stale input. In Mario Kart World, water jumps for one frame and the minimap retains fading wave artifacts. → [Guest event queue ordering](../reference/nvn-objects.md#guest-event-queue-ordering)
 
 ## Rendering
 
