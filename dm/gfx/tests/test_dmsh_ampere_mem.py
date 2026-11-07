@@ -283,6 +283,33 @@ class Sured(Translated):
         self.assertIn('SURED form', str(e.exception))
 
 
+class StorageBaseInNestedAdd(Translated):
+    """(storage slot 0's base + R0) + R3: one storage buffer (c[0] 0x10, mapped to 0x310), its base added to a row offset, then a column offset added to that sum"""
+    LAYOUT = dict(nvn2_cs=[0, 1, 0, 0x20, 0])
+    ROW = (0x000fe20000002100, 0x0000000000007919)        # S2R R0, SR_TID.X
+    COL = (0x000fe20000002500, 0x0000000000037919)        # S2R R3, SR_CTAID.X
+    BASE_ROW = (0x000fe200007e00ff, 0x0000040000027a10)   # IADD3 R2, R0, c[0x0][0x10], RZ
+    COLUMN = (0x000fe200007e00ff, 0x0000000302047210)     # IADD3 R4, R2, R3, RZ
+    STORE = (0x000fe20000000900, 0x0000000604007386)      # STG.E [R4.64], R6
+    LOAD = (0x000fe20000000900, 0x0000000004067381)       # LDG.E R6, [R4.64]
+
+    def msl(self, *code):
+        return self.translate(b''.join(inst(*c) for c in (self.ROW, self.COL) + code) + inst(*EXIT), **self.LAYOUT)
+
+    SUM = r'int _\d+ = as_type<int>\(_\d+\) \+ as_type<int>\(_\d+\);\s+uint _\d+ = uint\(int\(uint\(_\d+\) >> uint\(2\)\)\);\s+'   # the word index: (R0 + R3) >> 2
+
+    def test_store_goes_to_the_storage_buffer(self):
+        msl = self.msl(self.BASE_ROW, self.COLUMN, self.STORE)
+        self.assertNotIn('reinterpret_cast<device', msl)   # not through the pool table
+        self.assertNotIn('atomic_compare_exchange', msl)   # nor the write log
+        self.assertRegex(msl, self.SUM + r'\(\*spvDescriptorSet0\.cp_s0\)\._m0\[int\(_\d+\)\] = ')
+
+    def test_load_goes_to_the_storage_buffer(self):
+        msl = self.msl(self.BASE_ROW, self.COLUMN, self.LOAD, self.STORE)
+        self.assertNotIn('reinterpret_cast<device', msl)
+        self.assertRegex(msl, self.SUM + r'float _\d+ = as_type<float>\(\(\*spvDescriptorSet0\.cp_s0\)\._m0\[int\(_\d+\)\]\);')
+
+
 class StageMemory(Translated):
     """A task or mesh shader's stage memory in shared memory, on the game's encodings (job stage_memory: workgroup 0, input 0x10, outputs 0x120, primitives 0x400)"""
     MEMORY = dict(stage_memory=[0, 0x10, 0x120, 0x400], shared=0x800)

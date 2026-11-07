@@ -190,6 +190,7 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             public int SbCbOffset { get; }
             public Operand Offset { get; }
             public int ConstOffset { get; }
+            public Operand ExtraOffset { get; }
 
             public SearchResult(int sbCbSlot, int sbCbOffset)
             {
@@ -197,12 +198,13 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
                 SbCbOffset = sbCbOffset;
             }
 
-            public SearchResult(int sbCbSlot, int sbCbOffset, Operand offset, int constOffset = 0)
+            public SearchResult(int sbCbSlot, int sbCbOffset, Operand offset, int constOffset = 0, Operand extraOffset = null)
             {
                 SbCbSlot = sbCbSlot;
                 SbCbOffset = sbCbOffset;
                 Offset = offset;
                 ConstOffset = constOffset;
+                ExtraOffset = extraOffset;
             }
         }
 
@@ -336,15 +338,27 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
 
                     offset = hostOffset;
                 }
-                else if (result.ConstOffset != 0)
+                else
                 {
-                    Operand newOffset = Local();
+                    if (result.ExtraOffset != null)
+                    {
+                        Operand newOffset = Local();
 
-                    Operation addOp = new(Instruction.Add, newOffset, offset, Const(result.ConstOffset));
+                        node.List.AddBefore(node, new Operation(Instruction.Add, newOffset, offset, result.ExtraOffset));
 
-                    node.List.AddBefore(node, addOp);
+                        offset = newOffset;
+                    }
 
-                    offset = newOffset;
+                    if (result.ConstOffset != 0)
+                    {
+                        Operand newOffset = Local();
+
+                        Operation addOp = new(Instruction.Add, newOffset, offset, Const(result.ConstOffset));
+
+                        node.List.AddBefore(node, addOp);
+
+                        offset = newOffset;
+                    }
                 }
 
                 if (CanUseInlineStorageOp(operation, targetLanguage))
@@ -1501,6 +1515,21 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             src1 = operation.GetSource(0);
             src2 = operation.GetSource(1);
 
+            if (needsOffset && src1.Type != OperandType.ConstantBuffer && src2.Type != OperandType.ConstantBuffer)
+            {
+                SearchResult nested = FindBaseAddressCbInNestedAdd(block, src1, src2, constOffset);
+
+                if (!nested.Found)
+                {
+                    nested = FindBaseAddressCbInNestedAdd(block, src2, src1, constOffset);
+                }
+
+                if (nested.Found)
+                {
+                    return nested;
+                }
+            }
+
             // If we have two possible results, we give preference to the ones from
             // the driver reserved constant buffer, as those are the ones that
             // contains the base address.
@@ -1526,6 +1555,36 @@ namespace Ryujinx.Graphics.Shader.Translation.Optimizations
             }
 
             return GetBaseAddressCbWithOffset(src1, src2, constOffset);
+        }
+
+        // nxnative: (storage descriptor + x) + y, two additions of registers. Ampere code adds a row offset to a storage buffer's base once and the column offset at each
+        // access (OoT's movie network, NDVE: every feature-map load and store of its layers, c0[0x310] + row + column); traced to no storage buffer, they went through
+        // the pool table and the write log, whose 1,024 slots a 1080p feature map overflows. Only the driver's storage descriptors are taken this way; the offset is x + y
+        private static SearchResult FindBaseAddressCbInNestedAdd(BasicBlock block, Operand inner, Operand other, int constOffset)
+        {
+            inner = Utils.FindLastOperation(inner, block);
+
+            if (inner.AsgOp is not Operation innerOp || innerOp.Inst != Instruction.Add)
+            {
+                return SearchResult.NotFound;
+            }
+
+            Operand a = innerOp.GetSource(0);
+            Operand b = innerOp.GetSource(1);
+
+            static bool IsDriverCb(Operand operand) => operand.Type == OperandType.ConstantBuffer && operand.GetCbufSlot() == DriverReservedCb;
+
+            Operand baseAddress = IsDriverCb(a) && !IsDriverCb(b) ? a : IsDriverCb(b) && !IsDriverCb(a) ? b : null;
+
+            if (baseAddress == null)
+            {
+                return SearchResult.NotFound;
+            }
+
+            Operand offset = baseAddress == a ? b : a;
+            SearchResult result = GetBaseAddressCbWithOffset(baseAddress, offset, constOffset);
+
+            return result.Found ? new SearchResult(result.SbCbSlot, result.SbCbOffset, result.Offset, result.ConstOffset, other) : result;
         }
 
         private static SearchResult FindBaseAddressCbFromMemory(GtsContext gtsContext, Operation operation, int constOffset, bool needsOffset)
