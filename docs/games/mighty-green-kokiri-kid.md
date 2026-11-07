@@ -22,7 +22,9 @@ Then build again. Do not set pso_mtl4: without a pipeline pack for the phone's G
 
 ## Documents/env.txt
     DM_PRESENT_SNAP=1
-    DM_PRESENT_UPSCALE=metalfx
+    DM_PRESENT_UPSCALE=off
+    DM_RENDER_SCALE=0.6
+    DM_NDSR=game
     DM_NVN_RES_LIMIT_MB=6900
     DM_NVN_TEX_MIP_SKIP=256
     DM_NVN_TEX_MIP_LEVELS=2
@@ -40,10 +42,14 @@ Then build again. Do not set pso_mtl4: without a pipeline pack for the phone's G
 | DM_NVN_RES_LIMIT_MB | Stops the game before GPU memory runs out; without it the phone froze and needed a hard reboot. Since #1482 it measures the residency set (6900 is an estimate; check the log). |
 | DM_GFX_SCALE=2 | The game picks its lower graphics tier: 960x540 internal render, 1280x720 output. |
 | DM_NVN_DISPATCH_OVERLAP=0 | With the render-target heap (#1453), overlapped compute stalled the CPU on the GPU (about 2,400 waits in a run, frames up to 150 ms); off: about 25. |
+| DM_RENDER_SCALE=0.6 | Caps the game's dynamic resolution at 60% (render_scale.py adds seedds#1497 for v131072 next to the dynamic frame step). With the cooler: frame p50 16.4-17.3 ms, 59.8 fps average, GPU 10-15 ms. 0.65 is the most it has room for. |
+| DM_NDSR=game | The game's own upscaler. oot2's MetalFX replacement scales the whole texture, so below the game's full size the 3D world was black. |
+| DM_PRESENT_UPSCALE=off | Bilinear to the screen instead of a second MetalFX pass: about 1-2 ms of GPU. |
 | DM_FX_DIRECT=0 | With seedds#1541, MetalFX wrote the screen's drawable directly, and the GPU waited for the display: GPU 18-25 ms a frame. With 0 it keeps the present pass: 14-17 ms. |
 | DM_TEX_LAZY=2 + MIN_KB | Less texture churn in bright areas without the white flashes. |
 | Keep the render-target heap on | DM_NVN_POOL_HEAP=0 is faster but brings back white flashes: the game relies on its render targets sharing memory. |
 
 ## Results so far (Kokiri Forest)
+With DM_RENDER_SCALE=0.6 and DM_NDSR=game, phone on a cooler: 59.8 fps average, frame p50 16.4-17.3 ms, p95 mostly around 20 ms.
 Best runs: frame time p50 16.3-17 ms (60 fps) for stretches, 19-29 ms in heavy scenes; submit thread 3-6 ms, GPU 14-24 ms. No crashes, no rows, no flashes once settled.
 Open: the GPU is now the limit (heavy scenes and heat). Storage takeovers no longer cost the submit thread (takeover_note0.py, after seedds#1489).
