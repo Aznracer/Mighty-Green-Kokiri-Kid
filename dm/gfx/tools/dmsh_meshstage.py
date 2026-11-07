@@ -150,7 +150,9 @@ def to_stage(msl, i):
     word = lambda comps: [f'{mem}[b + {comps[k] * BLOCK}u]' if comps[k] is not None else None for k in range(4)]
     vm, pm = _members(vertex), _members(primitive)
     topo, nidx = TOPOLOGY[verts], f'np * {verts}u'
-    head += ('struct dm_vertex_t {\n    float4 position [[position]];\n' +
+    # The position is invariant, as a vertex shader's: a game may draw the same geometry with two mesh shaders and test the second for depth equality
+    # (Ocarina of Time draws its foliage with a mesh depth pre-pass and a mesh colour pass with depth EQUAL)
+    head += ('struct dm_vertex_t {\n    float4 position [[position, invariant]];\n' +
              ('    float point_size [[point_size]];\n' if 'psiz' in vm else '') +
              ''.join(f'    float4 a{n} [[user(locn{n})]];\n' for n in vm if isinstance(n, int)) + '};\n' +
              ('struct dm_prim_t {\n' + ''.join(f'    float4 p{n} [[user(locn{n})]];\n' for n in pm) + '};\n' if pm else '') +

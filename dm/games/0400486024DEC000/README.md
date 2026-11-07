@@ -62,6 +62,7 @@ The launcher's Render scale (`DM_RENDER_SCALE`, 0.5 to 1.0) fixes the 3D views a
 - [A texture ID with no texture kept its cached view](../../../docs/reference/rendering.md#a-texture-id-with-no-texture-kept-its-cached-view): the page faults at f3,677 and f4,851 with the render-target reclaim on.
 - Magenta and black textures over the ground, walls and props after area changes (into Hyrule Castle Town, from it into Hyrule Field) came from `DM_TEX_RELEASE=2`: textures the game makes again over released pages read zeros ([The guest copy of uploaded textures given back](../../../docs/reference/memory.md#the-guest-copy-of-uploaded-textures-given-back)). Use level 1. Headless runs that start in the town never showed it. The host also names the first ASTC textures it makes empty (`ASTC texture made empty`).
 - [A pixel shader's depth after a partly written target](../../../docs/reference/shaders.md#a-pixel-shaders-depth-after-a-partly-written-target): 46 depth-writing pixel shaders read their depth from the wrong register, agl_common's depth pass among them.
+- [Position invariance across shaders](../../../docs/reference/shaders.md#position-invariance-across-shaders): white shapes on plants and bushes for single frames in Kokiri Forest, from the foliage's mesh pre-pass and mesh colour pass rounding the position apart.
 
 ## Open
 
