@@ -44,6 +44,7 @@ if git rev-parse -q --verify refs/oot_watch/oot2-up >/dev/null; then
   has 1472 g_args_ogen         "argument tables copied (CPU)"
   has 1473 tex_mtl_raw          "submit thread unretained (CPU)"
   has 1604 mtl_tex_gpu_written "ground holes fix"
+  has 1644 pkg_hand_over       "long-session GPU page faults"
 fi
 
 echo; echo "=== seedds/nxnative pull requests"
