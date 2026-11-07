@@ -1,11 +1,12 @@
 # Settings
 
-The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls** and **Performance**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
+The screen before the game starts shows the settings the game supports. A setting that only matters while another is on appears under it and disappears when that one is turned off. Tap **Play** to start; the app remembers your choices for the next start. All settings are on one scrollable screen, under **Game**, **Controls**, **Performance** and **Cheemu**. Tap a menu or move a slider there; no settings page needs opening. **Upscaling** is in **Game**, beside **Console mode**. A Mac app shows the same settings in a [window of its own](#the-mac-settings-window).
 
 - [Tested defaults](#tested-defaults)
 - [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff)
 - [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+- [Cheemu](#cheemu): [Softer textures](#softer-textures), [Lossy render targets](#lossy-render-targets)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
 - [In-game menu](#in-game-menu)
 - [TV](#tv)
@@ -208,6 +209,22 @@ Apple's performance overlay over the game: frame rate, frame and GPU times, memo
 ### Reset to tested defaults
 
 Sets every setting back to the game's tested default; **Play** then forgets your choices, so those defaults apply, and those of later builds too ([Tested defaults](#tested-defaults)). Settings fixed by `Documents/env.txt` stay as the file says.
+
+## Cheemu
+
+Options taken from cheemu21's Ocarina of Time fork ([kid-with-sword-remake](https://github.com/cheemu21/kid-with-sword-remake)) that save memory at some cost in looks. Both are off by default.
+
+### Softer textures
+
+Large compressed textures from the game files are kept on the GPU without their finest level: each takes about a quarter of the memory, and looks softer up close. Only flat (2D) textures of 512 pixels and more are affected; a texture the game copies from or reads back is kept whole.
+
+- **When to change it:** on a Mac with 16 GB or less, if the game runs out of memory or the system starts swapping.
+
+### Lossy render targets
+
+On Apple M2 and later, colour render targets the game only draws into are kept with Metal's lossy compression, about half their memory and bandwidth. Colours lose a little precision where neighbouring pixels differ; most scenes look the same.
+
+- **When to change it:** to save a little more memory on a tight Mac; the saving is smaller than Softer textures'.
 
 ## The Mac settings window
 

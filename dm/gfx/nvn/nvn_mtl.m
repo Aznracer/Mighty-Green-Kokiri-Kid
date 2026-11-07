@@ -2378,7 +2378,9 @@ static void hm_rel(void *v) { CFRelease(v); }
 static __unsafe_unretained id hm_get_id(const nvn_hmap *m, const void *k) { return (__bridge id)nvn_hm_get(m, k); }
 static void hm_put_id(nvn_hmap *m, const void *k, id o) { void *old = nvn_hm_put(m, k, (void *)CFBridgingRetain(o)); if (old) CFRelease(old); }
 static void hm_del_id(nvn_hmap *m, const void *k) { void *old = nvn_hm_del(m, k); if (old) CFRelease(old); }
-static nvn_hmap g_by_serial = {.klen = 8};     // Serial → MTLTexture / NvPkg / NvProg
+static nvn_hmap g_by_serial = {.klen = 8};
+// Storage of soft textures the game copies from or reads back (soft_harden, DM_NVN_TEX_SOFT): those are kept whole from then on, as the copy needs the level the game has. Under g_smu
+static nvn_hmap g_soft_hard = {.klen = 8};     // Serial → MTLTexture / NvPkg / NvProg
 static pthread_mutex_t g_smu = PTHREAD_MUTEX_INITIALIZER;
 // Serial table generation: +1 when entries are added / removed or a packaged texture is replaced. Downstream caches (texture views, programs) record the generation at fetch time; if it is unchanged they can be used directly without another table lookup
 static _Atomic uint64_t g_ser_gen = 1, g_prog_gen = 1;   // programs share the lookup table, but do not change texture IDs
@@ -3346,7 +3348,18 @@ static id<MTLBuffer> up_big_src(uint64_t addr, uint64_t len, uint64_t *off, int 
 // registered texture is made). Render targets and shader-written textures are never in such formats; views and copies of the skipped textures take the guest's level less the skip
 // (tex_mip_skipped), and a copy of the dropped level is skipped. Textures look blurrier up close; a shader that asks a texture's size gets the halved one
 static unsigned mip_skip_px(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TEX_MIP_SKIP"); v = e ? atoi(e) : 0; if (v == 1) v = 512; if (v < 0) v = 0; if (v) MLOG("DM_NVN_TEX_MIP_SKIP: compressed CPU-written textures of %d pixels and more are made without their finest level", v); } return (unsigned)v; }
+// DM_NVN_TEX_SOFT=1 (the launcher's Cheemu section; tex_soft from cheemu21's kid-with-sword-remake, after the plumber-racer-2 fork): the same skip with that tree's rules, which
+// Ocarina of Time was played with: 2D textures only (its reflection probes are 2D arrays, and skipped they showed flat sky in the water under Kokiri Forest's canopy), the long side at
+// least 512 and the short one 256 pixels, three levels or more, none in a virtual pool; a texture the game copies from or reads back goes whole again (soft_harden)
+static int tex_soft_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TEX_SOFT"); v = e && atoi(e) != 0; if (v) MLOG("DM_NVN_TEX_SOFT: large compressed 2D textures from the game files are made without their finest level (softer textures, less memory)"); } return v; }
+static int soft_hard(const tex_t *t) { uint64_t k = (uint64_t)(uintptr_t)t->mem; pthread_mutex_lock(&g_smu); int h = nvn_hm_get(&g_soft_hard, &k) != NULL; pthread_mutex_unlock(&g_smu); return h; }
 static unsigned mip_skip(const tex_t *t, MTLTextureDescriptor *d) {
+    if (!mip_skip_px() && tex_soft_on()) {
+        if (!fmt_compressed(t->d.format) || (d.usage & MTLTextureUsageShaderWrite) || d.mipmapLevelCount < 3 || t->d.target != 1 || !t->mem) return 0;
+        if (t->pool && t->pool->magic == MAGIC('P', 'O', 'O', 'L') && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL)) return 0;
+        if (MAX(d.width, d.height) < 512 || MIN(d.width, d.height) < 256) return 0;
+        return !soft_hard(t);
+    }
     unsigned px = mip_skip_px();
     if (!px || !fmt_compressed(t->d.format) || (d.usage & MTLTextureUsageShaderWrite) || d.mipmapLevelCount < 2) return 0;
     if (t->d.target != 1 && t->d.target != 4 && t->d.target != 8 && t->d.target != 9) return 0;
@@ -4392,6 +4405,35 @@ void rc_tick_(void) {
         (unsigned long long)f, (unsigned long long)g_rc_deaths, (unsigned long long)g_rc_reclaims, (unsigned long long)g_rc_reuses, (unsigned long long)g_rc_trims, (unsigned long long)g_rc_ghost, (unsigned long long)g_rc_again,
         (unsigned long long)g_rc_sampled, (unsigned long long)g_rc_dead_reads, (unsigned long long)g_rc_excl_n, (unsigned long long)g_rc_hist_n, (unsigned long long)(g_rc_hist_b >> 20), (unsigned long long)g_rc_full, (unsigned long long)g_rc_partial, nfree, (unsigned long long)(fb >> 20), g_rc_n, g_rcb_n);
 }
+// The game copies from or reads back a texture DM_NVN_TEX_SOFT made without its finest level: it goes whole from here on, uploaded again now with that level, which its storage still
+// holds (cheemu21's soft_harden). Otherwise the copy of the dropped level would be skipped (lv_host); Mario Kart World copies source textures into its terrain arrays, and a skipped
+// copy left them zero, a magenta road
+static void soft_harden(const tex_t *t) {
+    if (!t || !tex_soft_on() || !t->mem || (t->pool && t->pool->magic != MAGIC('P', 'O', 'O', 'L'))) return;
+    id have = tex_get(t->serial); NvPkg *pk = [have isKindOfClass:[NvPkg class]] ? have : nil;
+    if (!pk || pk->sparse || !pk->tex || !tex_mip_skipped(t, pk->tex)) return;
+    uint64_t k = (uint64_t)(uintptr_t)t->mem; pthread_mutex_lock(&g_smu); nvn_hm_put(&g_soft_hard, &k, (void *)1); pthread_mutex_unlock(&g_smu);
+    static uint64_t nh; if (nh++ < 4 || !(nh & (nh - 1))) MLOG("DM_NVN_TEX_SOFT: kept whole, the game copies from it: ser=%llu %ux%u format %#x (%llu so far)", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format, (unsigned long long)nh);
+    uint64_t st; id<MTLTexture> nt = pkg_upload(t, &st, nil, pk->tex.usage);
+    if (!nt) return;
+    if (pk->spare) defer_obj_release(pk->spare);
+    pk->spare = pk->tex; pk->spare_fence = g_fence + 1; pk->tex = nt; ser_note(t->serial); pk->stamp = st; pk->span = nvn_dirty_span(t->mem, t->L.size); pk->seen = st; pkg_edges_take(pk, t);
+}
+// DM_NVN_RT_LOSSY=1 (the launcher's Cheemu section; rt_lossy from cheemu21's kid-with-sword-remake): a colour render target the GPU only draws into (no shader writes or atomics, no
+// format views, private, 2D) is made with Metal's lossy compression, which Apple GPU family 8 and later keep in about half the memory and bandwidth; precision drops a little where
+// neighbouring colours differ. An allow-list of formats, as Metal stops the process at one with no lossy form (RG11B10Float, the scene colour, is one) and names no query for it. Render
+// targets in a placement heap (pool_heap_texture, image_texture) keep theirs; a texture Metal refuses this way is made lossless
+static uint64_t g_rtl_n, g_rtl_bytes;
+static void rt_lossy(MTLTextureDescriptor *d) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_RT_LOSSY"); on = e && atoi(e) != 0 && [g_dev supportsFamily:MTLGPUFamilyApple8];
+        if (on) MLOG("DM_NVN_RT_LOSSY: lossy compression for colour render targets drawn as attachments only"); }
+    if (!on || !(d.usage & MTLTextureUsageRenderTarget) || (d.usage & (MTLTextureUsageShaderWrite | MTLTextureUsageShaderAtomic | MTLTextureUsagePixelFormatView)) || d.storageMode != MTLStorageModePrivate) return;
+    if (d.textureType != MTLTextureType2D && d.textureType != MTLTextureType2DArray) return;
+    MTLPixelFormat f = d.pixelFormat;
+    if (f != MTLPixelFormatRGBA8Unorm && f != MTLPixelFormatRGBA8Unorm_sRGB && f != MTLPixelFormatBGRA8Unorm && f != MTLPixelFormatBGRA8Unorm_sRGB && f != MTLPixelFormatRGBA16Float) return;
+    d.allowGPUOptimizedContents = YES; d.compressionType = MTLTextureCompressionTypeLossy;
+    g_rtl_n++; g_rtl_bytes += (uint64_t)d.width * d.height * (f == MTLPixelFormatRGBA16Float ? 8 : 4);
+}
 static id<MTLTexture> tex_mtl_(const tex_t *ct) {
     tex_t *t = (tex_t *)ct;
     if (!t || !t->serial) return nil;
@@ -4548,9 +4590,11 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         mt = image_texture(t, d);
         int filled = 0;
         if (!mt) mt = pool_heap_texture(t, d);
+        if (!mt) rt_lossy(d);   // DM_NVN_RT_LOSSY
         if (!mt && (mt = rc_take(d, t))) { res_add(mt); if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); else rc_excl(t); }   // DM_NVN_RT_RECLAIM's free list
         else if (!mt && (mt = trc_take(d))) { if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); else rc_excl(t); }   // a recycled one: still resident (see trc_released)
         else if (!mt) { mt = [g_dev newTextureWithDescriptor:d];
+            if (!mt && d.compressionType == MTLTextureCompressionTypeLossy) { d.compressionType = MTLTextureCompressionTypeLossless; mt = [g_dev newTextureWithDescriptor:d]; }   // refused lossy (rt_lossy)
             if (mt) { res_add(mt); trc_mark(mt, d); if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); else rc_excl(t); } }
         if (mt && !filled && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && t->d.target != NVN_TEXTURE_TARGET_BUFFER) rel_push(t, 0);   // the GPU-only texture of a pool nobody reads: its guest pages mean nothing, the host never reads them
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
@@ -4623,6 +4667,7 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     if (trc_on() && g_trc_made) { pthread_mutex_lock(&g_trc_mu); int n = g_ntrc; uint64_t mb = g_trc_bytes >> 20; pthread_mutex_unlock(&g_trc_mu);
         MLOG("recycled textures (DM_NVN_TEX_RECYCLE): %llu made, %llu binned, %llu taken from the bin, %llu let go, %llu releases while held, %llu not binned for memory; the bin holds %d, %llu MB",
              (unsigned long long)g_trc_made, (unsigned long long)g_trc_put, (unsigned long long)g_trc_hit, (unsigned long long)g_trc_evict, (unsigned long long)g_trc_skip_held, (unsigned long long)g_trc_short, n, (unsigned long long)mb); }
+    if (g_rtl_n) MLOG("lossy render targets (DM_NVN_RT_LOSSY): %llu made, %llu MB before compression", (unsigned long long)g_rtl_n, (unsigned long long)(g_rtl_bytes >> 20));
     if (swept || aorph) MLOG("shared textures no texture object holds: %u, %llu MB; %u of them swept, %llu MB (DM_NVN_ALIAS_SWEEP)", aorph, (unsigned long long)aorph_mb, swept, (unsigned long long)swept_mb);
     { void mtl_vc_stats(unsigned *, uint64_t *, uint64_t *), mtl_tb2_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *, uint64_t *); uint64_t mtl_tex_mis_count(void); unsigned vn; uint64_t vh, vm, tb, tm, tf, tc, tcb;
       mtl_vc_stats(&vn, &vh, &vm); mtl_tb2_stats(&tb, &tm, &tf, &tc, &tcb);
@@ -13365,6 +13410,7 @@ static void copy_t2b(const p_copy_b2t *c) {
     rp_flush();   // Materialize pending clears before reading, matching copy_t2t.
     g_wr_epoch++; g_mdx_epoch++;
     if (c->tex) xv_check(c->tex->serial, c->has_view && c->view.set_levels ? c->view.base_level : 0, c->has_view && c->view.set_layers ? c->view.min_layer : 0, "texture-to-buffer copy");
+    soft_harden(c->tex);   // the game copies from it: whole from here on (DM_NVN_TEX_SOFT)
     id<MTLTexture> t = tex_mtl(c->tex);
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
@@ -13423,6 +13469,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     // A guest thread can live indefinitely without draining its outer pool: release readback temporaries here, after the GPU and CPU copies finish.
     // Finding: docs/reference/memory.md, GPU readback without an autorelease pool.
     @autoreleasepool {
+    soft_harden(t);   // the game reads it back: whole from here on (DM_NVN_TEX_SOFT)
     id<MTLTexture> mt = tex_mtl(t);
     if (!mt || !lv_host(t, mt, &level) || !tex_level_ok(mt, level, "CPU readback")) { memset(dst, 0, img * nz); return; }
     mtl_finish_gpu_at(WS_READTEX);
@@ -13743,6 +13790,7 @@ static void copy_t2t(const p_copy_t2t *c) {
         int ss = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, ds = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
         if (zskip_has(c->src->serial, sl, ss)) zskip_add(c->dst->serial, dl, ds);
     }
+    soft_harden(c->src);   // the game copies from it: whole from here on (DM_NVN_TEX_SOFT)
     id<MTLTexture> s = tex_mtl(c->src), d = tex_mtl(c->dst); tex_gpu_wrote(c->dst, GW_COPY);
     PD("T src=%llu dst=%llu %dx%dx%d→%dx%dx%d flags=%#x", c->src->serial, c->dst->serial, c->sr.width, c->sr.height, c->sr.depth, c->dr.width, c->dr.height, c->dr.depth, c->flags);
     if (!s || !d) return;
