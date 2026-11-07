@@ -8059,7 +8059,23 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
 // On by default on the Mac; on iOS DM_PSO_MTL4=1, or the profile key pso_mtl4 on, turns it on, and with it the hybrid pipelines and the pipeline prebuild. The archive's footprint
 // (with the prebuild, about 850 MB more for Breath of the Wild) is not measured against an iPhone's limit yet. The prebuild's bases can also come made offline, bundled with the
 // app (DM_PSO_BUNDLE, pso_bundle_open). newArchiveWithURL maps a file on the Mac's internal disk (clean pages, not in the footprint) and reads one on an external drive into memory, whole and for the
-// whole run (Kirby Star Allies: 1.13 GB), and it offers no choice: docs/reference/memory.md
+// whole run (Kirby Star Allies: 1.13 GB), and it offers no choice: arch_open maps it anyway (docs/reference/memory.md)
+// Metal opens a pipeline archive through NSData with "mapped if safe", and Foundation takes a file on an external drive as not safe: it reads it into memory, whole and for the
+// whole run (the bundled archive of Ocarina of Time is 4 GB). newArchiveWithURL has no option for it, so while this host opens its archives the read of a .mtl4a asks for a mapping, as
+// the internal disk gets (upstream 6121fd75). The game already runs from that drive; a drive pulled out ends it either way. The swap is undone after each open, and never nested
+typedef id (*ns_read_fn)(id, SEL, NSString *, NSUInteger, NSUInteger, NSError **);
+static ns_read_fn g_ns_read; static int g_ns_swapped;
+static id arch_read_mapped(id self, SEL cmd, NSString *path, NSUInteger options, NSUInteger max, NSError **err) {
+    if ([path hasSuffix:@".mtl4a"]) options = (options & ~(NSUInteger)NSDataReadingMappedIfSafe) | NSDataReadingMappedAlways;
+    return g_ns_read(self, cmd, path, options, max, err);
+}
+static Method arch_read_method(void) { return class_getInstanceMethod([NSData class], sel_registerName("initWithContentsOfFile:options:maxLength:error:")); }
+static void arch_open_begin(void) {
+    Method m = arch_read_method(); if (!m || g_ns_swapped) return;
+    IMP prev = method_setImplementation(m, (IMP)arch_read_mapped); if (!g_ns_read) g_ns_read = (ns_read_fn)prev; g_ns_swapped = 1;
+}
+static void arch_open_end(void) { Method m = arch_read_method(); if (m && g_ns_swapped) { method_setImplementation(m, (IMP)g_ns_read); g_ns_swapped = 0; } }
+static id<MTL4Archive> arch_open(NSString *p, NSError **ae) { arch_open_begin(); id<MTL4Archive> a = [g_dev newArchiveWithURL:[NSURL fileURLWithPath:p] error:ae]; arch_open_end(); return a; }
 static int pso4_on(void) {
     static int v = -1;
     if (v < 0) {
@@ -8213,7 +8229,7 @@ static void pso_bundle_open(NSMutableArray<id<MTL4Archive>> *archp) {
     }
     uint64_t t0 = bp_now(); NSError *ae = nil;
     if (!arch_file_ok(p)) { MLOG("[RED] pipeline archive bundled with the app: %s is not a pipeline archive: the bases are built on the device", p.UTF8String); return; }
-    id<MTL4Archive> a = [g_dev newArchiveWithURL:[NSURL fileURLWithPath:p] error:&ae];
+    id<MTL4Archive> a = arch_open(p, &ae);
     if (!a) { MLOG("pipeline archive bundled with the app: this system cannot open %s (%s; made for another system version, or an OS update changed the GPU compiler): the bases are built on the device",
                    p.UTF8String, ae.localizedDescription.UTF8String); return; }
     g_arch_bundle = a; g_bundle_dir = dir; [archp addObject:a];
@@ -8309,7 +8325,7 @@ static void pso4_init(void) {
                                           sortedArrayUsingSelector:@selector(compare:)];
             for (NSString *n in names.reverseObjectEnumerator) {   // newest first
                 NSString *p = [g_arch_dir stringByAppendingPathComponent:n]; NSError *ae = nil;
-                id<MTL4Archive> a = arch_file_ok(p) ? [g_dev newArchiveWithURL:[NSURL fileURLWithPath:p] error:&ae] : nil;
+                id<MTL4Archive> a = arch_file_ok(p) ? arch_open(p, &ae) : nil;
                 int pf = [n hasPrefix:@"p"];
                 if (a) { [pf ? archp : arch addObject:a]; if (!pf) [runf addObject:p]; bytes += [[NSFileManager.defaultManager attributesOfItemAtPath:p error:nil] fileSize]; }
                 else MLOG("[RED] pipeline archive file %s not usable (%s): its bases are built again", p.UTF8String, ae ? ae.localizedDescription.UTF8String : "not a pipeline archive");
