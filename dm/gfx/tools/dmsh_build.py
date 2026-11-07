@@ -163,6 +163,37 @@ def tg_spill(msl):
         ln = re.sub(r'(?<!mem_device \| )mem_flags::mem_threadgroup\b', 'mem_flags::mem_device | mem_flags::mem_threadgroup', ln)
         lines[n] = ln
     return '\n'.join(lines), total
+# textureGatherOffsets: spirv-cross's spvGatherConstOffsets passes coffsets[i] from a loop to gather(), whose offset Metal takes only as a constant expression. At -O1 the loop stays and
+# the compiler takes it anyway: the gathers then read texels at offsets that differ between lanes and between runs, with no error. agl's NDSR upscaler builds its input tile this way, so
+# some of its lanes saw zeros and the network drew dotted rows in smooth areas of the picture (the same frame, three pictures). Each call becomes its four gathers, offsets written out
+GATHER4 = 'template<typename T> static inline __attribute__((always_inline)) vec<T, 4> dm_gather4(T a, T b, T c, T d) { return vec<T, 4>(a, b, c, d); }\n'
+def gather_offsets(msl):
+    if not re.search(r'\bspvGather(Compare)?ConstOffsets\(spvDesc|= spvGather(Compare)?ConstOffsets\(', msl): return msl
+    arrays = {}
+    for m in re.finditer(r'\bconstant spvUnsafeArray<int2, 4> (\w+) = spvUnsafeArray<int2, 4>\(\{ (.*?) \}\);', msl):
+        off = re.findall(r'int2\([^()]*\)', m.group(2))
+        if len(off) != 4: raise ValueError('gather offsets: unexpected array ' + m.group(0)[:120])
+        arrays[m.group(1)] = off
+    out, i = [], 0
+    for m in re.finditer(r'\bspvGather(Compare)?ConstOffsets\((?=[^)]*?\w)', msl):
+        if m.start() < i or msl[m.end():m.end() + 6] == 'const ': continue   # the wrappers' own definitions
+        depth, args, cur, j = 1, [], '', m.end()
+        while depth:
+            ch = msl[j]; j += 1
+            depth += {'(': 1, ')': -1}.get(ch, 0)
+            if depth == 0 or (ch == ',' and depth == 1): args.append(cur.strip()); cur = ''
+            else: cur += ch
+        cmp = bool(m.group(1)); base = 3 if cmp else 4
+        if len(args) <= base or args[2] not in arrays: raise ValueError('gather offsets: unexpected call ' + msl[m.start():j][:160])
+        tex, smp, off, rest = args[0], args[1], arrays[args[2]], ', '.join(args[base:])
+        tail = '' if cmp else ', ' + args[3]
+        fn = 'gather_compare' if cmp else 'gather'
+        out += [msl[i:m.start()], 'dm_gather4(' + ', '.join(f'{tex}.{fn}({smp}, {rest}, {o}{tail}).w' for o in off) + ')']
+        i = j
+    out.append(msl[i:])
+    msl = ''.join(out)
+    k = msl.index('\n', msl.index('using namespace metal;')) + 1
+    return msl[:k] + GATHER4 + msl[k:]
 def hmma_msl(msl):
     m = re.search(r'\n(\w+) dmsh_hmma16816_f16\(([^)]*)\)\n\{', msl)
     if not m: return msl
@@ -1420,6 +1451,8 @@ def finish(key, w, j, c1):
     try: src = dmsh_atomic.check_msl(src)
     except ValueError as e: return 'image atomic MSL failed', str(e), None
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
+    try: src = gather_offsets(src)   # four gathers (upstream b1d7c70)
+    except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
     try: src = hmma_msl(src)   # Ampere HMMA through simdgroup_matrix (see hmma_msl)
     except ValueError as e: return 'HMMA rewrite failed', str(e)[:160], None
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
