@@ -940,7 +940,7 @@ static void big_full(big_pool *b) {   // caller holds g_mu
     for (int i = 0; i < g_npool;) {
         pool_ent *p = &g_pools[i];
         if (p->key != b->mem || i == b->full - 1) { i++; continue; }
-        [g_keep removeObject:p->buf]; defer_obj_release(p->buf);
+        id<MTLBuffer> ob = p->buf; [g_keep removeObject:ob]; defer_obj_release(ob);   // strong first: p->buf is unretained, and g_keep may hold its last reference
         if (p->res) g_pool_res_n--;
         g_pools[i] = g_pools[--g_npool];
         if (i < g_npool) big_moved(i);
@@ -970,7 +970,7 @@ static int big_lookup(big_pool *b, uint64_t addr, uint64_t len) {
     // pool went: PRAGMATA's pools kept a 48 MB and a 96 MB chunk at one base, each counted whole, and the set passed Metal's working set on an 8 GB Mac. Nothing keeps its GPU address past
     // that: every cache of pool addresses is checked against g_pool_gen, which big_new bumped
     if (i >= 0) {
-        [g_keep removeObject:g_pools[i].buf]; defer_obj_release(g_pools[i].buf); g_pools[n].res = 0; if (g_pools[i].res) g_pool_res_n--;
+        id<MTLBuffer> ob = g_pools[i].buf; [g_keep removeObject:ob]; defer_obj_release(ob); g_pools[n].res = 0; if (g_pools[i].res) g_pool_res_n--;   // strong first: a chunk only g_keep held was freed by the removal, and the deferred release got a freed object
         g_pools[i] = g_pools[n]; g_npool--; n = i;
     }
     b->chunk[k] = n + 1;

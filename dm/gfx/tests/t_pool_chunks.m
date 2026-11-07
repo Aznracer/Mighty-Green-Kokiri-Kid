@@ -61,6 +61,21 @@ int main(void) { @autoreleasepool {
     CHECK("a long range in one buffer", big.length >= 100 * MB && g_npool == n1 + 1);
     id<MTLBuffer> again = look(base + 300 * MB + 4096, 4096);
     CHECK("its stride keeps the long chunk", again == big);
+    // A chunk nothing but g_keep holds (made by a lookup that keeps no reference, as tex_storage_live's), then lengthened, and the whole-pool mapping that retires the chunks: each took
+    // the old buffer out of g_keep before handing it to the deferred release, which then got a freed object (a crash in defer_obj_at with DM_NVN_GMEM_NOBIG, Hyrule Castle Town).
+    // Run with NSZombieEnabled=YES (check_t_pool_chunks does) to see a use after free here
+    @autoreleasepool {   // a pool of its own, as the whole-pool mapping changes it for good
+        uint8_t *m2 = mmap(NULL, 512 * MB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (m2 == MAP_FAILED) abort();
+        mtl_pool_add(m2, 512 * MB);
+        uint64_t sa = (uint64_t)(uintptr_t)m2 + 200 * MB + 3;
+        pthread_mutex_lock(&g_mu); int s0 = pool_find(sa, 64); int res0 = s0 >= 0 ? g_pools[s0].res : -1; pthread_mutex_unlock(&g_mu);
+        CHECK("a short chunk only g_keep holds", s0 >= 0 && res0 == 0);
+        pthread_mutex_lock(&g_mu); int s1 = pool_find(sa, 40 * MB); uint64_t e1 = s1 >= 0 ? g_pools[s1].end : 0; pthread_mutex_unlock(&g_mu);
+        CHECK("lengthened over it", s1 >= 0 && e1 >= sa + 40 * MB);
+        pthread_mutex_lock(&g_mu); int b0 = big_of(sa); if (b0 >= 0) big_full(&g_big[b0]); int full = b0 >= 0 ? g_big[b0].full : 0; pthread_mutex_unlock(&g_mu);
+        CHECK("the whole-pool mapping retires the chunks", full > 0);
+        mtl_pool_del(m2); munmap(m2, 512 * MB);
+    }
     // The pool's end
     CHECK("past the end: not found", !mtl_gpu_addr(base + GB - 8, 64, &mb, &mo, &gpu));
     CHECK("at the end: found", mtl_gpu_addr(base + GB - 8, 8, &mb, &mo, &gpu));
