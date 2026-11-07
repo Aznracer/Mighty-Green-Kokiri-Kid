@@ -3,7 +3,7 @@
 #   oot2 (penis6, git.eden-emu.dev), seedds/nxnative's pull requests, cheemu21's kid-with-sword-remake.
 # Run from anywhere inside the repo: bash scripts/oot_iphone/check_updates.sh   (ALL=1 lists the last 10 of each again)
 # The last state seen is kept in the repo's git dir (oot_watch); oot2 lands in the branch oot2-up, cheemu21's in cheemu21-up.
-cd "$(git rev-parse --show-toplevel)" || exit 1
+cd "$(dirname "$0")" && cd "$(git rev-parse --show-toplevel)" || exit 1   # works from any folder
 W=$(git rev-parse --git-common-dir)/oot_watch; mkdir -p "$W" || { echo "cannot write $W"; exit 1; }
 LOG='%h %ad %an | %s'
 export GIT_TERMINAL_PROMPT=0   # a gone or private repo fails instead of waiting for a password
