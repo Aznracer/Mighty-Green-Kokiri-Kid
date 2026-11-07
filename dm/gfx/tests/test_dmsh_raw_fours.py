@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Raw reads in fours (dmsh_wide.raw_fours): through the offline translator (dmsh_xlate, arch sm86), a compute shader's 128-bit load from an address it
 cannot trace (four words at +0, +4, +8 and +12) become one dm_raw4 on the helper's three ulong words, and a store between them leaves them single; on this Mac's GPU dm_raw reads what the
-translator's helper reads, and dm_raw4 what four dm_raw reads do, over test_dmsh_raw_last.py's pool table and address walk with two runs that cross a pool's end and
+translator's helper reads, and dm_raw4 / dm_raw4s what four dm_raw reads do, over test_dmsh_raw_last.py's pool table and address walk with two runs that cross a pool's end and
 runs whose four addresses are not each 4 past the one before. Needs DMSH_TEST_XLATE (the translator) like the other translator tests."""
 import os
 from pathlib import Path
@@ -39,9 +39,20 @@ class RawFours(Translated):
         src = self.msl(self.FOUR)
         out, reads, runs = dmsh_wide.raw_fours(src)
         self.assertEqual((reads, runs), (4, 1), out[-3000:])
-        self.assertEqual(out.count('dm_raw4(_'), 1)
+        self.assertRegex(out, r'= dm_raw4s\(_\d+, _\d+, \(\*spvDescriptorSet0\.\w+\), dm_s, dm_n, dm_d\);')   # base + 4, + 8, + 12 with their carries: proven, no run-time compares
+        self.assertEqual(out.count('dm_raw4(_'), 0)
         self.assertIn('ulong dm_s = 0, dm_n = 0, dm_d = 0;', out)
         self.assertNotRegex(out, r'thread uint& _\d+')   # the seven words are gone with the helper
+
+    def test_unproven_run_keeps_the_compares(self):   # a word's high half reassigned after its declaration: the text no longer proves the four adjacent, so dm_raw4 checks at run time
+        src = self.msl(self.FOUR)
+        his = re.findall(r'(?m)^ +int _\d+ = _\d+\(_\d+, (_\d+), \(\*spvDescriptorSet0\.\w+\)(?:, _\d+){7}\);$', src)
+        first = re.search(r'(?m)^ +int _\d+ = _\d+\(_\d+, _\d+, \(\*spvDescriptorSet0\.\w+\)(?:, _\d+){7}\);$', src).start()
+        src = src[:first] + f'    {his[2]} = {his[2]};\n' + src[first:]
+        out, reads, runs = dmsh_wide.raw_fours(src)
+        self.assertEqual((reads, runs), (4, 1), out[-3000:])
+        self.assertEqual(out.count('dm_raw4(_'), 1)
+        self.assertEqual(out.count('dm_raw4s(_'), 0)
 
     def test_a_store_between_ends_a_run(self):   # the 128-bit load's four reads with a store to storage slot 0 after the second: the later words must be read after it
         src = self.msl(self.FOUR)
@@ -64,7 +75,7 @@ class RawFours(Translated):
 kernel void k({old.group(2)} {old.group(3)}& map [[buffer(0)]], const device uint2* addr [[buffer(1)]], device int* out [[buffer(2)]], uint id [[thread_position_in_grid]])
 {{
     uint c[{words}] = {{}};
-    ulong s = 0, n = 0, d = 0, s2 = 0, n2 = 0, d2 = 0;
+    ulong s = 0, n = 0, d = 0, s2 = 0, n2 = 0, d2 = 0, s3 = 0, n3 = 0, d3 = 0, s4 = 0, n4 = 0, d4 = 0;
     for (int st = 0; st < 16; st++)
     {{
         uint2 x = addr[id * 16 + st]; ulong a = as_type<ulong>(x);
@@ -72,8 +83,10 @@ kernel void k({old.group(2)} {old.group(3)}& map [[buffer(0)]], const device uin
         int now = dm_raw(int(x.x), int(x.y), map, s2, n2, d2);
         ulong b[4] = {{a, a + 4, a + ((st & 1) ? 20 : 8), a + 12}};
         uint4 v = dm_raw4(int(uint(b[0])), int(uint(b[0] >> 32)), int(uint(b[1])), int(uint(b[1] >> 32)), int(uint(b[2])), int(uint(b[2] >> 32)), int(uint(b[3])), int(uint(b[3] >> 32)), map, s, n, d);
-        bool same = was == now && int(v.x) == now;
+        uint4 w = dm_raw4s(int(uint(a)), int(uint(a >> 32)), map, s3, n3, d3);   // a, a + 4, a + 8, a + 12 always
+        bool same = was == now && int(v.x) == now && int(w.x) == now;
         for (int k = 1; k < 4; k++) same = same && v[k] == uint(dm_raw(int(uint(b[k])), int(uint(b[k] >> 32)), map, s2, n2, d2));
+        for (int k = 1; k < 4; k++) {{ ulong e = a + 4 * k; same = same && w[k] == uint(dm_raw(int(uint(e)), int(uint(e >> 32)), map, s4, n4, d4)); }}
         out[id * 16 + st] = same ? now : 0x7fffffff;
     }}
 }}

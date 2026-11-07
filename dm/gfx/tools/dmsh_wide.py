@@ -353,6 +353,27 @@ uint4 dm_raw4(int lo0, int hi0, int lo1, int hi1, int lo2, int hi2, int lo3, int
     v.w = uint(dm_raw(lo3, hi3, t, s, n, d));
     return v;
 }}
+
+static inline __attribute__((always_inline))
+uint4 dm_raw4s(int lo0, int hi0, {qual} {typ}& t, thread ulong& s, thread ulong& n, thread ulong& d)
+{{
+    ulong a = as_type<ulong>(uint2(uint(lo0), uint(hi0)));
+    ulong r = a - s;
+    if (r < n && n - r >= 16)
+    {{
+        ulong h = a + d;
+        if ((h & 15) == 0) return *reinterpret_cast<const device uint4*>(h);
+        const device uint* p = reinterpret_cast<const device uint*>(h);
+        return uint4(p[0], p[1], p[2], p[3]);
+    }}
+    uint4 v;
+    v.x = uint(dm_raw(lo0, hi0, t, s, n, d));
+    ulong a1 = a + 4, a2 = a + 8, a3 = a + 12;
+    v.y = uint(dm_raw(int(uint(a1)), int(uint(a1 >> 32)), t, s, n, d));
+    v.z = uint(dm_raw(int(uint(a2)), int(uint(a2 >> 32)), t, s, n, d));
+    v.w = uint(dm_raw(int(uint(a3)), int(uint(a3 >> 32)), t, s, n, d));
+    return v;
+}}
 '''
 
 
@@ -380,6 +401,36 @@ def _raw_fours_entry(body, call, words, table):
             v = a.group(1)
             if a.re.groups > 1 and a.group(2): off += int(a.group(2))
         return v, off
+    again = set(re.findall(r'(?m)^\s+(_\d+) = ', body))   # variables assigned after their declaration (loops, phis): no proof may rest on them
+
+    def same(v):   # v through its plain copies
+        for _ in range(16):
+            if v in again or v not in defs or not re.fullmatch(r'_\d+', defs[v][1]): return v
+            v = defs[v][1]
+        return v
+
+    def high(v):   # a high word H + int(uint(lo) < base) as (H, lo, base); None otherwise
+        v = same(v)
+        m = v not in again and re.fullmatch(r'(.+) \+ (_\d+)', defs.get(v, (0, ''))[1])
+        c = m and m.group(2) not in again and re.fullmatch(r'int\((_\d+)\)', defs.get(m.group(2), (0, ''))[1])
+        b = c and c.group(1) not in again and re.fullmatch(r'uint\((_\d+)\) < (?:as_type<uint>|uint)\((_\d+)\)', defs.get(c.group(1), (0, ''))[1])
+        return (m.group(1), same(b.group(1)), b.group(2)) if b else None
+
+    def proven(run):   # the shader computes the four addresses as one 64-bit base plus c, c + 4, c + 8, c + 12 (c >= 0): low words root + c + 4k, each high word the base's high
+        r0, h0 = root(run[0][1]['lo']), None   # word plus the carry of its own low word against root; a word at c = 0 is the base pair itself
+        if r0[1] < 0 or r0[1] + 12 >= 1 << 31 or r0[0] in again: return False
+        for j, (_, c) in enumerate(run):
+            if r0[1] + 4 * j == 0:
+                continue
+            hp = high(c['hi'])
+            if not hp or hp[1] != same(c['lo']) or hp[2] != r0[0] or (h0 is not None and hp[0] != h0): return False
+            h0 = hp[0]
+            if any(w in again for w in re.findall(r'_\d+', hp[0])): return False
+        if r0[1] == 0:   # word 0 is the base: its high word is H itself
+            v = same(run[0][1]['hi'])
+            if h0 is None or not (v == h0 or defs.get(v, (0, ''))[1] == h0) or v in again: return False
+        return True
+
     out = {i: f'{c["ind"]}int {c["out"]} = dm_raw({c["lo"]}, {c["hi"]}, {c["tab"]}, dm_s, dm_n, dm_d);' for i, c in calls}
     k, nv = 0, 0
     while k + 3 < len(calls):
@@ -393,7 +444,8 @@ def _raw_fours_entry(body, call, words, table):
         if not ok: k += 1; continue
         v = f'dm_q{nv}'; nv += 1
         c0 = run[0][1]
-        out[run[0][0]] = f'{c0["ind"]}uint4 {v} = dm_raw4({", ".join(args)}, {c0["tab"]}, dm_s, dm_n, dm_d);\n{c0["ind"]}int {c0["out"]} = as_type<int>({v}.x);'
+        call4 = f'dm_raw4s({args[0]}, {args[1]}' if proven(run) else f'dm_raw4({", ".join(args)}'   # proven adjacent: no run-time compares
+        out[run[0][0]] = f'{c0["ind"]}uint4 {v} = {call4}, {c0["tab"]}, dm_s, dm_n, dm_d);\n{c0["ind"]}int {c0["out"]} = as_type<int>({v}.x);'
         for (i, c), comp in zip(run[1:], 'yzw'): out[i] = f'{c["ind"]}int {c["out"]} = as_type<int>({v}.{comp});'
         k += 4
     for i, ln in out.items(): lines[i] = ln
