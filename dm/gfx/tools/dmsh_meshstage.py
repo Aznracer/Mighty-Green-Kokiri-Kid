@@ -30,8 +30,8 @@ def is_stage(ctl):
 
 
 def sph_outputs(sph):
-    """The components an SPH's OMAP enables, in the order of the attribute area: [('psiz', 0)] for the point size (byte 0x35, bit 3, attribute 0x6c), [(None, c)] for the position's
-    (byte 0x35, bits 4..7), then [(n, c)] for generic attribute n's (bytes 0x36 on, a nibble an attribute, bit c its component)."""
+    """The components an SPH's OMAP enables, in the order of the attribute area: [('psiz', 0)] for the point size (byte 0x35, bit 3), [(None, c)] for the position's (byte 0x35,
+    bits 4..7), then [(n, c)] for generic attribute n's (bytes 0x36 on, a nibble an attribute, bit c its component)."""
     out = ([('psiz', 0)] if sph[0x35] >> 3 & 1 else []) + [(None, c) for c in range(4) if sph[0x35] >> (4 + c) & 1]
     for n in range(32):
         out += [(n, c) for c in range(4) if sph[0x36 + n // 2] >> (4 * (n % 2) + c) & 1]
@@ -40,7 +40,8 @@ def sph_outputs(sph):
 
 def info(ctl, area):
     """A task or mesh shader's facts from its control section and its whole code area (the SPH, the instructions, a mesh shader's second SPH): +0x58 its workgroup's threads, +0x5a its
-    payload's bytes, +0x5e whether a mesh shader has a task, +0x5f a primitive's vertices, +0x60 / +0x62 a mesh shader's most vertices and primitives, +0x64 the offset of its per-primitive SPH where +0x68 bit 7 is set."""
+    payload's bytes, +0x5e whether a mesh shader has a task, +0x5f a primitive's vertices, +0x60 / +0x62 a mesh shader's most vertices and primitives, +0x64 the offset of its per-primitive
+    SPH where +0x68 bit 7 is set."""
     kind = is_stage(ctl)
     threads, payload = struct.unpack_from('<2H', ctl, 0x58)
     out = {'kind': kind, 'threads': threads, 'payload': payload}
@@ -95,19 +96,39 @@ def _name(param):
     return m[1]
 
 
-def _component(c, base):
-    """A vector of 4 from the attribute area's components: base[c] is the word's expression, or None for a component the shader does not write (0, 0, 0, 1 as a vertex output starts)."""
-    return 'float4(' + ', '.join(f'as_type<float>({base[k]})' if base[k] else ('1.0' if k == 3 else '0.0') for k in range(4)) + ')' if c else ''
-
-
 def _members(comps):
     """{n: [the component's index in comps, or None, for x, y, z, w]} per attribute (None for the position)."""
     return {n: [comps.index((n, c)) if (n, c) in comps else None for c in range(4)] for n in dict.fromkeys(n for n, _ in comps)}
 
 
-def to_stage(msl, i):
+def pixel_reads(sph):
+    """{generic attribute n: the mask of its components (bit c) a pixel shader reads} from its SPH's input map: byte 0x18 + n, two bits a component (0 unused, 1 constant,
+    2 perspective, 3 linear; Ryujinx ShaderHeader ImapTypes), the same place in a Maxwell and an Ampere pixel SPH."""
+    return {n: sum(1 << c for c in range(4) if sph[0x18 + n] >> (2 * c) & 3) for n in range(32) if sph[0x18 + n]}
+
+
+def _width(written, read):
+    """The components an output needs: those the shader writes, and a w its pixel shaders read (read: component mask, None = not known, every component) that it does not write,
+    which must hold the hardware's 1. A Metal fragment input wider than the output it links to reads 0 in the components the output lacks, the hardware's default for x, y and z."""
+    hi = max((c + 1 for c in range(4) if written[c] is not None), default=0)
+    return max(hi, 4 if (0xf if read is None else read) & 8 and written[3] is None else 0, 1)
+
+
+def _value(width, base):
+    """The output's value of width components: base[c] is the word's expression, or None for a component the shader does not write (0, 0, 0, 1 as a vertex output starts)."""
+    parts = [f'as_type<float>({base[k]})' if base[k] else ('1.0' if k == 3 else '0.0') for k in range(width)]
+    return parts[0] if width == 1 else f'float{width}(' + ', '.join(parts) + ')'
+
+
+def _type(width):
+    return 'float' if width == 1 else f'float{width}'
+
+
+def to_stage(msl, i, reads=None):
     """The translated kernel as the object function main0 (kind 'ts'), or the mesh functions main0 and main0_z (kind 'ms': the two depth conventions, as dmsh_build.py vs_depth gives a
-    vertex shader, near = -w and near = 0)."""
+    vertex shader, near = -w and near = 0). reads: {user(locnN) location: component mask} of what a mesh shader's paired pixel shaders read (pixel_reads), None when not known.
+    A location its SPHs do not enable becomes a vertex output of (0,0,0,1), what the hardware gives a pixel shader input no stage wrote (dmsh_build.py vs_pad does the same for a
+    vertex shader), since Metal links no pixel input the mesh stage does not write; each output is declared as wide as those readers can see (_width)."""
     kind = i['kind']
     m = _KERNEL.search(msl)
     if not m: raise ValueError(f'{kind}: no kernel main0 starting with its stage memory')
@@ -146,22 +167,31 @@ def to_stage(msl, i):
     if max_v > METAL_MAX_VERTICES or max_p > METAL_MAX_PRIMITIVES: raise ValueError(f'ms: {max_v} vertices and {max_p} primitives exceed a Metal mesh')
     v_blocks = max(max(max_v, 1) + BLOCK - 1, 0) // BLOCK
     v_stride, p_stride = max(len(vertex), 1) * BLOCK, max(len(primitive), 1) * BLOCK   # words of a vertex or primitive attribute block
-    p_out = out + v_blocks * len(vertex) * BLOCK   # the per-primitive blocks follow all vertex blocks (ee4ef51a4fddc28e writes its primitives' from +3072, after 4 blocks of 6 components)
+    p_out = out + v_blocks * len(vertex) * BLOCK   # per-primitive blocks follow all vertex blocks
     word = lambda comps: [f'{mem}[b + {comps[k] * BLOCK}u]' if comps[k] is not None else None for k in range(4)]
     vm, pm = _members(vertex), _members(primitive)
-    topo, nidx = TOPOLOGY[verts], f'np * {verts}u'
+    # Each output as wide as its pixel shaders can see (_width): what Metal counts against a mesh's 32 KB is the declared outputs, and the float4 of every attribute the SPH names
+    # put Ocarina of Time's foliage mesh 626fbf48041cb82b (160 vertices, 26 components written) at 35,840 bytes. A location they read that no SPH enables is padded (0,0,0,1)
+    read = (lambda n: reads.get(n, 0)) if reads is not None else (lambda n: None)
+    miss = sorted(set(reads or ()) - {n for n in vm if isinstance(n, int)} - set(pm))
+    vw = {n: _width(c, read(n)) for n, c in vm.items() if isinstance(n, int)}
+    pw = {n: _width(c, read(n)) for n, c in pm.items()}
+    mw = {n: _width([None] * 4, read(n)) for n in miss}
     # The position is invariant, as a vertex shader's: a game may draw the same geometry with two mesh shaders and test the second for depth equality
     # (Ocarina of Time draws its foliage with a mesh depth pre-pass and a mesh colour pass with depth EQUAL)
     head += ('struct dm_vertex_t {\n    float4 position [[position, invariant]];\n' +
              ('    float point_size [[point_size]];\n' if 'psiz' in vm else '') +
-             ''.join(f'    float4 a{n} [[user(locn{n})]];\n' for n in vm if isinstance(n, int)) + '};\n' +
-             ('struct dm_prim_t {\n' + ''.join(f'    float4 p{n} [[user(locn{n})]];\n' for n in pm) + '};\n' if pm else '') +
-             f'using dm_mesh_t = metal::mesh<dm_vertex_t, {"dm_prim_t" if pm else "void"}, {max_v}, {max_p}, metal::topology::{topo}>;\n')
+             ''.join(f'    {_type(w)} a{n} [[user(locn{n})]];\n' for n, w in vw.items()) +
+             ''.join(f'    {_type(w)} dm_pad{n} [[user(locn{n})]];\n' for n, w in mw.items()) + '};\n' +
+             ('struct dm_prim_t {\n' + ''.join(f'    {_type(w)} p{n} [[user(locn{n})]];\n' for n, w in pw.items()) + '};\n' if pm else '') +
+             f'using dm_mesh_t = metal::mesh<dm_vertex_t, {"dm_prim_t" if pm else "void"}, {max_v}, {max_p}, metal::topology::{TOPOLOGY[verts]}>;\n')
     v_block = lambda v: f'{out}u + ({v} / {BLOCK}u) * {v_stride}u + {v} % {BLOCK}u'
     p_block = lambda p: f'{p_out}u + ({p} / {BLOCK}u) * {p_stride}u + {p} % {BLOCK}u'
     sets = ''.join(f'        v.point_size = as_type<float>({word(c)[0]});\n' if n == 'psiz' else
-                   f'        v.{"position" if n is None else f"a{n}"} = {_component(True, word(c))};\n' for n, c in vm.items())
-    psets = ''.join(f'        p.p{n} = {_component(True, word(c))};\n' for n, c in pm.items())
+                   f'        v.position = {_value(4, word(c))};\n' if n is None else
+                   f'        v.a{n} = {_value(vw[n], word(c))};\n' for n, c in vm.items()) + \
+        ''.join(f'        v.dm_pad{n} = {_value(w, [None] * 4)};\n' for n, w in mw.items())
+    psets = ''.join(f'        p.p{n} = {_value(pw[n], word(c))};\n' for n, c in pm.items())
     if None not in vm: raise ValueError('ms: its SPH enables no position component')
 
     def entry(name, gl):
@@ -177,5 +207,5 @@ def to_stage(msl, i):
                 ('        v.position.z = fma(v.position.z, 0.5, v.position.w * 0.5);\n' if gl else '') +
                 '        dm_out.set_vertex(n, v);\n    }\n' +
                 (f'    for (uint n = {lid}; n < np; n += {thr}u)\n    {{\n        uint b = {p_block("n")};\n        dm_prim_t p;\n{psets}        dm_out.set_primitive(n, p);\n    }}\n' if pm else '') +
-                f'    for (uint n = {lid}; n < {nidx}; n += {thr}u)\n    {{\n        uint at = {prim + 4}u + n;\n        dm_out.set_index(n, ({mem}[at >> 2] >> ((at & 3u) * 8u)) & 0xffu);\n    }}\n}}\n')
+                f'    for (uint n = {lid}; n < np * {verts}u; n += {thr}u)\n    {{\n        uint at = {prim + 4}u + n;\n        dm_out.set_index(n, ({mem}[at >> 2] >> ((at & 3u) * 8u)) & 0xffu);\n    }}\n}}\n')
     return src + '\n' + head + entry('main0', True) + '\n' + entry('main0_z', False)
