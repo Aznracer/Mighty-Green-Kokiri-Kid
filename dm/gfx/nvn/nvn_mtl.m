@@ -4420,6 +4420,7 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
 // Memory readout line (always on, low frequency, capped): resident memory, GPU allocated, deferred-release queue, residency set object count, registered memory pools / peak / tracking table capacity, cumulative texture re-uploads.
 // Purpose: pin down "crashes with no log". The system gives no notice before killing a process for memory, so only readouts left beforehand can show which number kept climbing.
 // Called by the frame hook every 300 frames; printed only when resident or GPU allocated changed by ≥ 64 MB since the last line, otherwise one line every 3000 frames; capped at 400 lines per game. All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting)
+static uint64_t g_gptr_sites, g_gptr_filled, g_gptr_draws, g_gptr_short;   // bind-time pointer sites encoded, those whose word named a pool, shader bindings with sites, those with a site left empty or none (NVN_RB_GPTR in encode_args)
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     static unsigned long long last_rss, last_gpu, last_frame; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     unsigned long long dr = rss_mb > last_rss ? rss_mb - last_rss : last_rss - rss_mb, dg = gpu > last_gpu ? gpu - last_gpu : last_gpu - gpu;
@@ -4462,6 +4463,8 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
     MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u of them unreferenced; evicted with pools %llu, on storage takeover %llu, idle %llu, unreferenced and idle %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total, finalized textures still referenced %u (small table, %llu put in total); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, aorph, (unsigned long long)g_alias_evicted, (unsigned long long)g_alias_taken, (unsigned long long)g_alias_idle, (unsigned long long)g_alias_retired, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, nghost, (unsigned long long)ghost_puts, avail);
+    if (g_gptr_draws) MLOG("bind-time pointers up to frame %llu: %llu sites encoded, %llu of them named a pool (%llu per mille); %llu raw-load shader bindings, %llu of them with a site empty or no site (they rely on the table)", frame,
+                           (unsigned long long)g_gptr_sites, (unsigned long long)g_gptr_filled, (unsigned long long)(g_gptr_sites ? g_gptr_filled * 1000 / g_gptr_sites : 0), (unsigned long long)g_gptr_draws, (unsigned long long)g_gptr_short);
     if (trc_on() && g_trc_made) { pthread_mutex_lock(&g_trc_mu); int n = g_ntrc; uint64_t mb = g_trc_bytes >> 20; pthread_mutex_unlock(&g_trc_mu);
         MLOG("recycled textures (DM_NVN_TEX_RECYCLE): %llu made, %llu binned, %llu taken from the bin, %llu let go, %llu releases while held, %llu not binned for memory; the bin holds %d, %llu MB",
              (unsigned long long)g_trc_made, (unsigned long long)g_trc_put, (unsigned long long)g_trc_hit, (unsigned long long)g_trc_evict, (unsigned long long)g_trc_skip_held, (unsigned long long)g_trc_short, n, (unsigned long long)mb); }
@@ -9876,6 +9879,33 @@ full:;
             if (!raw_map) { gmem_map_gpu(); raw_map = g_gmem_buf; }
             slots[aid] = raw_map.gpuAddress; gmem_aid = aid;
             if (bl) PD("B %llu st%d gmem %s", g_stat_pass, nvn_stage, b->rw ? "rw" : "ro");
+        } else if (b->kind == NVN_RB_GPTR) {
+            // B: bind-time pointer sites (dmsh_abi.h DMSH_GPTR_*, PR #1585). Each site's pointer word, read now from the storage buffer it lies in, names the pool the shader's load
+            // will reach; its entry {start, end, delta} lets the load skip the hint and the search, and finds a pool the table leaves out. The pool is made resident here as a storage
+            // buffer binding's is. The word is the CPU's view: one the GPU rewrites later in the submission gives an entry the address falls outside, and the load searches the table
+            int n = sh->rf.ngptr;
+            g_gptr_draws++;
+            if (!n) { g_gptr_short++; slots[aid] = zero_bank_gpu(); USE(zero_bank(), MTLResourceUsageRead); }
+            else {
+                __strong id<MTLBuffer> db = nil; size_t doff = arena_alloc((size_t)n * DMSH_GMEM_MAP_ENTRY, &db);
+                uint64_t *ent = (uint64_t *)((uint8_t *)db.contents + doff); memset(ent, 0, (size_t)n * DMSH_GMEM_MAP_ENTRY);
+                int filled = 0;
+                for (int q = 0; q < n; q++) {
+                    int sreg = sh->rf.gptr[q].reg; const p_bind_buf *u = sreg >= 0 && sreg < 16 ? &S.ssbo[nvn_stage][sreg] : NULL;
+                    uint64_t at = u && u->addr ? u->addr + sh->rf.gptr[q].off : 0, ptr = 0;
+                    if (!at || (u->size && sh->rf.gptr[q].off + 8u > u->size)) continue;
+                    memcpy(&ptr, (const void *)(uintptr_t)at, 8);
+                    void *mb; uint64_t mo, gpu;
+                    if (!ptr || !mtl_gpu_addr(ptr, 1, &mb, &mo, &gpu)) continue;
+                    __unsafe_unretained id<MTLBuffer> pb = (__bridge id<MTLBuffer>)mb;
+                    uint64_t *e = ent + (size_t)q * (DMSH_GMEM_MAP_ENTRY / 8);
+                    e[0] = ptr - mo; e[1] = ptr - mo + pb.length; e[2] = gpu - ptr; filled++;
+                    USE(pb, MTLResourceUsageRead);
+                }
+                slots[aid] = db.gpuAddress + doff; USE(db, MTLResourceUsageRead);
+                g_gptr_sites += (uint64_t)n; g_gptr_filled += (uint64_t)filled; if (filled < n) g_gptr_short++;
+                if (bl) PD("B %llu st%d gptr %d sites %d filled", g_stat_pass, nvn_stage, n, filled);
+            }
         } else if (b->kind == NVN_RB_GMEML) {   // B: the write log of those stores; their writes are noted as gml_take learned them
             if (!raw_map) { gmem_map_gpu(); raw_map = g_gmem_buf; }
             slots[aid] = gml_take(raw_map);

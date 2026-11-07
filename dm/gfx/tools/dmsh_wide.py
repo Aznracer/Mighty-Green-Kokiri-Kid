@@ -295,8 +295,8 @@ def _raw_quads(msl, helper, table):
 # by word through dm_raw, so dm_raw4 returns what the four reads did. A run ends at a brace, at a line that may write memory (_WRITE) and at a call of any
 # other function, so reading the later words at the first one's place reads the same values. Ocarina of Time's Hyrule Castle Town: 35 vertex shaders of its
 # main pass (253 raw reads a vertex, 232 of them in fours) took that pass from 6.8 to 5.2 ms of GPU time, the frame from 17.7 to 15.5-16.0 ms
-_RAW7 = re.compile(r'static inline __attribute__\(\(always_inline\)\)\nint (_\d+)\(thread const int& _\d+, thread const int& _\d+, ((?:const )?device) (_\d+)& (\w+)'
-                   r'((?:, thread uint& _\d+){7})\)\n\{\n.*?\n\}\n', re.S)
+_RAW7 = re.compile(r'static inline __attribute__\(\(always_inline\)\)\nint (_\d+)\(thread const int& _\d+, thread const int& _\d+, (thread const int& _\d+, )?((?:const )?device) (_\d+)& (\w+)'
+                   r'(?:, ((?:const )?device) (_\d+)& (\w+))?((?:, thread uint& _\d+){7})\)\n\{\n.*?\n\}\n', re.S)   # a load's site argument and its entries' buffer (PR #1585) come together
 _RAW7_TAIL = re.compile(r'uint (_\d+) = \*\(reinterpret_cast<(?:const )?device uint\*>\(as_type<ulong>\(uint2\(uint\(_\d+\), uint\(_\d+\)\)\)\)\);\n\s*float (_\d+) = '
                         r'as_type<float>\(\1\);\n\s*return as_type<int>\(\2\);\n    \}\n    _\d+ = false;\n    return 0;\n\}\n$')
 _RAW7_MARKS = ('& 4095;', ' * 8;', ' + 7;', ' + 6;', '< 2097152u;', '= 0 + 4;', ' >> uint(1)', ' + 2;', ' + 3;', ' + 4;', ' + 5;')
@@ -304,37 +304,57 @@ _ENTRY = re.compile(r'(?ms)^(?:vertex|fragment|kernel) [^\n]*\(.*?^\}')
 _CALL_ANY = re.compile(r'\b(_\d+|dm_\w+)\s*\(')
 
 
-def _raw_fours_helpers(qual, typ):
-    return f'''static inline __attribute__((always_inline))
-int dm_raw(int lo, int hi, {qual} {typ}& t, thread ulong& s, thread ulong& n, thread ulong& d)
-{{
-    ulong a = as_type<ulong>(uint2(uint(lo), uint(hi)));
-    if (a - s >= n)
-    {{
-        uint chunk = (uint(hi) << 11) | (uint(lo) >> 21);
+def _raw_fours_helpers(qual, typ, gq=None, gtyp=None):
+    """dm_raw, dm_raw4 and dm_raw4s on the helper's table (t). With gtyp the helper takes a load's bind-time pointer site and its entries (g, PR #1585): on a miss of the
+    kept entry the site's entry is tried before the hint and the search, as the translator's helper does, so a pool the table leaves out is still found"""
+    sp, gp, sa, ga = (', int site', f', {gq} {gtyp}& g', ', site', ', g') if gtyp else ('', '', '', '')
+    lookup = """        uint chunk = (uint(hi) << 11) | (uint(lo) >> 21);
         uint h = (chunk & 4095u) * 8u;
         uint idx = t._m0[h + 7u];
         if (!(idx != 0u && t._m0[h + 6u] == chunk + 1u && uint(hi) < 2097152u))
-        {{
+        {
             uint i = 0u;
             for (uint step = t._m0[4] >> 1; step != 0u; step >>= 1)
-            {{
+            {
                 uint m = i + step;
                 i = as_type<ulong>(uint2(t._m0[m * 8u], t._m0[m * 8u + 1u])) <= a ? m : i;
-            }}
+            }
             idx = i;
-        }}
+        }
         uint b = idx * 8u;
         ulong st = as_type<ulong>(uint2(t._m0[b], t._m0[b + 1u]));
         ulong en = as_type<ulong>(uint2(t._m0[b + 2u], t._m0[b + 3u]));
         if (!(a < en)) return 0;
         s = st; n = en - st; d = as_type<ulong>(uint2(t._m0[b + 4u], t._m0[b + 5u]));
-    }}
+"""
+    if gtyp:
+        lookup = """        uint e = uint(site) * 8u;
+        ulong gs = 0, ge = 0;
+        if (site != -1)
+        {
+            gs = as_type<ulong>(uint2(g._m0[e], g._m0[e + 1u]));
+            ge = as_type<ulong>(uint2(g._m0[e + 2u], g._m0[e + 3u]));
+        }
+        if (a >= gs && a < ge)
+        {
+            s = gs; n = ge - gs; d = as_type<ulong>(uint2(g._m0[e + 4u], g._m0[e + 5u]));
+        }
+        else
+        {
+""" + ''.join('    ' + ln + '\n' if ln else '\n' for ln in lookup.rstrip('\n').split('\n')) + """        }
+"""
+    return f"""static inline __attribute__((always_inline))
+int dm_raw(int lo, int hi{sp}, {qual} {typ}& t{gp}, thread ulong& s, thread ulong& n, thread ulong& d)
+{{
+    ulong a = as_type<ulong>(uint2(uint(lo), uint(hi)));
+    if (a - s >= n)
+    {{
+{lookup}    }}
     return as_type<int>(*reinterpret_cast<const device uint*>(a + d));
 }}
 
 static inline __attribute__((always_inline))
-uint4 dm_raw4(int lo0, int hi0, int lo1, int hi1, int lo2, int hi2, int lo3, int hi3, {qual} {typ}& t, thread ulong& s, thread ulong& n, thread ulong& d)
+uint4 dm_raw4(int lo0, int hi0, int lo1, int hi1, int lo2, int hi2, int lo3, int hi3{sp}, {qual} {typ}& t{gp}, thread ulong& s, thread ulong& n, thread ulong& d)
 {{
     ulong a = as_type<ulong>(uint2(uint(lo0), uint(hi0)));
     ulong r = a - s;
@@ -347,15 +367,15 @@ uint4 dm_raw4(int lo0, int hi0, int lo1, int hi1, int lo2, int hi2, int lo3, int
         return uint4(p[0], p[1], p[2], p[3]);
     }}
     uint4 v;
-    v.x = uint(dm_raw(lo0, hi0, t, s, n, d));
-    v.y = uint(dm_raw(lo1, hi1, t, s, n, d));
-    v.z = uint(dm_raw(lo2, hi2, t, s, n, d));
-    v.w = uint(dm_raw(lo3, hi3, t, s, n, d));
+    v.x = uint(dm_raw(lo0, hi0{sa}, t{ga}, s, n, d));
+    v.y = uint(dm_raw(lo1, hi1{sa}, t{ga}, s, n, d));
+    v.z = uint(dm_raw(lo2, hi2{sa}, t{ga}, s, n, d));
+    v.w = uint(dm_raw(lo3, hi3{sa}, t{ga}, s, n, d));
     return v;
 }}
 
 static inline __attribute__((always_inline))
-uint4 dm_raw4s(int lo0, int hi0, {qual} {typ}& t, thread ulong& s, thread ulong& n, thread ulong& d)
+uint4 dm_raw4s(int lo0, int hi0{sp}, {qual} {typ}& t{gp}, thread ulong& s, thread ulong& n, thread ulong& d)
 {{
     ulong a = as_type<ulong>(uint2(uint(lo0), uint(hi0)));
     ulong r = a - s;
@@ -367,14 +387,14 @@ uint4 dm_raw4s(int lo0, int hi0, {qual} {typ}& t, thread ulong& s, thread ulong&
         return uint4(p[0], p[1], p[2], p[3]);
     }}
     uint4 v;
-    v.x = uint(dm_raw(lo0, hi0, t, s, n, d));
+    v.x = uint(dm_raw(lo0, hi0{sa}, t{ga}, s, n, d));
     ulong a1 = a + 4, a2 = a + 8, a3 = a + 12;
-    v.y = uint(dm_raw(int(uint(a1)), int(uint(a1 >> 32)), t, s, n, d));
-    v.z = uint(dm_raw(int(uint(a2)), int(uint(a2 >> 32)), t, s, n, d));
-    v.w = uint(dm_raw(int(uint(a3)), int(uint(a3 >> 32)), t, s, n, d));
+    v.y = uint(dm_raw(int(uint(a1)), int(uint(a1 >> 32)){sa}, t{ga}, s, n, d));
+    v.z = uint(dm_raw(int(uint(a2)), int(uint(a2 >> 32)){sa}, t{ga}, s, n, d));
+    v.w = uint(dm_raw(int(uint(a3)), int(uint(a3 >> 32)){sa}, t{ga}, s, n, d));
     return v;
 }}
-'''
+"""
 
 
 def _raw_fours_entry(body, call, words, table):
@@ -431,7 +451,9 @@ def _raw_fours_entry(body, call, words, table):
             if h0 is None or not (v == h0 or defs.get(v, (0, ''))[1] == h0) or v in again: return False
         return True
 
-    out = {i: f'{c["ind"]}int {c["out"]} = dm_raw({c["lo"]}, {c["hi"]}, {c["tab"]}, dm_s, dm_n, dm_d);' for i, c in calls}
+    st = lambda c: f', {c["site"]}' if c.groupdict().get('site') else ''   # a load's site (PR #1585)
+    tb = lambda c: f'{c["tab"]}, {c["gp"]}' if c.groupdict().get('gp') else c['tab']
+    out = {i: f'{c["ind"]}int {c["out"]} = dm_raw({c["lo"]}, {c["hi"]}{st(c)}, {tb(c)}, dm_s, dm_n, dm_d);' for i, c in calls}
     k, nv = 0, 0
     while k + 3 < len(calls):
         run = calls[k:k + 4]
@@ -444,8 +466,8 @@ def _raw_fours_entry(body, call, words, table):
         if not ok: k += 1; continue
         v = f'dm_q{nv}'; nv += 1
         c0 = run[0][1]
-        call4 = f'dm_raw4s({args[0]}, {args[1]}' if proven(run) else f'dm_raw4({", ".join(args)}'   # proven adjacent: no run-time compares
-        out[run[0][0]] = f'{c0["ind"]}uint4 {v} = {call4}, {c0["tab"]}, dm_s, dm_n, dm_d);\n{c0["ind"]}int {c0["out"]} = as_type<int>({v}.x);'
+        call4 = f'dm_raw4s({args[0]}, {args[1]}' if proven(run) else f'dm_raw4({", ".join(args)}'   # proven adjacent: no run-time compares; the first word's site
+        out[run[0][0]] = f'{c0["ind"]}uint4 {v} = {call4}{st(c0)}, {tb(c0)}, dm_s, dm_n, dm_d);\n{c0["ind"]}int {c0["out"]} = as_type<int>({v}.x);'
         for (i, c), comp in zip(run[1:], 'yzw'): out[i] = f'{c["ind"]}int {c["out"]} = as_type<int>({v}.{comp});'
         k += 4
     for i, ln in out.items(): lines[i] = ln
@@ -458,11 +480,15 @@ def raw_fours(msl):
     helper is not the expected one or a call or its words are not where expected"""
     hm = list(_RAW7.finditer(msl))
     if len(hm) != 1: return msl, 0, 0
-    hm = hm[0]; name, qual, typ, table = hm.group(1), hm.group(2), hm.group(3), hm.group(4)
-    words = re.findall(r'thread uint& (_\d+)', hm.group(5))
+    hm = hm[0]; name, site, qual, typ, table, gq, gtyp, gptr = (hm.group(k) for k in range(1, 9))
+    if bool(site) != bool(gptr): return msl, 0, 0
+    words = re.findall(r'thread uint& (_\d+)', hm.group(9))
     helper = hm.group(0)
     if not _RAW7_TAIL.search(helper) or helper.count(table + '._m0[') != 11 or any(m not in helper for m in _RAW7_MARKS) or 'atomic' in helper or 'extract_bits' in helper: return msl, 0, 0
-    call = re.compile(r'(?P<ind> +)int (?P<out>_\d+) = ' + name + r'\((?P<lo>_\d+), (?P<hi>_\d+), (?P<tab>\(\*spvDescriptorSet0\.' + re.escape(table) + r'\)), ' + ', '.join(words) + r'\);')
+    if gptr and helper.count(gptr + '._m0[') != 6: return msl, 0, 0   # the site entry's start, end and delta
+    call = re.compile(r'(?P<ind> +)int (?P<out>_\d+) = ' + name + r'\((?P<lo>_\d+), (?P<hi>_\d+), ' + (r'(?P<site>_\d+), ' if gptr else '') +
+                      r'(?P<tab>\(\*spvDescriptorSet0\.' + re.escape(table) + r'\))' + (r', (?P<gp>\(\*spvDescriptorSet0\.' + re.escape(gptr) + r'\))' if gptr else '') +
+                      r', ' + ', '.join(words) + r'\);')
     reads = runs = 0; pieces, last = [], 0
     for e in _ENTRY.finditer(msl):
         if name + '(' not in e.group(0): continue
@@ -470,7 +496,7 @@ def raw_fours(msl):
         if not got or name + '(' in got[0]: return msl, 0, 0
         pieces += [msl[last:e.start()], got[0]]; last = e.end(); reads += got[1]; runs += got[2]
     out = ''.join(pieces) + msl[last:]
-    out = out.replace(helper, _raw_fours_helpers(qual, typ))
+    out = out.replace(helper, _raw_fours_helpers(qual, typ, gq, gtyp))
     if name + '(' in out or any(re.search(r'\b' + w + r'\b', out) for w in words): return msl, 0, 0
     return out, reads, runs
 

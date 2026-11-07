@@ -39,15 +39,15 @@ class RawFours(Translated):
         src = self.msl(self.FOUR)
         out, reads, runs = dmsh_wide.raw_fours(src)
         self.assertEqual((reads, runs), (4, 1), out[-3000:])
-        self.assertRegex(out, r'= dm_raw4s\(_\d+, _\d+, \(\*spvDescriptorSet0\.\w+\), dm_s, dm_n, dm_d\);')   # base + 4, + 8, + 12 with their carries: proven, no run-time compares
+        self.assertRegex(out, r'= dm_raw4s\(_\d+, _\d+, _\d+, \(\*spvDescriptorSet0\.\w+\), \(\*spvDescriptorSet0\.\w+\), dm_s, dm_n, dm_d\);')   # base + 4, + 8, + 12 with their carries: proven, no run-time compares; the load's site and the sites' entries
         self.assertEqual(out.count('dm_raw4(_'), 0)
         self.assertIn('ulong dm_s = 0, dm_n = 0, dm_d = 0;', out)
         self.assertNotRegex(out, r'thread uint& _\d+')   # the seven words are gone with the helper
 
     def test_unproven_run_keeps_the_compares(self):   # a word's high half reassigned after its declaration: the text no longer proves the four adjacent, so dm_raw4 checks at run time
         src = self.msl(self.FOUR)
-        his = re.findall(r'(?m)^ +int _\d+ = _\d+\(_\d+, (_\d+), \(\*spvDescriptorSet0\.\w+\)(?:, _\d+){7}\);$', src)
-        first = re.search(r'(?m)^ +int _\d+ = _\d+\(_\d+, _\d+, \(\*spvDescriptorSet0\.\w+\)(?:, _\d+){7}\);$', src).start()
+        his = re.findall(r'(?m)^ +int _\d+ = _\d+\(_\d+, (_\d+), _\d+, \(\*spvDescriptorSet0\.\w+\), \(\*spvDescriptorSet0\.\w+\)(?:, _\d+){7}\);$', src)
+        first = re.search(r'(?m)^ +int _\d+ = _\d+\(_\d+, _\d+, _\d+, \(\*spvDescriptorSet0\.\w+\), \(\*spvDescriptorSet0\.\w+\)(?:, _\d+){7}\);$', src).start()
         src = src[:first] + f'    {his[2]} = {his[2]};\n' + src[first:]
         out, reads, runs = dmsh_wide.raw_fours(src)
         self.assertEqual((reads, runs), (4, 1), out[-3000:])
@@ -56,7 +56,7 @@ class RawFours(Translated):
 
     def test_a_store_between_ends_a_run(self):   # the 128-bit load's four reads with a store to storage slot 0 after the second: the later words must be read after it
         src = self.msl(self.FOUR)
-        second = [m.end() for m in re.finditer(r'(?m)^ +int _\d+ = _\d+\(_\d+, _\d+, \(\*spvDescriptorSet0\.\w+\)(?:, _\d+){7}\);$', src)][1]
+        second = [m.end() for m in re.finditer(r'(?m)^ +int _\d+ = _\d+\(_\d+, _\d+, _\d+, \(\*spvDescriptorSet0\.\w+\), \(\*spvDescriptorSet0\.\w+\)(?:, _\d+){7}\);$', src)][1]
         src = src[:second] + '\n    (*spvDescriptorSet0.cp_s0)._m0[6] = 0u;' + src[second:]
         out, reads, runs = dmsh_wide.raw_fours(src)
         self.assertEqual((reads, runs), (4, 0), out[-3000:])
@@ -65,28 +65,31 @@ class RawFours(Translated):
     @unittest.skipUnless(shutil.which('xcrun') and sys.platform == 'darwin', 'needs Metal')
     def test_reads_on_gpu(self):
         src = self.msl(self.FOUR)
-        old = re.search(r'(?m)^int (_\d+)\(thread const int& _\d+, thread const int& _\d+, ((?:const )?device) (_\d+)& \w+((?:, thread uint& _\d+)+)\)\n', src)
+        old = re.search(r'(?m)^int (_\d+)\(thread const int& _\d+, thread const int& _\d+, thread const int& _\d+, ((?:const )?device) (_\d+)& \w+, (?:const )?device _\d+& \w+((?:, thread uint& _\d+)+)\)\n', src)
+        self.assertTrue(old, src[:3000])   # the helper takes a load's site and the sites' entries (PR #1585)
         new = dmsh_wide.raw_fours(src)[0]
-        # the translator's helper and the rewrite's, side by side: each step reads its address through the old helper (its own words), through dm_raw (its own
-        # words), and four words through dm_raw4, at a, a+4, a+8, a+12 on even steps and a, a+4, a+20, a+12 on odd ones; the step's word goes out when all agree
+        # the translator's helper and the rewrite's, side by side: each step reads its address through the old helper (its own words), through dm_raw (its own words), four words
+        # through dm_raw4 (a, a+4, a+8, a+12 on even steps and a, a+4, a+20, a+12 on odd ones) and through dm_raw4s (a .. a+12); the step's word goes out when all agree. Pool B is out
+        # of the table and reached only through site 0's entry (the runner below), as a culling shader's range pointer into a pool the table leaves out
         both = (new[:new.index('kernel void main0')] + src[old.start():src.index('\n}\n', old.start()) + 3])
         words = len(re.findall(r'thread uint&', old.group(4)))
         kernel = both + f'''
-kernel void k({old.group(2)} {old.group(3)}& map [[buffer(0)]], const device uint2* addr [[buffer(1)]], device int* out [[buffer(2)]], uint id [[thread_position_in_grid]])
+kernel void k({old.group(2)} {old.group(3)}& map [[buffer(0)]], const device uint2* addr [[buffer(1)]], device int* out [[buffer(2)]], {old.group(2)} {old.group(3)}& gp [[buffer(3)]], uint id [[thread_position_in_grid]])
 {{
     uint c[{words}] = {{}};
+    int site = 0;
     ulong s = 0, n = 0, d = 0, s2 = 0, n2 = 0, d2 = 0, s3 = 0, n3 = 0, d3 = 0, s4 = 0, n4 = 0, d4 = 0;
     for (int st = 0; st < 16; st++)
     {{
         uint2 x = addr[id * 16 + st]; ulong a = as_type<ulong>(x);
-        int was = {old.group(1)}(int(x.x), int(x.y), map, {", ".join(f"c[{k}]" for k in range(words))});
-        int now = dm_raw(int(x.x), int(x.y), map, s2, n2, d2);
+        int was = {old.group(1)}(int(x.x), int(x.y), site, map, gp, {", ".join(f"c[{k}]" for k in range(words))});
+        int now = dm_raw(int(x.x), int(x.y), site, map, gp, s2, n2, d2);
         ulong b[4] = {{a, a + 4, a + ((st & 1) ? 20 : 8), a + 12}};
-        uint4 v = dm_raw4(int(uint(b[0])), int(uint(b[0] >> 32)), int(uint(b[1])), int(uint(b[1] >> 32)), int(uint(b[2])), int(uint(b[2] >> 32)), int(uint(b[3])), int(uint(b[3] >> 32)), map, s, n, d);
-        uint4 w = dm_raw4s(int(uint(a)), int(uint(a >> 32)), map, s3, n3, d3);   // a, a + 4, a + 8, a + 12 always
+        uint4 v = dm_raw4(int(uint(b[0])), int(uint(b[0] >> 32)), int(uint(b[1])), int(uint(b[1] >> 32)), int(uint(b[2])), int(uint(b[2] >> 32)), int(uint(b[3])), int(uint(b[3] >> 32)), site, map, gp, s, n, d);
+        uint4 w = dm_raw4s(int(uint(a)), int(uint(a >> 32)), site, map, gp, s3, n3, d3);   // a, a + 4, a + 8, a + 12 always
         bool same = was == now && int(v.x) == now && int(w.x) == now;
-        for (int k = 1; k < 4; k++) same = same && v[k] == uint(dm_raw(int(uint(b[k])), int(uint(b[k] >> 32)), map, s2, n2, d2));
-        for (int k = 1; k < 4; k++) {{ ulong e = a + 4 * k; same = same && w[k] == uint(dm_raw(int(uint(e)), int(uint(e >> 32)), map, s4, n4, d4)); }}
+        for (int k = 1; k < 4; k++) same = same && v[k] == uint(dm_raw(int(uint(b[k])), int(uint(b[k] >> 32)), site, map, gp, s2, n2, d2));
+        for (int k = 1; k < 4; k++) {{ ulong e = a + 4 * k; same = same && w[k] == uint(dm_raw(int(uint(e)), int(uint(e >> 32)), site, map, gp, s4, n4, d4)); }}
         out[id * 16 + st] = same ? now : 0x7fffffff;
     }}
 }}
@@ -94,6 +97,13 @@ kernel void k({old.group(2)} {old.group(3)}& map [[buffer(0)]], const device uin
         steps = '{0, 16}, {0, 20}}'
         self.assertIn(steps, RUNNER)
         runner = RUNNER.replace(steps, '{-1, 0x10000ff8}, {-1, 0x200040ff8}}')   # A's last two words and B's first two; C's last two and the gap after it
+        table = '    uint32_t chunk = (uint32_t)(GUEST[2] >> 32) << 11'
+        self.assertIn(table, runner)
+        runner = runner.replace(table, '''    uint64_t site_b[3]; memcpy(site_b, t + 2 * 8, 24);   // pool B leaves the table (C moves down to entry 2) and is site 0's entry
+    memcpy(t + 2 * 8, t + 3 * 8, 24); memset(t + 3 * 8, 0, 32); memset(t + 3 * 8, 0xff, 8);
+    id<MTLBuffer> gp = [d newBufferWithLength:4096 options:MTLResourceStorageModeShared]; memset(gp.contents, 0, 4096); memcpy(gp.contents, site_b, 24);
+''' + table).replace('t[(chunk & 4095) * 8 + 7] = 3;', 't[(chunk & 4095) * 8 + 7] = 2;').replace('[ce setBuffer:out offset:0 atIndex:2];', '[ce setBuffer:out offset:0 atIndex:2]; [ce setBuffer:gp offset:0 atIndex:3];')
+        self.assertIn('atIndex:3', runner); self.assertIn('* 8 + 7] = 2;', runner)
         with tempfile.TemporaryDirectory() as w:
             w = Path(w)
             (w / 'k.metal').write_text(kernel)

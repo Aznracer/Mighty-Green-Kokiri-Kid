@@ -86,6 +86,13 @@
 // GlobalToStorage.GmemLogCbOffset): a bitmap of the table's entries, bit i in word i / 32 for entry i (PR #1299). The host reads it against the exact table the shader used
 #define DMSH_KIND_GMEM_LOG "gmem_log"    // that write log: the host gives each draw or dispatch its own, cleared (nvn_mtl.m gml_take)
 #define DMSH_GMEM_LOG_CB_OFFSET 1
+// Bind-time pointers (PR #1585): a raw load whose address is a pointer word the shader read from a bound storage buffer at a constant offset, plus an index, is a site
+// (GlobalToStorage.FindPointerSite). The translator numbers a shader's sites and notes each one ("gptr site k: c<cb slot>[<cb word>] +<byte>", dmsh_build.py gptr_sites), and the
+// host fills one entry per site before the draw from the word's current value (nvn_mtl.m, NVN_RB_GPTR in encode_args): the pool holding it as start, end (exclusive), delta, laid
+// out as a table entry. The shader tries its site's entry before the hint and the search, so an entry that is stale or empty costs only the search it replaces
+#define DMSH_KIND_GPTR "gptr"            // the site entries: the host fills them per draw or dispatch
+#define DMSH_GPTR_CB_OFFSET 2
+#define DMSH_GPTR_MAX 64                 // sites a shader may have; its loads past them search the table
 
 // A pool binding points at a buffer the host keeps (nvn_mtl.m pool_gpu): a 32-bit bound n (the highest index the shader may read), then from DMSH_POOL_HEAD one 8-byte resource ID per ID
 #define DMSH_POOL_HEAD 8                 // bytes before element 0 of a pool buffer

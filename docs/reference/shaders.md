@@ -1427,6 +1427,24 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Check:** `test_dmsh_raw_fours.py`: a 128-bit load through a loaded pointer becomes one `dm_raw4s` (its words are base + 4k with their carries), a reassigned high word keeps `dm_raw4`, a store between its words keeps them apart, and on the GPU the translator's helper, `dm_raw`, `dm_raw4` and `dm_raw4s` read the same over `test_dmsh_raw_last.py`'s pool table, with runs that cross a pool's end and runs whose addresses are not adjacent.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game) (Hyrule Castle Town).
 
+### Raw global memory through a pointer read when the draw is bound
+
+- **Symptom:**
+  - A GPU hang (`kIOGPUCommandBufferCallbackErrorHang`) in a command buffer with Ocarina of Time's culling task shaders (`f75708d176bb6591`, `47f9b38490dcf9a2`, `99280b7b8aae78df` and five more), whenever the pool their range pointer names is not in the raw pool table. On this tree's Mac, repeated hangs of the game's indirect mesh draws once ended in a kernel panic.
+  - Wrong reads: any raw load into a pool the table leaves out reads 0.
+- **Cause:**
+  - These shaders read both ends of a range through a pointer loaded from a storage buffer and loop `(min(end - start, 256) - 1) >> 5` times. A table miss reads both ends as 0, so the count is `uint(-1) >> 5`, 134,217,727 iterations.
+  - The table lists only the pools the game was handed a GPU address for ([PR 1394](https://github.com/seedds/nxnative/pull/1394)), which leaves out 172 of Ocarina's pools (3.7 GB).
+  - 99.5% of the raw-table accesses of Ocarina's raw shaders take their pointer from a fixed byte offset of a bound storage buffer (every model shader: five pointers at bytes 0x0-0x20 of one slot), which the CPU can read before the draw.
+- **Fix:** from [PR 1585](https://github.com/seedds/nxnative/pull/1585), in the chain and the host.
+  - **Translator** (`GlobalToStorage.FindPointerSite`): a raw load is a site when its address's low word is a storage buffer word at a constant offset plus index terms and its high word the next word of the same buffer. Sites are numbered per shader (at most `DMSH_GPTR_MAX`, 64) and noted `gptr site k: c<slot>[<word>] +<byte>`. The load helper takes its site as a third argument; after the kept entry misses it tests the site's entry `{start, end, delta}` (`DMSH_KIND_GPTR`, the sentinel slot's offset 2), then the hint and the search. A hit becomes the kept entry.
+  - **MSL** (`dmsh_wide.raw_fours`): `dm_raw`, `dm_raw4` and `dm_raw4s` take the site and the entries' buffer and try the site the same way on a miss of the kept entry; a run of four passes its first word's site.
+  - **Build** (`dmsh_build.py` `gptr_sites`): each site becomes `[NVN storage slot, byte]`; a pointer whose buffer is not a c0 storage slot gets slot -1 and an empty entry.
+  - **Host** (`NVN_RB_GPTR` in `encode_args`): before each draw or dispatch it reads each site's 8-byte word from the bound storage buffer and fills the entry from `mtl_gpu_addr`, which also makes the pool resident.
+  - The shader checks the address against the entry, so a stale entry (a word the GPU rewrites later in the submission) or an empty one costs only the search it would have done anyway.
+  - The memory line has a counter: `bind-time pointers up to frame N`.
+- **Check:** `test_dmsh_raw_fours.py` on the GPU: pool B is taken out of the table and reachable only through site 0's entry, and the translator's helper, `dm_raw`, `dm_raw4` and `dm_raw4s` read what the pools hold (with the site off, 192 of 1,024 reads come out wrong); `test_dmsh_reflect.py` (gptr sites) and `t_refl` (bind-time pointer sites).
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#found-on-this-game).
 ### Bindless handles through a loop phi
 
 - **Symptom:** `no resolved slot number`, the shader does not load; the translation has a 32-entry texture-pool array (`fp_t2d_cb0_40000000`, handle type Direct).
