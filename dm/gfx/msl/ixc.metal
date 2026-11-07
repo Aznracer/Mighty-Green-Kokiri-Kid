@@ -7,7 +7,12 @@ kernel void ixc_arrays(device const ajob *j [[buffer(0)]], uint i [[threadgroup_
   if (j[i].prim == 0x40) {   // DrawMeshTasksIndirect {count, first}: grid XYZ, first workgroup at +16 (mtk_encode)
     // A count or first over the hardware's 65535 task workgroups is not a draw (launched, such a count hung the GPU): nothing is drawn. The count is capped at j.cap (DM_NVN_MESH_IND_MAXN)
     uint n = s[0], f = s[1]; bool ok = n <= 65535u && f <= 65535u; device uint *d = j[i].args;
-    d[0] = ok ? min(n, j[i].cap ? j[i].cap : 65535u) : 0u; d[1] = 1; d[2] = 1; d[3] = 0; d[4] = ok ? f : 0u; return; }
+    uint c = ok ? min(n, j[i].cap ? j[i].cap : 65535u) : 0u;
+    d[0] = c; d[1] = 1; d[2] = 1; d[3] = 0; d[4] = ok ? f : 0u;
+    // From byte 32, IXC_MESH_PARTS draws of at most IXC_MESH_GRID workgroups {x, 1, 1, first}: with no task shader the threadgroups are the mesh grid, which Metal holds to
+    // 1024 (Ocarina of Time's foliage: up to 1,771; past it the GPU read out of bounds and page faulted). The cap keeps c within the parts (upstream PR #1708)
+    for (uint k = 0; k < 8u; k++) { uint o = k * 1024u; device uint *q = d + 8u + 4u * k; q[0] = c > o ? min(c - o, 1024u) : 0u; q[1] = 1; q[2] = 1; q[3] = (ok ? f : 0u) + o; }
+    return; }
   uint n = s[0], c = j[i].prim == 7 ? n / 4 * 6 : n >= 3 ? (n - 2) * 3 : 0;
   device uint *d = j[i].args; d[0] = min(c, j[i].cap); d[1] = s[1]; d[2] = 0; d[3] = s[2]; d[4] = s[3]; }
 struct ejob { device const uint *rec; device const uchar *ib; device uint *out; device uint *args; uint prim, isz, ilen, cap; };
