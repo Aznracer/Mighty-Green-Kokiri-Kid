@@ -61,6 +61,7 @@ The launcher's Render scale (`DM_RENDER_SCALE`, 0.5 to 1.0) fixes the 3D views a
 - Kokiri Forest's load adds about 3.2 GB of render targets the game reuses by overwrite: [Render targets dead by overwrite](../../../docs/reference/rendering.md#render-targets-dead-by-overwrite-dm_nvn_rt_reclaim), `DM_NVN_RT_RECLAIM=1` (PR 1588, off by default).
 - [A texture ID with no texture kept its cached view](../../../docs/reference/rendering.md#a-texture-id-with-no-texture-kept-its-cached-view): the page faults at f3,677 and f4,851 with the render-target reclaim on.
 - Magenta and black textures over the ground, walls and props after area changes (into Hyrule Castle Town, from it into Hyrule Field) came from `DM_TEX_RELEASE=2`: textures the game makes again over released pages read zeros ([The guest copy of uploaded textures given back](../../../docs/reference/memory.md#the-guest-copy-of-uploaded-textures-given-back)). Use level 1. Headless runs that start in the town never showed it. The host also names the first ASTC textures it makes empty (`ASTC texture made empty`).
+- [A pixel shader's depth after a partly written target](../../../docs/reference/shaders.md#a-pixel-shaders-depth-after-a-partly-written-target): 46 depth-writing pixel shaders read their depth from the wrong register, agl_common's depth pass among them.
 
 ## Open
 
