@@ -4399,6 +4399,9 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
             if (mt) { res_add(mt); trc_mark(mt, d); if (!(filled = tex_init_fill(t, mt, again))) tex_zero_fill(mt); } }
         if (mt && !filled && t->pool && (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) && t->d.target != NVN_TEXTURE_TARGET_BUFFER) rel_push(t, 0);   // the GPU-only texture of a pool nobody reads: its guest pages mean nothing, the host never reads them
         if (!mt) { RED_ONCE(2, "failed to create MTLTexture %ux%u format %#x target %d", t->d.width, t->d.height, t->d.format, t->d.target); return nil; }
+        // An ASTC texture made here with nothing from its storage is all-zero blocks, which decode as magenta (Ocarina of Time showed magenta tiles over Hyrule Castle Town once): the first few are named
+        if (!filled && t->d.format >= 0x79 && t->d.format <= 0x94) { static int na; if (na++ < 8) MLOG("[RED] ASTC texture made empty (magenta when sampled) ser=%llu %ux%ux%u format %#x levels %u %s, texture flags %#x pool flags %#x storage %p",
+            (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.levels, live ? "live" : "finalized", t->d.flags, t->pool ? t->pool->flags : 0, (void *)t->mem); }
     }
     if (mt.allocatedSize >= (256u << 20)) { static int nb; if (nb++ < 20)   // the textures that take most of the GPU's memory (a GPU out-of-memory error says nothing of which)
         MLOG("large texture ser=%llu %ux%ux%u format %#x target %d levels %u: %llu MB%s", (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.target, t->d.levels,
@@ -5474,7 +5477,7 @@ static void shmap_read(void) {
 @interface NvShader : NSObject { @public id<MTLFunction> fn, tf_fn, discard_fn, fn_u, fn_m, fn_d, geo_fn; uint8_t mask_m;   // fn_u: the integer-output entry point (dmsh_build.py fs_uint), for pipelines whose colour attachments are all unsigned integer (pso_desc); fn_m: the mixed one, its outputs in mask_m unsigned integer; fn_d: the dual-source one (dmsh_build.py fs_dual)
     uint16_t tf_stride[4]; uint32_t cb_ext[16], sb_ro; nvn_refl rf; id<MTLArgumentEncoder> ae; NSUInteger arg_len; int stage, range_ro, layer_out; const char *builtin; uint64_t logged; char key[24]; id<MTLBuffer> c1buf; uint64_t c1_gpu; size_t c1off;
     uint32_t geo_vertices, geo_invocations, geo_output, geo_stride, geo_index_stride;
-    uint8_t ndsr;   // agl's four-dispatch NDSR chain (ndsr_index): 0 not looked up, 1-4 its dispatch, 5 not one
+    uint8_t ndsr;   // agl's four-dispatch NDSR chain (ndsr_index): 0 not looked up, 1-4 its dispatch (4: any of its networks), 9 not one
     uint8_t mesh_kind, mesh_notask; uint16_t mesh_threads, mesh_payload;   // an NVN2 task (1) or mesh (2) shader, a mesh shader with no task, its workgroup's threads, its payload's bytes (dmsh_meshstage.py)
     id<MTLComputePipelineState> geo_pso; int geo_pso_failed, cps_failed;   // cps_failed: Metal refused this compute shader's pipeline (dispatch): its dispatches are skipped without asking again
     int16_t *geo_slot; uint32_t geo_words;   // a lean passthrough kernel (dmsh_geometry.lean): capture word -> record slot (-1: not read), record words
@@ -14839,11 +14842,14 @@ static int up_mfx_run(id<MTLTexture> in, id<MTLTexture> out, uint64_t dserial, N
 // the 1536x864 targets have (NOTES 2026-11-05). DM_NDSR=metalfx (default): the four dispatches are skipped and MetalFX's spatial scaler scales the first one's colour into the last one's
 // image; off: a bilinear draw instead; game: the game's shaders. Read at every chain start (ctl "env" switches it live). DM_NDSR_COLOR=hdr (default, linear colour) | perceptual (encoded).
 // Anything unexpected (bindings, sizes, MetalFX refusing) keeps the game's chain from the next frame on; the frame it happens in runs the network on what the skipped dispatches left
-static const char g_ndsr_keys[4][17] = {"f8965bffbdf51d78", "d17eefaff4f0bc23", "a335c1db6270c355", "fa3033d05c0a41d6"};
+// The network at the end is one of several, by the scale between the render size and the output: fa3033d0 for 1.33x (1920x1080 to 2560x1440 at the game's own scale), 04135bb8 from
+// agl_ndsr_vr_light.pck for 2x (1280x720, DM_RENDER_SCALE=0.5), 8df148d5 for 1.1x (2328x1310, 0.9), aad7ea7e and b106afba (PR #1560). Only fa3033d0 was known: at 0.5 and 0.9 the first
+// three were skipped and the other network ran on what they left, a black picture. The dispatch right after a335c1db is the network, whichever it is (g_ndsr_pack)
+static const char g_ndsr_keys[7][17] = {"f8965bffbdf51d78", "d17eefaff4f0bc23", "a335c1db6270c355", "fa3033d05c0a41d6", "04135bb812a0d66e", "aad7ea7e5c02f41d", "b106afba1a18faa9"};
 enum { NDSR_GAME, NDSR_METALFX, NDSR_OFF };
-static int g_ndsr_armed, g_ndsr_failed, g_ndsr_last = -1; static id<MTLTexture> g_ndsr_in; static uint64_t g_ndsr_n;
+static int g_ndsr_armed, g_ndsr_pack, g_ndsr_failed, g_ndsr_last = -1; static id<MTLTexture> g_ndsr_in; static uint64_t g_ndsr_n;
 static int ndsr_index(NvShader *cs) {
-    if (!cs->ndsr) { cs->ndsr = 5; for (int i = 0; i < 4; i++) if (!strncmp(cs->key, g_ndsr_keys[i], 16)) cs->ndsr = (uint8_t)(i + 1); }
+    if (!cs->ndsr) { cs->ndsr = 9; for (int i = 0; i < 7; i++) if (!strncmp(cs->key, g_ndsr_keys[i], 16)) cs->ndsr = (uint8_t)(i < 3 ? i + 1 : 4); }   // every network is the fourth
     return cs->ndsr <= 4 ? cs->ndsr - 1 : -1;
 }
 static int ndsr_mode(void) {
@@ -14860,12 +14866,13 @@ static int ndsr_bind(NvShader *cs, int k) {
     for (int i = 0; i < cs->rf.nb; i++) if (cs->rf.b[i].kind == k) { if (r >= 0) return -1; r = i; }
     return r;
 }
-static int ndsr_fail(const char *why, NvShader *cs) { MLOG("[RED] NDSR replacement: %s (%s); the game's chain runs from the next frame", why, cs->key); g_ndsr_failed = 1; g_ndsr_armed = 0; g_ndsr_in = nil; return 0; }
+static int ndsr_fail(const char *why, NvShader *cs) { MLOG("[RED] NDSR replacement: %s (%s); the game's chain runs from the next frame", why, cs->key); g_ndsr_failed = 1; g_ndsr_armed = g_ndsr_pack = 0; g_ndsr_in = nil; return 0; }
 // 1 when dispatch dp of cs is taken (skipped or replaced), 0 to run it
 static int ndsr_dispatch(NvShader *cs, const p_dispatch *dp) {
-    int i = ndsr_index(cs); if (i < 0) return 0;
+    int i = ndsr_index(cs);
+    if (i < 0) { if (!g_ndsr_armed || !g_ndsr_pack) return 0; i = 3; }   // the dispatch after the third: the network of this scale
     if (i == 0) {
-        g_ndsr_armed = 0; g_ndsr_in = nil;
+        g_ndsr_armed = g_ndsr_pack = 0; g_ndsr_in = nil;
         int m = g_ndsr_failed ? NDSR_GAME : ndsr_mode(); if (m == NDSR_GAME || dp->ind) return 0;
         int ti = ndsr_bind(cs, NVN_RB_TEX); if (ti < 0) return ndsr_fail("the first dispatch has not one texture", cs);
         int tin = (int)(tex_slot_h(S.tex[5], S.img[5], cs->rf.b[ti].reg) & 0xfffff);
@@ -14877,8 +14884,9 @@ static int ndsr_dispatch(NvShader *cs, const p_dispatch *dp) {
         return 1;
     }
     if (!g_ndsr_armed) return 0;
-    if (i < 3) return 1;
-    int m = g_ndsr_armed; id<MTLTexture> in = g_ndsr_in; g_ndsr_armed = 0; g_ndsr_in = nil;
+    if (i < 3) { g_ndsr_pack = i == 2; return 1; }
+    if (!g_ndsr_pack) return ndsr_fail("a network before the chain's third dispatch", cs);
+    int m = g_ndsr_armed; id<MTLTexture> in = g_ndsr_in; g_ndsr_armed = g_ndsr_pack = 0; g_ndsr_in = nil;
     int oi = ndsr_bind(cs, NVN_RB_IMG); if (oi < 0 || cs->rf.b[oi].reg >= 32) return ndsr_fail("the last dispatch has not one image", cs);
     int tout = (int)(S.img[5][cs->rf.b[oi].reg] & 0xfffff);
     tex_t dout = {0}; uint64_t rid = 0; int real = 0; id<MTLTexture> out = nil;

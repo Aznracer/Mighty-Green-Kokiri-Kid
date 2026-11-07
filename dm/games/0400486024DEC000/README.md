@@ -34,6 +34,10 @@ The game sizes its output from fixed 2560x1440 (docked) constants, so a 21:9 scr
 
 The game's frame loop steps a constant per frame, so it played in slow motion below 60 fps. A stub now takes the measured frame time when that is longer ([A fixed step per frame runs slowly below the target](../../../docs/reference/frame-rate.md#a-fixed-step-per-frame-runs-slowly-below-the-target)); `DM_FRAME_DELTA=0` turns it off. Found by gunvalk in [Lichii PR #216](https://github.com/zortos293/Lichii/pull/216).
 
+## Render scale
+
+The launcher's Render scale (`DM_RENDER_SCALE`, 0.5 to 1.0) fixes the 3D views at that fraction of the output and turns the game's dynamic resolution off; 1.0 (the default) keeps the game's own. Docked, the game usually draws 1920x1080 for its 2560x1440 output, so 0.75 is its usual size, lower is faster (0.5: 1280x720, GPU 13.7 ms in Hyrule Castle Town against 16.0-16.2 ms) and higher is sharper (0.9: 2328x1310, 19.0 ms). The game's upscaler network for each ratio is drawn by MetalFX ([A fixed render scale for a game whose dynamic resolution recomputes sizes only on a change](../../../docs/reference/rendering.md#a-fixed-render-scale-for-a-game-whose-dynamic-resolution-recomputes-sizes-only-on-a-change)).
+
 ## Found on this game
 
 - The online library's [eventfd for its poller](../../../docs/reference/services.md#eventfds-served-offline) and the [virtual audio input list](../../../docs/reference/audio.md#no-virtual-audio-input-devices-sdk-22) blocked startup.
@@ -49,6 +53,9 @@ The game's frame loop steps a constant per frame, so it played in slow motion be
 - [Live resolution variants share physical image storage](../../../docs/reference/rendering.md#live-resolution-variants-share-physical-image-storage): the dynamic-resolution depth buffer (`COMPRESSIBLE` alone) kept 15-16 live sizes at one offset, 14.5 MB each, as separate Metal textures (GPU allocation 7,710 → 7,520 MB in Kokiri Forest before main's Ocarina fixes; the 17 sizes still form on main at 2eb71820, where all Depth32Float textures take 225 MB with them shared).
 - [The alias flush on every encoder's end barrier](../../../docs/reference/frame-rate.md#the-alias-flush-on-every-encoders-end-barrier): the main submission's 8 command allocators at 36-80 MB each and 6-15 ms a frame in scenes of about 150 passes before main's Ocarina fixes; on main at 2eb71820, CPU-visible Metal memory 392 → 298 MB and no measurable frame-time change (M3 Pro, 18 GB).
 - Walking and turning the camera in Hyrule Castle Town hitched (p95 22-54 ms) while standing still held 60 fps: the game makes its transient render targets anew each frame, and the host made [a new Metal texture for every transient render target](../../../docs/reference/frame-rate.md#a-new-metal-texture-for-every-transient-render-target), about 1,000 a second, each added to and taken out of the residency set.
+- [Mesh attributes: every vertex block, then every primitive block](../../../docs/reference/shaders.md#mesh-attributes-every-vertex-block-then-every-primitive-block): the Forest Temple's paintings solid green or magenta (PR 1590), white blotches over Kokiri Forest (PR 1575), the foliage point meshes' point size read as part of their position.
+- The Render scale setting did nothing at 60 fps, and below the game's usual size the 3D picture was black: [A fixed render scale for a game whose dynamic resolution recomputes sizes only on a change](../../../docs/reference/rendering.md#a-fixed-render-scale-for-a-game-whose-dynamic-resolution-recomputes-sizes-only-on-a-change).
+- Magenta tiles once covered Hyrule Castle Town's ground and walls in a windowed run (walking into the town); not reproduced headless at any scale or with the dynamic resolution moving. An ASTC texture made empty decodes as magenta, so the host now names the first ones it makes (`ASTC texture made empty`).
 
 ## Open
 
