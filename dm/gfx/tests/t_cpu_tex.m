@@ -215,7 +215,8 @@ static void flushed_buffer_upload(int flush_kind) {
     CHECK(h_nvnTextureInitialize(&tex, &tb), "flush test texture initialized without packaged layout");
     uint8_t pixels[64], zeros[64] = {0}; for (int i=0;i<64;i++) pixels[i]=(uint8_t)(i+32);
     const tex_t *t = (const tex_t *)&tex;
-    // Write block-linear bytes directly; TextureWriteTexels would bypass the flush path.
+    // Write block-linear bytes directly; TextureWriteTexels would bypass the flush path. With tex_dirty_upload the registered texture's pages are write-protected (ft_add)
+    dm_guest_write_prepare(mem + buffer_off + flush_off, t->L.size);
     CHECK(nvn_swizzle(&t->d, 0, 0, pixels, 16, mem + buffer_off + flush_off) == 0, "CPU pixels swizzled into buffer storage");
     if (flush_kind == 1) h_nvnMemoryPoolFlushMappedRange(&pool, buffer_off + flush_off, t->L.size);
     if (flush_kind == 2) h_nvnBufferFlushMappedRange(&buffer, flush_off, t->L.size);
@@ -227,9 +228,11 @@ static void flushed_buffer_upload(int flush_kind) {
     state_reset(); memset(&R,0,sizeof R); mtl_sub_begin(); mtl_exec((const uint8_t *)handle);
     CHECK(mtl_wait(mtl_sub_commit(),5000000000ull), "flushed storage GPU readback completed");
     CHECK(!mtl_last_commit_error(), "flushed storage readback has no GPU error");
-    CHECK(!memcmp(mem + output_off, flush_kind ? pixels : zeros, sizeof pixels),
+    // with tex_dirty_upload a write after registration is seen at first use without a flush too (nvn_ft_written)
+    CHECK(!memcmp(mem + output_off, flush_kind || DM_GAME_TEX_DIRTY_UPLOAD ? pixels : zeros, sizeof pixels),
           flush_kind == 2 ? "buffer flush publishes texture pixels to Metal" :
-          flush_kind == 1 ? "pool flush publishes texture pixels to Metal" : "unflushed cached storage does not trigger first-use upload");
+          flush_kind == 1 ? "pool flush publishes texture pixels to Metal" :
+          DM_GAME_TEX_DIRTY_UPLOAD ? "with tex_dirty_upload an unflushed write after registration is uploaded at first use" : "unflushed cached storage does not trigger first-use upload");
     h_nvnCommandBufferFinalize(&cmd); h_nvnTextureFinalize(&tex); h_nvnBufferFinalize(&buffer); h_nvnMemoryPoolFinalize(&pool);
     CHECK(!nvn_flushed(mem + buffer_off + flush_off, 1), "pool finalization retires buffer flush ranges");
     defer_drain(); munmap(mem,len);
@@ -347,6 +350,35 @@ static void handover_holders(void) {
     h_nvnTextureFinalize(&c); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&pool); settle();
     munmap(mem, len);
 }
+#if DM_GAME_TEX_DIRTY_UPLOAD
+// nvn_ft_poll (tex_dirty_upload): a registered texture the CPU rewrites after its first use is uploaded from its storage, though tex_desc gave it render-target use; one whose storage
+// the GPU wrote is left to the GPU and stays registered (Ocarina of Time's terrain tiles: the height, blend and hole maps are rewritten as tile slots are reused, the normal maps the GPU draws)
+static void poll_rewrites(void) {
+    const size_t len = 1 << 20;
+    uint8_t *mem = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (mem == MAP_FAILED) abort();
+    pool_t pool = {0}; pool_builder_t pb = {.mem=mem, .size=len, .flags=NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    CHECK(h_nvnMemoryPoolInitialize((NVNmemoryPool *)&pool, (const NVNmemoryPoolBuilder *)&pb), "poll: CPU-cached pool initialized");
+    NVNtextureBuilder tb; NVNtexture tex = {0}, drawn = {0}; h_nvnTextureBuilderSetDefaults(&tb);
+    h_nvnTextureBuilderSetWidth(&tb, 256); h_nvnTextureBuilderSetHeight(&tb, 256); h_nvnTextureBuilderSetFormat(&tb, NVN_FORMAT_RGBA8);
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, 65536);
+    CHECK(h_nvnTextureInitialize(&tex, &tb), "poll: texture initialized");
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, 524288);
+    CHECK(h_nvnTextureInitialize(&drawn, &tb), "poll: a second texture initialized");
+    tex_t *t = (tex_t *)&tex, *d = (tex_t *)&drawn;
+    CHECK(nvn_ft_tracked(t->serial) && nvn_ft_tracked(d->serial), "poll: both textures are registered");
+    dm_guest_write_prepare(t->mem, t->L.size); memset(t->mem, 0x40, t->L.size);
+    dm_guest_write_prepare(d->mem, d->L.size); memset(d->mem, 0x40, d->L.size);
+    mtl_tex_gpu_written(d->pool, d->mem, d->L.size);
+    nvn_ft_poll();
+    CHECK(tex_cpu_written(t->serial) && !nvn_ft_tracked(t->serial), "poll: a rewrite of storage the GPU never wrote is uploaded");
+    CHECK(!tex_cpu_written(d->serial) && nvn_ft_tracked(d->serial), "poll: a rewrite the GPU wrote over is left to the GPU, and the texture stays registered");
+    h_nvnTextureFinalize(&tex); h_nvnTextureFinalize(&drawn); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&pool);
+    defer_drain(); munmap(mem, len);
+}
+#else
+static void poll_rewrites(void) { printf("poll_rewrites: skipped, the profile has no tex_dirty_upload\n"); }
+#endif
 int main(int argc, const char **argv) { @autoreleasepool {
     setenv("DM_NVN_POOL_SKIP_RETIRED", "0", 1);   // finalized_bindless_pool checks that retired IDs are made again; a profile with pool_skip_retired (Ocarina of Time) gives them the dummy
     enum { N = 6442, BASE = 1000 };
@@ -373,6 +405,6 @@ int main(int argc, const char **argv) { @autoreleasepool {
     CHECK(mtl_cpu_tex_count() == N - 2, "a texture with no serial is not recorded");
     for (int i=0;i<N;i++) mtl_tex_release(&t[i]);
     retired_classification(); descriptor_replacement(); gpu_written_ranges();
-    if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); finalized_bindless_pool(); for (int i=0;i<3;i++) flushed_buffer_upload(i); packaged_entry_outside_the_set(); finalize_during_walk(); gpu_owned_after_write(); handover_holders(); }
+    if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); finalized_bindless_pool(); for (int i=0;i<3;i++) flushed_buffer_upload(i); packaged_entry_outside_the_set(); finalize_during_walk(); gpu_owned_after_write(); handover_holders(); poll_rewrites(); }
     printf("t_cpu_tex: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

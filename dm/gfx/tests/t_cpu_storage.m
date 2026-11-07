@@ -63,6 +63,31 @@ int main(void) {
         CHECK("in a pool the GPU writes it is not taken from storage", !tex_cpu_content(&f.t));
         teardown(&f);
 
+        // nvn_ft_poll's question of a registered texture the CPU wrote after its first use (mtl_tex_cpu_rewritten)
+        setup(&f, 7030, CACHED, NVN_FORMAT_RGBA8, 0);
+        fill(&f.t, f.mem, 40);
+        CHECK("a rewrite of storage the GPU never wrote is uploaded", mtl_tex_cpu_rewritten(&f.t) == MTL_REWRITE_UPLOADED && tex_cpu_written(f.t.serial));
+        CHECK("with the rewrite as its content", first_red(resolve(&f.t)) == 40);
+        mtl_tex_gpu_written(&f.pool, f.mem, f.t.L.size);
+        mtl_sub_begin(); cpu_unc_drop(); finish();
+        CHECK("and the GPU's next write there makes it a GPU texture again", !tex_cpu_written(f.t.serial));
+        dm_guest_write_prepare(f.mem, f.t.L.size); fill(&f.t, f.mem, 80);
+        CHECK("a rewrite of storage the GPU has written is left to the GPU", mtl_tex_cpu_rewritten(&f.t) == MTL_REWRITE_GPU_NOW && !tex_cpu_written(f.t.serial));
+        teardown(&f);
+
+        setup(&f, 7032, CACHED, NVN_FORMAT_RGBA_DXT1, 0);   // a block-compressed texture: a GPU copy into it while registered lands in its storage too (tex_storage_dst)
+        memset(f.mem, 0x5a, f.t.L.size);
+        mtl_tex_gpu_written(&f.pool, f.mem, f.t.L.size);
+        CHECK("a block-compressed rewrite is uploaded though the GPU wrote its storage", mtl_tex_cpu_rewritten(&f.t) == MTL_REWRITE_UPLOADED && tex_cpu_written(f.t.serial));
+        teardown(&f);
+
+        setup(&f, 7034, CACHED, NVN_FORMAT_RGBA8, 0);
+        CHECK("the fixture texture ends before the pool's last page", f.t.L.size <= POOL - 0x1000);
+        fill(&f.t, f.mem, 40);
+        mtl_tex_gpu_written(&f.pool, (uint8_t *)f.mem + POOL - 0x1000, 0x1000);
+        CHECK("a GPU write elsewhere in the pool leaves the rewrite uploaded", mtl_tex_cpu_rewritten(&f.t) == MTL_REWRITE_UPLOADED && tex_cpu_written(f.t.serial));
+        teardown(&f);
+
         setup(&f, 7003, CACHED, NVN_FORMAT_RGBA8, 0);
         CHECK("storage of zeros is not taken", !tex_cpu_content(&f.t));
         teardown(&f);
