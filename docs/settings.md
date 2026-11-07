@@ -222,7 +222,7 @@ Large compressed textures from the game files are kept on the GPU without their 
 
 ### Lossy render targets
 
-On Apple M2 and later, colour render targets the game only draws into are kept with Metal's lossy compression, about half their memory and bandwidth. Colours lose a little precision where neighbouring pixels differ; most scenes look the same.
+On Apple M2 and later, color render targets the game only draws into are kept with Metal's lossy compression, about half their memory and bandwidth. Colors lose a little precision where neighbouring pixels differ; most scenes look the same.
 
 - **When to change it:** to save a little more memory on a tight Mac; the saving is smaller than Softer textures'.
 
