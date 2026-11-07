@@ -109,7 +109,7 @@ DM_MOTION_LOG	diagnostic	`=1` logs player 1's mapped motion sample once a second
 DM_MOVIE_SKIP	player	`=<part>[,<part>…]` (`1` or `all` = every movie): a movie whose file name (the .webm / .mp4 the game opened last, hle_fs.c) contains a part ends at its first picture, as if it had played to the end (Ocarina of Time's opening and title movies)
 DM_MOVIE_TRACE	diagnostic	When set, the movie decoder logs every call with its thread and decoder (by default the first 12 calls, then every 2^k-th)
 DM_MSL_DIR	path	Parent folder of the shader libraries: NVN loads from `b-<chain version>/` or the one file `b-<chain version>.img` beneath it, Vulkan from `vk/`, GL from `gl/`; the app and the Mac launcher set it
-DM_NDSR	switch	Ocarina of Time's four-dispatch NDSR upscale (agl, 1536x864 to 2048x1152): `metalfx` (default) draws it with MetalFX's spatial scaler instead, `off` with a bilinear draw, `game` runs the game's shaders
+DM_NDSR	switch	Ocarina of Time's four-dispatch NDSR upscale (agl's chain and the network its ratio picks): `metalfx` draws it with MetalFX's spatial scaler instead, `off` with a bilinear draw, `game` runs the game's shaders. Unset: as the launcher's Game's upscaler row (`DM_UPSCALER`), `game` unless that is `metalfx`
 DM_NDSR_COLOR	switch	With `DM_NDSR=metalfx`: `hdr` (default) scales the colour as linear, `perceptual` as encoded
 DM_NICK	switch	The account nickname the game sees (default `Player`)
 DM_NRO	switch	`0` turns off loading of the NRO modules the game's NRR files register (on by default): every `nn::ro::LoadModule` then fails
@@ -394,7 +394,7 @@ DM_UDC_SELFTEST	diagnostic	`=1` runs a start-up check of DontCare load and store
 DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.py`, for `shader_split.py` (default `ue_shaders` beside the RomFS); needed when the RomFS has Unreal paks
 DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streaming.PoolSize`) is raised to, overriding the profile's `ue_texture_pool`; `0` keeps the game's own pool. On iOS only this switch turns it on (`Documents/env.txt`)
 DM_ULTRAWIDE	switch	`=<width>x<height>` at build time (the NSP script's rewrite step): The Legend of Zelda: Ocarina of Time renders that screen shape natively, its output and render sizes widened from the screen's ratio at its own heights (e.g. `3440x1440` for 21:9); unset, the game is not patched
-DM_UPSCALER	player	`metalfx` draws the game's own upscaler shaders (agl's NDSR network, found by the shader map) with MetalFX's spatial scaler; `game` (the default) runs them
+DM_UPSCALER	player	`metalfx` draws the game's own upscaler shaders (agl's NDSR network, found by the shader map, and Ocarina of Time's four-dispatch chain unless `DM_NDSR` says otherwise) with MetalFX's spatial scaler; `game` (the default) runs them
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)

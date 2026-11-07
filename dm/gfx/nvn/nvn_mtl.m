@@ -15126,9 +15126,12 @@ static int ndsr_index(NvShader *cs) {
     if (!cs->ndsr) { cs->ndsr = 9; for (int i = 0; i < 7; i++) if (!strncmp(cs->key, g_ndsr_keys[i], 16)) cs->ndsr = (uint8_t)(i < 3 ? i + 1 : 4); }   // every network is the fourth
     return cs->ndsr <= 4 ? cs->ndsr - 1 : -1;
 }
+// DM_NDSR when set, else the launcher's Game's upscaler row (DM_UPSCALER, game by default): the game's network anti-aliases as it scales, MetalFX's spatial scaler does not, and
+// Ocarina's grass shimmered under it (hard blade edges changing every frame)
 static int ndsr_mode(void) {
     const char *e = getenv("DM_NDSR");
-    int m = !e || !*e || !strcmp(e, "metalfx") ? NDSR_METALFX : !strcmp(e, "off") ? NDSR_OFF : NDSR_GAME;
+    if (!e || !*e) { const char *u = getenv("DM_UPSCALER"); e = u && !strcmp(u, "metalfx") ? "metalfx" : "game"; }
+    int m = !strcmp(e, "metalfx") ? NDSR_METALFX : !strcmp(e, "off") ? NDSR_OFF : NDSR_GAME;
     static int fx = -1; if (fx < 0) fx = g_q4 && [MTLFXSpatialScalerDescriptor supportsMetal4FX:g_dev];
     if (m == NDSR_METALFX && !fx) m = NDSR_GAME;
     if (m != g_ndsr_last) { MLOG("NDSR (DM_NDSR=%s): %s", e ? e : "", m == NDSR_METALFX ? "MetalFX spatial scaler" : m == NDSR_OFF ? "bilinear draw" : fx ? "the game's four dispatches" : "the game's four dispatches (no Metal 4 MetalFX)"); g_ndsr_last = m; }

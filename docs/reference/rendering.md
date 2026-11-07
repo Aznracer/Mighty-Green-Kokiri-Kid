@@ -1130,6 +1130,14 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
 - **Check:** `python3 dm/tools/tests/test_oot_render_scale.py` runs both stubs as ARM64 over host scales, stored scales, controller answers and flags, and checks the launcher offers the setting for a build whose fixups say `RENDER_SCALE`.
 - **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#render-scale), update v131072.
 
+### Grass shimmers under MetalFX in place of agl's four-dispatch upscaler
+
+- **Symptom:** in Ocarina of Time the grass shimmers and half-flickers while the camera moves: every blade has a hard, bright edge, and the thin tips catch the light on different pixels each frame (Hyrule Field, render scale 0.80 handheld, M4 Pro).
+- **Cause:** the host drew agl's four-dispatch chain (`f8965bff`, `d17eefaf`, `a335c1db`, then the network its ratio picks) with MetalFX's spatial scaler by default (`DM_NDSR`). The game's network smooths edges as it scales; MetalFX's spatial scaler only scales. The launcher's **Game's upscaler** row (`DM_UPSCALER`) did not reach this chain: its keys are the shader map's `agl_ndsr.pck` shaders, and Ocarina's chain is in `agl_ndsr_vr.pck` and `agl_ndsr_vr_light.pck`.
+- **Fix:** `nvn_mtl.m` `ndsr_mode`: with `DM_NDSR` unset the chain follows the Game's upscaler row, the game's own network unless the row says MetalFX. `DM_NDSR` still overrides it.
+- **Measured:** headless, one spot outside Hyrule Castle (about 3,080 draws a frame), M4 Pro: render scale 0.80 handheld, GPU 13.8 ms with MetalFX and 14.6 ms with the game's network; the game's network docked at 0.5, 0.9 and 1.0 drew a correct picture each time, at 15.1, 20.5 and 17.6-19.6 ms. In Hyrule Castle Town at 0.9, 19.0 ms with MetalFX and 20.5 ms with the game's network. In play, the shimmer went with the game's network (the player's recordings, side by side).
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md), update v131072.
+
 ### Block corruption after NDVE movie reconstruction
 
 - **Symptom:** Ocarina of Time's title movie shows rectangular colour blocks while the logo, menu and subtitles remain legible.

@@ -57,7 +57,7 @@ Breath of the Wild renders 1280x720 in handheld mode. Docked it renders its worl
 
 ### Game's upscaler
 
-Shown only for games that upscale their own picture with a network of their own before the app sees it: agl's NDSR network, in Donkey Kong Bananza and Splatoon Raiders. **Game's own**, the default, keeps the game's upscaler. **MetalFX** replaces it with Apple's MetalFX spatial scaler: the same input and output sizes, at a fraction of the GPU time, but Apple's scaler's picture rather than the game's.
+Shown only for games that upscale their own picture with a network of their own before the app sees it: agl's NDSR network, in Donkey Kong Bananza, Splatoon Raiders and Ocarina of Time. **Game's own**, the default, keeps the game's upscaler. **MetalFX** replaces it with Apple's MetalFX spatial scaler: the same input and output sizes, at a fraction of the GPU time, but Apple's scaler's picture rather than the game's.
 
 ```mermaid
 flowchart LR
@@ -70,6 +70,7 @@ flowchart LR
 
 - **When to change it:** when the game falls short of its frame rate in busy scenes because of GPU time: Donkey Kong Bananza's upscaler is the largest single piece of a heavy frame on an M1 (3.5-5 ms of about 24 in handheld mode). Compare the look side by side before keeping it.
 - **Cost:** none in GPU time (it saves 2.5-4 ms a frame in that case); the picture is Apple's scaler's rather than the game's. Frames where the game renders at its output size are not upscaled and keep the game's shader either way. Devices without MetalFX keep the game's upscaler.
+- **Ocarina of Time:** its network also smooths edges as it scales, which MetalFX's spatial scaler does not: with MetalFX the grass shimmers, hard blade edges catching the light differently every frame. Game's own costs about 1.5-2 ms of GPU time a frame more on an M4 Pro.
 - **Not the same as [Upscaling](#upscaling):** that one scales the finished picture, HUD included, to the screen; this one replaces the game's own step inside the frame. Both can be on.
 
 ### Game language
