@@ -75,21 +75,17 @@ def frag_z(msl):
         else: return m.group(0)
         return f'bool {m.group(1)} = {a} {op} {b};'
     return re.sub(r'bool (_\d+) = (_\d+) (>=|<=|>|<) (_\d+);', one, msl)
-# Keep SPIRV-Cross's mulhi workaround, but allow constant folding for scalar uint products with a non-power-of-two literal multiplier.
-# Power-of-two high-word products have a separate shift identity; vector, signed and dynamic products retain the original helper.
-def extended_multiply_msl(msl):
-    if 'spvMulExtended<' not in msl or 'using namespace metal;\n' not in msl: return msl
-    helper = r'template<typename T, typename U, typename V>\s*\[\[clang::optnone\]\] T spvMulExtended\(V l, V r\)\s*\{\s*return T\{U\(l \* r\), U\(mulhi\(l, r\)\)\};\s*\}'
-    if len(re.findall(helper, msl)) != 1 or len(re.findall(r'\bT spvMulExtended\(', msl)) != 1: return msl
-    call = r'\bspvMulExtended<(\w+), uint>\(((?:uint|as_type<uint>)\([^()]*\)), ([0-9]+)u\)'
-    def replace(m):
-        n = int(m[3])
-        if n <= 1 or n > 0xffffffff or n & (n - 1) == 0: return m[0]
-        return f'dmsh_mul_extended_uint<{m[1]}>({m[2]}, {m[3]}u)'
-    changed = re.sub(call, replace, msl)
-    if changed == msl: return msl
-    body = 'template<typename T> static inline __attribute__((always_inline)) T dmsh_mul_extended_uint(uint l, uint r) { ulong p = ulong(l) * ulong(r); return T{uint(p), uint(p >> 32)}; }\n'
-    return changed.replace('using namespace metal;\n', 'using namespace metal;\n' + body, 1)
+# spirv-cross writes OpUMulExtended / OpSMulExtended as calls of an optnone template, spvMulExtended, as Metal's compiler may fail on an inlined mulhi (spirv_msl.cpp,
+# SPVFuncImplMulExtended). The barrier keeps every product a call that is never folded: Switch 2 shaders divide by constants through the high word of a product (Ocarina of Time
+# has 348,587 such calls, all scalar uint by a literal, 98% by a power of two), and its NDVE title movie ran 6.9% faster on an M1 Pro with its 5,679 others inline (PR #1741).
+# Scalar operands get overloads that take the halves of the 64-bit product, with no mulhi; overload resolution prefers them to the template, and vectors keep the template.
+def mul_extended(msl):
+    helper = re.compile(r'template<typename T, typename U, typename V>\s*\[\[clang::optnone\]\] T spvMulExtended\(V l, V r\)\s*\{\s*return T\{U\(l \* r\), U\(mulhi\(l, r\)\)\};\s*\}\n')
+    found = list(helper.finditer(msl)) if 'spvMulExtended' in msl else []
+    if len(found) != 1 or 'spvMulExtended(uint l, uint r)' in msl: return msl
+    scalar = ''.join(f'template<typename T, typename U> static inline __attribute__((always_inline)) T spvMulExtended({t} l, {t} r) {{ {w} p = {w}(l) * {w}(r); return T{{U(p), U(p >> 32)}}; }}\n'
+                     for t, w in (('uint', 'ulong'), ('int', 'long')))
+    return msl[:found[0].end()] + scalar + msl[found[0].end():]
 
 # Ampere HMMA.16816 with an f16 accumulator (agl's upscaler networks, the NDVE video networks) reaches the MSL as calls of dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1,
 # flags, A's LDSM address, A0..A3's offsets, A's row stride, out D1) → D0, the subgroup's 256-word block of the scratch shared memory as the last argument (InstEmitAmpereTensor.AHmma,
@@ -1614,7 +1610,7 @@ def finish(key, w, j, c1):
     except ValueError as e: return 'image atomic MSL failed', str(e), None
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
     if j['stage'] == 'ps': src = frag_z(src)   # position.z against the depth the same surface stored (see frag_z)
-    src = extended_multiply_msl(src)   # exact scalar products without the unoptimized mulhi wrapper
+    src = mul_extended(src)   # scalar extended products without the optnone wrapper (see mul_extended)
     try: src = gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)
     except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
     try: src = hmma_msl(src)   # Ampere HMMA through simdgroup_matrix (see hmma_msl)
