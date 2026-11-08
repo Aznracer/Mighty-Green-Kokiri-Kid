@@ -4379,45 +4379,94 @@ static nvn_hmap g_cpu_tex = {.klen = 8}, g_cpu_tex_retired = {.klen = 8};   // s
 static nvn_hmap g_cpu_unc = {.klen = 8};   // serial → pool: the uncompressed 2D textures tex_cpu_content took from their storage, which leave the CPU-written set at their pool's first GPU write
 static _Atomic int g_pool_gpuw_new;   // the GPU has written storage it had not written before since cpu_unc_drop last looked
 static nvn_hmap g_cpu_unc_lo = {.klen = 8}, g_cpu_unc_sz = {.klen = 8};   // serial → storage start and size of those textures, under g_cpu_tex_mu
-// The storage ranges the GPU has written (render targets, clears, copy destinations, image stores), sorted and merged, until their pool goes. A mark on the whole pool was too coarse for one
-// that holds both kinds: The Legend of Zelda: Ocarina of Time keeps its terrain height tiles (260x260 R32F, written by the CPU with no flush) in a 202 MB pool with textures the GPU writes,
-// so the pool counted as GPU-written, every height tile stayed zeros and each terrain patch was a flat plane far below the player: the sky showed wherever only the terrain covers the ground.
-// An uncompressed texture is kept from its storage only where its own range overlaps one the GPU wrote (aCidcOde, GitHub issue #1326)
-static struct gpuw_rng { uint64_t lo, hi; } *g_gpuw; static uint32_t g_ngpuw, g_gpuw_cap; static pthread_mutex_t g_gpuw_mu = PTHREAD_MUTEX_INITIALIZER;
-static int gpuw_overlaps(uint64_t lo, uint64_t hi) {
-    pthread_mutex_lock(&g_gpuw_mu);
-    uint32_t a = 0, b = g_ngpuw; while (a < b) { uint32_t m = (a + b) / 2; if (g_gpuw[m].hi <= lo) a = m + 1; else b = m; }
-    int r = a < g_ngpuw && g_gpuw[a].lo < hi;
-    pthread_mutex_unlock(&g_gpuw_mu);
+// The storage the GPU has written (render targets, clears, copy destinations, image stores), by span, until their pool goes. A mark on the whole pool was too coarse for one that holds
+// both kinds: The Legend of Zelda: Ocarina of Time keeps its terrain height tiles (260x260 R32F, written by the CPU with no flush) in a 202 MB pool with textures the GPU writes, so the pool
+// counted as GPU-written, every height tile stayed zeros and each terrain patch was a flat plane far below the player (aCidcOde, GitHub issue #1326). Spans that only grew were still too
+// coarse: the game reuses a tile slot whose normal map the GPU drew for a height or blend / hole map the CPU fills, and that storage stayed the GPU's until the pool went, so tiles streamed
+// in after a scene change came out as zeros: holes in the ground with the sky or fog below showing through, leaving the Deku Tree, until a reload (upstream e2b76d4e, PR #1604). So a span
+// keeps the dirty-page generation of its last GPU write (stamp) and has its whole pages write-protected, and a CPU write into it afterwards makes the storage the CPU's content again.
+// Only whole pages count: a span's first and last pages are shared with whatever lies beside it. Spans do not merge: a GPU write over part of one cuts it, and the parts outside keep their
+// own stamp. A span without a tracked range (whole-pool marks, storage the CPU cannot write) stays the GPU's. GPU writes are stamped when recorded, so a command buffer submitted again
+// does not stamp its writes again (open: storage the CPU wrote since counts as the CPU's until the next recorded GPU write there)
+typedef struct { uint64_t lo, hi, stamp, seen; const void *rg; int taken; } gws_span;   // seen: dirty generation at the last look; rg: the dirty-page range of its whole pages; taken: a texture was taken from it since its stamp
+static gws_span *g_gws; static uint32_t g_ngws, g_cgws; static pthread_mutex_t g_gws_mu = PTHREAD_MUTEX_INITIALIZER;
+static void whole_pages(uint64_t lo, uint64_t hi, uint64_t *a, uint64_t *e) { uint64_t pg = (uint64_t)getpagesize(); *a = (lo + pg - 1) & ~(pg - 1); *e = hi & ~(pg - 1); }
+static uint32_t gws_find(uint64_t a) { uint32_t l = 0, h = g_ngws; while (l < h) { uint32_t m = (l + h) / 2; if (g_gws[m].hi <= a) l = m + 1; else h = m; } return l; }   // the first span that ends after a; g_gws_mu held
+static void gws_stamp(gws_span *s, int track) {   // the stamp first, then the protection (nvn_dirty_now); g_gws_mu held
+    uint64_t a, e; whole_pages(s->lo, s->hi, &a, &e);
+    s->stamp = s->seen = nvn_dirty_now();
+    s->rg = track && e > a ? nvn_dirty_span((const void *)(uintptr_t)a, e - a) : NULL;
+    if (s->rg) nvn_dirty_protect((const void *)(uintptr_t)a, e - a);
+}
+static int gws_cpu_since(gws_span *s, uint64_t lo, uint64_t hi) {   // the CPU wrote a whole page of [lo, hi) within the span after its stamp; g_gws_mu held
+    uint64_t a, e; whole_pages(MAX(lo, s->lo), MIN(hi, s->hi), &a, &e);
+    if (e <= a || !s->rg) return 0;
+    return nvn_dirty_since_cached(&s->rg, (const void *)(uintptr_t)a, e - a, s->stamp);
+}
+static int gws_rewritten(gws_span *s) {   // the GPU writes a span again: a CPU write since its stamp is overwritten now. 1: a texture taken from it must become a GPU texture again; g_gws_mu held
+    uint64_t now = nvn_dirty_now();
+    if (now == s->seen) return 0;
+    s->seen = now;
+    if (!gws_cpu_since(s, s->lo, s->hi)) return 0;
+    gws_stamp(s, 1);
+    if (s->taken) { s->taken = 0; return 1; }
+    return 0;
+}
+static void gws_room(uint32_t more) {   // g_gws_mu held
+    if (g_ngws + more <= g_cgws) return;
+    uint32_t cap = g_cgws ? 2 * g_cgws : 256; while (cap < g_ngws + more) cap *= 2;
+    g_gws = realloc_or_die(g_gws, cap * sizeof *g_gws, "the GPU-written spans"); g_cgws = cap;
+}
+static void gws_set(uint64_t lo, uint64_t hi, int track) {   // [lo, hi) becomes one span, stamped now; the spans it overlaps keep their parts outside it, with their own stamps; g_gws_mu held
+    uint32_t i = gws_find(lo), j = i;
+    while (j < g_ngws && g_gws[j].lo < hi) j++;   // spans i .. j-1 overlap [lo, hi)
+    int nl = i < j && g_gws[i].lo < lo, nr = i < j && g_gws[j - 1].hi > hi;
+    gws_span left = nl ? g_gws[i] : (gws_span){0}, right = nr ? g_gws[j - 1] : (gws_span){0};
+    left.hi = lo; right.lo = hi;
+    uint32_t n = (uint32_t)nl + 1 + (uint32_t)nr;
+    gws_room(n);
+    memmove(g_gws + i + n, g_gws + j, (g_ngws - j) * sizeof *g_gws);
+    g_ngws = g_ngws - (j - i) + n;
+    if (nl) g_gws[i++] = left;
+    g_gws[i] = (gws_span){.lo = lo, .hi = hi}; gws_stamp(&g_gws[i], track);
+    if (nr) g_gws[i + 1] = right;
+}
+static int gpuw_add(uint64_t lo, uint64_t hi, int track) {   // 1 when a texture taken from its storage may now lie over storage the GPU writes (cpu_unc_drop looks again)
+    if (hi <= lo) return 0;
+    pthread_mutex_lock(&g_gws_mu);
+    uint32_t i = gws_find(lo); int r = 1;
+    if (track && i < g_ngws && g_gws[i].lo == lo && g_gws[i].hi == hi && g_gws[i].rg) r = gws_rewritten(&g_gws[i]);
+    else gws_set(lo, hi, track);
+    pthread_mutex_unlock(&g_gws_mu);
     return r;
 }
-static void gpuw_room(void) { if (g_ngpuw < g_gpuw_cap) return; g_gpuw_cap = g_gpuw_cap ? g_gpuw_cap * 2 : 256; g_gpuw = realloc_or_die(g_gpuw, g_gpuw_cap * sizeof *g_gpuw, "the GPU-written ranges"); }
-static int gpuw_add(uint64_t lo, uint64_t hi) {   // 1 when it covers storage that was not covered before
-    if (hi <= lo) return 0;
-    pthread_mutex_lock(&g_gpuw_mu);
-    uint32_t a = 0, b = g_ngpuw; while (a < b) { uint32_t m = (a + b) / 2; if (g_gpuw[m].hi < lo) a = m + 1; else b = m; }   // the first range that touches or follows lo
-    if (a < g_ngpuw && g_gpuw[a].lo <= lo && g_gpuw[a].hi >= hi) { pthread_mutex_unlock(&g_gpuw_mu); return 0; }
-    b = a; while (b < g_ngpuw && g_gpuw[b].lo <= hi) { if (g_gpuw[b].lo < lo) lo = g_gpuw[b].lo; if (g_gpuw[b].hi > hi) hi = g_gpuw[b].hi; b++; }
-    if (b == a) { gpuw_room(); memmove(g_gpuw + a + 1, g_gpuw + a, (g_ngpuw - a) * sizeof *g_gpuw); g_ngpuw++; }
-    else if (b > a + 1) { memmove(g_gpuw + a + 1, g_gpuw + b, (g_ngpuw - b) * sizeof *g_gpuw); g_ngpuw -= b - a - 1; }
-    g_gpuw[a].lo = lo; g_gpuw[a].hi = hi;
-    pthread_mutex_unlock(&g_gpuw_mu);
-    return 1;
+static int gpuw_overlaps(uint64_t lo, uint64_t hi) {   // the GPU wrote some of [lo, hi) and the CPU has not rewritten it since: the storage is not the content
+    int owned = 0;
+    pthread_mutex_lock(&g_gws_mu);
+    for (uint32_t i = gws_find(lo); i < g_ngws && g_gws[i].lo < hi && !owned; i++) owned = !gws_cpu_since(&g_gws[i], lo, hi);
+    pthread_mutex_unlock(&g_gws_mu);
+    return owned;
 }
-// A pool's storage goes with it: a pool made later at those addresses starts unwritten, as its gpu_written does. Ranges merge across neighbouring pools, so one may be cut in two
+static void gpuw_take(uint64_t lo, uint64_t hi) {   // a texture over [lo, hi) is taken from its storage: the next GPU write there makes it a GPU texture again (gws_rewritten, gws_set)
+    pthread_mutex_lock(&g_gws_mu);
+    for (uint32_t i = gws_find(lo); i < g_ngws && g_gws[i].lo < hi; i++) g_gws[i].taken = 1;
+    pthread_mutex_unlock(&g_gws_mu);
+}
+// A pool's storage goes with it: a pool made later at those addresses starts unwritten, as its gpu_written does. A span that reaches past the pool is cut
 static void gpuw_drop(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
-    pthread_mutex_lock(&g_gpuw_mu);
-    uint32_t a = 0, b = g_ngpuw; while (a < b) { uint32_t m = (a + b) / 2; if (g_gpuw[m].hi <= lo) a = m + 1; else b = m; }
-    for (b = a; b < g_ngpuw && g_gpuw[b].lo < hi; b++) {}
+    pthread_mutex_lock(&g_gws_mu);
+    uint32_t a = gws_find(lo), b = a;
+    while (b < g_ngws && g_gws[b].lo < hi) b++;
     if (b > a) {
-        struct gpuw_rng left = {g_gpuw[a].lo, lo}, right = {hi, g_gpuw[b - 1].hi}; uint32_t keep = (left.lo < left.hi) + (right.lo < right.hi);
-        gpuw_room();
-        memmove(g_gpuw + a + keep, g_gpuw + b, (g_ngpuw - b) * sizeof *g_gpuw); g_ngpuw = g_ngpuw - (b - a) + keep;
-        if (left.lo < left.hi) g_gpuw[a++] = left;
-        if (right.lo < right.hi) g_gpuw[a] = right;
+        gws_span left = g_gws[a], right = g_gws[b - 1]; left.hi = lo; right.lo = hi;
+        uint32_t keep = (left.lo < left.hi) + (right.lo < right.hi);
+        gws_room(keep);
+        memmove(g_gws + a + keep, g_gws + b, (g_ngws - b) * sizeof *g_gws); g_ngws = g_ngws - (b - a) + keep;
+        if (left.lo < left.hi) g_gws[a++] = left;
+        if (right.lo < right.hi) g_gws[a] = right;
     }
-    pthread_mutex_unlock(&g_gpuw_mu);
+    pthread_mutex_unlock(&g_gws_mu);
 }
 static void cpu_tex_drop_pool(const void *pool) {
     pthread_mutex_lock(&g_cpu_tex_mu);
@@ -4511,7 +4560,7 @@ static int tex_cpu_content(const tex_t *t) {
     int unc = tex_unc(t);
     if (!on || !tex_storage_ok(t, unc)) return 0;
     if ((unc && tex_storage_gpuw(t)) || !mem_any(t->mem, t->L.size)) return 0;   // not over storage the GPU writes
-    if (unc) cpu_unc_take(t);
+    if (unc) { cpu_unc_take(t); gpuw_take((uint64_t)(uintptr_t)t->mem, (uint64_t)(uintptr_t)t->mem + t->L.size); }
     static uint64_t n[2]; if (n[unc]++ < 4) MLOG("texture written by the CPU before its first use ser=%llu %ux%ux%u format %#x%s pool flags %#x: uploaded from its storage, re-uploaded when it changes (%llu so far)",
                                          (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, unc ? " (uncompressed, storage the GPU has not written)" : "", t->pool->flags, (unsigned long long)n[unc]);
     return 1;
@@ -4519,8 +4568,9 @@ static int tex_cpu_content(const tex_t *t) {
 void mtl_tex_gpu_written(const void *pool, const void *mem, uint64_t size) {
     pool_t *p = (pool_t *)pool;
     if (!p) return;
-    if (!mem || !size) { mem = p->mem; size = p->size; }
-    int fresh = mem && size && gpuw_add((uint64_t)(uintptr_t)mem, (uint64_t)(uintptr_t)mem + size);
+    int whole = !mem || !size;   // the whole pool: no texture's storage, so not tracked (the GPU's until the pool goes)
+    if (whole) { mem = p->mem; size = p->size; }
+    int fresh = mem && size && gpuw_add((uint64_t)(uintptr_t)mem, (uint64_t)(uintptr_t)mem + size, !whole);
     if (!atomic_load_explicit(&p->gpu_written, memory_order_relaxed)) { atomic_store(&p->gpu_written, 1); fresh = 1; }
     if (fresh) atomic_store(&g_pool_gpuw_new, 1);
 }
@@ -4538,7 +4588,7 @@ int mtl_tex_cpu_rewritten(const tex_t *t) {
         if (unc && tex_storage_gpuw(t)) return MTL_REWRITE_GPU_NOW;
         mtl_tex_cpu_written(t);
         if (unc) {
-            cpu_unc_take(t);
+            cpu_unc_take(t); gpuw_take((uint64_t)(uintptr_t)t->mem, (uint64_t)(uintptr_t)t->mem + t->L.size);
         }
         return MTL_REWRITE_UPLOADED;
     }
