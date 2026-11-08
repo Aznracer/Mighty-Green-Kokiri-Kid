@@ -20,6 +20,8 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <fcntl.h>
+#include <copyfile.h>
+#include <sys/mount.h>
 #include <signal.h>
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
@@ -691,8 +693,50 @@ static void udc_selftest(void) {
 // The bundled pipeline archive read ahead (DM_PSO_READAHEAD=0 turns it off): Metal reads the whole archive when it opens it, and arch_open maps it, so on an external drive the
 // open faulted it in a page at a time: Ocarina of Time's 4.3 GB took 9-16 s from a USB disk behind a grey window (read whole into memory it took 6.5 s, but stayed in the footprint).
 // A thread started with the device reads the file in 16 MB pieces while the game boots, so the open finds its pages in the file cache, which the system can take back
+// DM_PSO_MAPPED=copy (the Mac launcher's Archive on an external drive, Copy to this Mac): the bundled archive on another volume than the home folder (the app on a USB drive) is copied
+// once to ~/Library/Caches/nxnative/<game>/ and mapped from there. Mapped from the drive, a lookup whose pages the system dropped waits on the drive (Hyrule Castle Town: 1.4 ms a lookup,
+// hitches of 50-80 ms); read whole into memory (DM_PSO_MAPPED=0) it costs about its size: 4.3 GB on a 24 GB Mac took Ocarina of Time to 19.4 GB resident and into swap, and the GPU
+// waited 25-37 ms a frame entering the town. On the internal disk its pages are clean and cheap to read again. The copy's name holds the archive's size and date, so a rebuilt app
+// copies again and the old copy goes. Not enough room (its size and 8 GB to spare): mapped from where it is
+static int pso_copy_mode(void) { const char *e = getenv("DM_PSO_MAPPED"); return e && !strcmp(e, "copy"); }
+static void bundle_local_make(const char *src, char *out, size_t cap) {
+    struct stat ss, hs; const char *home = getenv("HOME");
+    if (stat(src, &ss) || !home || stat(home, &hs)) return;
+    if (ss.st_dev == hs.st_dev) { MLOG("pipeline archive bundled with the app: on the home folder's volume, mapped where it is (DM_PSO_MAPPED=copy)"); return; }
+    const char *root = getenv("DM_ROOT"), *game = root ? strrchr(root, '/') : NULL; game = game && game[1] ? game + 1 : "pso";
+    char dir[PATH_MAX]; snprintf(dir, sizeof dir, "%s/Library/Caches/nxnative/%s", home, game);
+    [NSFileManager.defaultManager createDirectoryAtPath:@(dir) withIntermediateDirectories:YES attributes:nil error:nil];
+    const char *base = strrchr(src, '/'); base = base ? base + 1 : src;
+    const char *dot = strrchr(base, '.'); int stem = dot ? (int)(dot - base) : (int)strlen(base);
+    char dst[PATH_MAX]; snprintf(dst, sizeof dst, "%s/%.*s-%lld-%ld.mtl4a", dir, stem, base, (long long)ss.st_size, (long)ss.st_mtimespec.tv_sec);
+    char pre[PATH_MAX]; snprintf(pre, sizeof pre, "%.*s-", stem, base);
+    for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(dir) error:nil]) {   // older copies of this archive, and a copy a stopped run left unfinished
+        NSString *full = [@(dir) stringByAppendingPathComponent:f];
+        if ([f hasPrefix:@(pre)] && strcmp(full.fileSystemRepresentation, dst)) { unlink(full.fileSystemRepresentation); MLOG("pipeline archive copy: %s removed (another build's)", f.UTF8String); }
+    }
+    struct stat ds;
+    if (!stat(dst, &ds) && ds.st_size == ss.st_size) { snprintf(out, cap, "%s", dst); return; }
+    struct statfs fs;
+    if (statfs(dir, &fs) || (uint64_t)fs.f_bavail * fs.f_bsize < (uint64_t)ss.st_size + (8ull << 30)) {
+        MLOG("pipeline archive copy: not enough room in %s for %.1f GB and 8 GB to spare: mapped from the drive", dir, ss.st_size / 1073741824.0); return; }
+    char tmp[PATH_MAX]; snprintf(tmp, sizeof tmp, "%s.part", dst); unlink(tmp);
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (copyfile(src, tmp, NULL, COPYFILE_DATA) || rename(tmp, dst)) { MLOG("[RED] pipeline archive copy to %s failed (%s): mapped from the drive", dst, strerror(errno)); unlink(tmp); return; }
+    snprintf(out, cap, "%s", dst);
+    MLOG("pipeline archive bundled with the app: copied to %s, %.1f MB in %.1f s (once for this build of the app)", dst, ss.st_size / 1048576.0, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
+}
+static pthread_mutex_t g_bl_mu = PTHREAD_MUTEX_INITIALIZER; static int g_bl_done; static char g_bl_path[PATH_MAX];
+static const char *bundle_local(const char *src) {   // the copy on the internal disk to open instead (DM_PSO_MAPPED=copy), or NULL; the first caller makes it, the others wait
+    if (!pso_copy_mode() || !src) return NULL;
+    pthread_mutex_lock(&g_bl_mu);
+    if (!g_bl_done) { g_bl_done = 1; bundle_local_make(src, g_bl_path, sizeof g_bl_path); }
+    pthread_mutex_unlock(&g_bl_mu);
+    return *g_bl_path ? g_bl_path : NULL;
+}
 static void *arch_readahead_run(void *arg) {
-    char *path = arg; uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), n = 0;
+    char *path = arg;
+    { const char *l = bundle_local(path); if (l) { free(path); path = strdup(l); if (!path) return NULL; } }   // the copy is what gets opened (made here, early, when it is not there yet)
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), n = 0;
     int fd = open(path, O_RDONLY);
     if (fd >= 0) {
         fcntl(fd, F_RDAHEAD, 1);
@@ -8771,6 +8815,7 @@ static void pso_bundle_open(NSMutableArray<id<MTL4Archive>> *archp) {
              have.count ? [have componentsJoinedByString:@", "].UTF8String : "none");
         return;
     }
+    { const char *l = bundle_local(p.fileSystemRepresentation); if (l) p = @(l); }   // DM_PSO_MAPPED=copy: the copy on the internal disk (its folder stays the app's: prebuilt.tsv)
     uint64_t t0 = bp_now(); NSError *ae = nil;
     if (!arch_file_ok(p)) { MLOG("[RED] pipeline archive bundled with the app: %s is not a pipeline archive: the bases are built on the device", p.UTF8String); return; }
     id<MTL4Archive> a = arch_open(p, &ae);
