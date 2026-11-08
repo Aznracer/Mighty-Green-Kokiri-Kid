@@ -46,7 +46,7 @@ if git rev-parse -q --verify refs/oot_watch/oot2-up >/dev/null; then
   has 1730 GMEM_RUN_MAX           "contiguous memory-pool runs merged"
   has 1731 DM_NVN_COPY_ABSORB     "texture upgrades, BC targets, retired descriptors"
   has 1752 RawResolveRange        "raw loads resolve their pool once (mesh shaders faster)"
-  has 04419bc2 "read one word at a time" "upstream: vector raw loads, occlusion, dynamic resolution (GPU 16.3 -> 12.6 ms)"
+  has 04419bc2 GenerateRawVectorLoad "upstream: vector raw loads, occlusion, dynamic resolution (GPU 16.3 -> 12.6 ms)"
   has 1833 shader_raw_direct      "raw memory at Metal GPU addresses (Ocarina)"
 fi
 
