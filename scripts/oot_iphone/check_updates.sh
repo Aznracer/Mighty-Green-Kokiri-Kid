@@ -45,6 +45,7 @@ if git rev-parse -q --verify refs/oot_watch/oot2-up >/dev/null; then
   has 1721 g_treg_sparse_synced   "texture bindings after sparse mapping changes"
   has 1730 GMEM_RUN_MAX           "contiguous memory-pool runs merged"
   has 1731 DM_NVN_COPY_ABSORB     "texture upgrades, BC targets, retired descriptors"
+  has 1752 RawResolveRange        "raw loads resolve their pool once (mesh shaders faster)"
 fi
 
 echo; echo "=== seedds/nxnative pull requests"
