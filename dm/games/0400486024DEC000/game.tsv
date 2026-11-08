@@ -61,3 +61,8 @@ tex_dirty_upload	on
 # Touch controls from cheemu21/kid-with-sword-remake: the Native layout (a mobile game's layout in very transparent glass) in the Forest colours; DM_PAD_THEME=0 in env.txt gives the Classic colours
 pad_layout	native
 pad_theme	forest
+# cheemu21 V17, a steady 30 fps (frame generation): present snapshots, display-link frame latency 2 at the 30 fps cap (frame buffering: a 34-38 ms frame is absorbed),
+# and no payback step (a late frame's lost time is let go instead of a step of 3 vsyncs shown for 2, a half-frame jump)
+present_snap	on
+link_latency30	2
+fps_payback	off
