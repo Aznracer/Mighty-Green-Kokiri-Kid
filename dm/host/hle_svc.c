@@ -450,6 +450,9 @@ void dm_guest_pool_anon(void *mem, size_t size) {
     if (!g_gf_n || !mem || !size) return;
     static int on = -1; if (on < 0) { const char *e = getenv("DM_POOL_ANON"); on = !e || !*e || atoi(e); if (!on) LOG("[mem] memory pools stay in the guest files (DM_POOL_ANON=0)"); }
     if (!on) return;
+    static long long max_mb = -2; if (max_mb == -2) { const char *m = getenv("DM_POOL_ANON_MAX_MB"); max_mb = m && *m ? atoll(m) : -1;
+        if (max_mb >= 0) LOG("[mem] memory pools larger than %lld MB stay in the guest files (DM_POOL_ANON_MAX_MB)", max_mb); }
+    if (max_mb >= 0 && (long long)(size >> 20) > max_mb) { LOG("[mem] memory pool %p+%llu MB stays in the guest files (DM_POOL_ANON_MAX_MB=%lld)", mem, (unsigned long long)(size >> 20), max_mb); return; }
     size_t pg = (size_t)getpagesize(); uintptr_t lo = (uintptr_t)mem & ~(pg - 1), hi = ((uintptr_t)mem + size + pg - 1) & ~(pg - 1);
     if (lo < (uintptr_t)g_as || hi > (uintptr_t)g_as + g_reserve) return;   // not guest memory
     pthread_mutex_lock(&g_anon_mu);
