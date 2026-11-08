@@ -1172,26 +1172,48 @@ static int g_rc_skip;   // a render-enable block evaluated false is active
 // Neither table may drop an entry: a timestamp report forgotten leaves the condition reading the 1 the CPU wrote, so the clear runs again. They held 256 reports a submission of both kinds, and Splatoon Raiders' 285 ink
 // queries a frame came first: every conditional clear after them ran, and the lit scene was wiped before the composite read it (a black screen with only the dialogue on it). Now only timestamps are kept per submission, and both tables grow
 static uint64_t *g_rc_pend; static uint32_t g_rc_npend, g_rc_pcap;   // timestamp reports replayed in this submission: their counter is 0, though memory does not show it yet
-static uint64_t *g_rc_occ; static uint32_t g_rc_ocap, g_rc_on;   // addresses ever written by a non-timestamp report (open addressing, a power of two): conditions on them keep drawing
-static int rc_occ_has(uint64_t a) { if (!g_rc_ocap) return 0; for (uint32_t i = (uint32_t)(a >> 4) & (g_rc_ocap - 1);; i = (i + 1) & (g_rc_ocap - 1)) { if (g_rc_occ[i] == a) return 1; if (!g_rc_occ[i]) return 0; } }
-static void rc_occ_add(uint64_t a) {
-    if (rc_occ_has(a)) return;
-    if ((g_rc_on + 1) * 2 > g_rc_ocap) { uint32_t oc = g_rc_ocap, nc = oc ? oc * 2 : 4096; uint64_t *old = g_rc_occ, *t = calloc(nc, 8); if (!t) MDIE("no memory for the query report table");
-        for (uint32_t k = 0; k < oc; k++) if (old[k]) { uint32_t i = (uint32_t)(old[k] >> 4) & (nc - 1); while (t[i]) i = (i + 1) & (nc - 1); t[i] = old[k]; }
-        g_rc_occ = t; g_rc_ocap = nc; free(old); }
-    uint32_t i = (uint32_t)(a >> 4) & (g_rc_ocap - 1); while (g_rc_occ[i]) i = (i + 1) & (g_rc_ocap - 1);
-    g_rc_occ[i] = a; g_rc_on++;
+// Addresses ever written by a non-timestamp report (open addressing, a power of two). A samples-passed report's result is written by post_run when its submission completes:
+// until then (pending, raised at replay and lowered once written) a condition on it keeps drawing; once every such report has landed, memory holds the result and the
+// condition is evaluated from it, as the GPU would at that point in the queue (from upstream 04419bc25: Ocarina of Time reports its queries a submission ahead of the conditional
+// draws, 42% of them false on its Kokiri Forest route, which the host drew all the same). Other counter kinds only get a placeholder from the host and keep drawing for good
+// (sticky). The table is shared with the completion thread (rc_landed), under g_rc_lk; the result is written before the count is lowered, so a read after seeing 0 sees it.
+// DM_NVN_RC_LANDED=0: every condition on such an address keeps drawing, as before
+typedef struct { uint64_t addr; uint32_t pending; uint8_t sticky; } rc_occ_ent;
+static rc_occ_ent *g_rc_occ; static uint32_t g_rc_ocap, g_rc_on; static os_unfair_lock g_rc_lk = OS_UNFAIR_LOCK_INIT;
+static uint64_t g_rc_stat[3];   // conditions evaluated since the last report: drawn, not drawn, drawn as unknown (rc_report_line)
+static int rc_landed_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RC_LANDED"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_RC_LANDED=0: conditions on samples-passed reports always draw"); } return v; }
+static rc_occ_ent *rc_occ_find(uint64_t a) {   // g_rc_lk held
+    if (!g_rc_ocap) return NULL;
+    for (uint32_t i = (uint32_t)(a >> 4) & (g_rc_ocap - 1);; i = (i + 1) & (g_rc_ocap - 1)) { if (g_rc_occ[i].addr == a) return &g_rc_occ[i]; if (!g_rc_occ[i].addr) return NULL; }
 }
-static void rc_note(uint64_t a, int kind) {
-    if (kind == 2) { rc_occ_add(a); return; }   // rc_value asks this table first
+static rc_occ_ent *rc_occ_add(uint64_t a) {   // g_rc_lk held
+    rc_occ_ent *e = rc_occ_find(a); if (e) return e;
+    if ((g_rc_on + 1) * 2 > g_rc_ocap) { uint32_t oc = g_rc_ocap, nc = oc ? oc * 2 : 4096; rc_occ_ent *old = g_rc_occ, *t = calloc(nc, sizeof *t); if (!t) MDIE("no memory for the query report table");
+        for (uint32_t k = 0; k < oc; k++) if (old[k].addr) { uint32_t i = (uint32_t)(old[k].addr >> 4) & (nc - 1); while (t[i].addr) i = (i + 1) & (nc - 1); t[i] = old[k]; }
+        g_rc_occ = t; g_rc_ocap = nc; free(old); }
+    uint32_t i = (uint32_t)(a >> 4) & (g_rc_ocap - 1); while (g_rc_occ[i].addr) i = (i + 1) & (g_rc_ocap - 1);
+    g_rc_occ[i].addr = a; g_rc_on++; return &g_rc_occ[i];
+}
+static void rc_note(uint64_t a, int kind) {   // kind 1: a timestamp report; 2: a samples-passed report, whose result lands later (rc_landed); 3: another counter (a placeholder)
+    if (kind >= 2) { os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_add(a); if (kind == 2 && rc_landed_on()) e->pending++; else e->sticky = 1; os_unfair_lock_unlock(&g_rc_lk); return; }   // rc_value asks this table first
     for (uint32_t i = 0; i < g_rc_npend; i++) if (g_rc_pend[i] == a) return;
     if (g_rc_npend == g_rc_pcap) { uint32_t nc = g_rc_pcap ? g_rc_pcap * 2 : 256; uint64_t *t = realloc(g_rc_pend, (size_t)nc * 8); if (!t) MDIE("no memory for the timestamp report table"); g_rc_pend = t; g_rc_pcap = nc; }
     g_rc_pend[g_rc_npend++] = a;
 }
+static void rc_landed(uint64_t a) {   // post_run: a samples-passed result was written to a
+    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); if (e && e->pending) e->pending--; os_unfair_lock_unlock(&g_rc_lk);
+}
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at encode time
-    if (rc_occ_has(a)) return 0;
+    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); int unknown = e && (e->sticky || e->pending); os_unfair_lock_unlock(&g_rc_lk);
+    if (unknown) return 0;
     for (uint32_t i = g_rc_npend; i-- > 0;) if (g_rc_pend[i] == a) { *v = 0; return 1; }
     *v = *(const volatile uint64_t *)a; return 1;
+}
+static void rc_report_line(uint64_t frame) {
+    uint64_t n = g_rc_stat[0] + g_rc_stat[1] + g_rc_stat[2]; if (!n) return;
+    MLOG("[nvn] conditional rendering up to frame %llu: %llu conditions, %llu drawn, %llu not drawn, %llu drawn with their result not landed yet", (unsigned long long)frame, (unsigned long long)n,
+         (unsigned long long)g_rc_stat[0], (unsigned long long)g_rc_stat[1], (unsigned long long)g_rc_stat[2]);
+    g_rc_stat[0] = g_rc_stat[1] = g_rc_stat[2] = 0;
 }
 // ---------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------
 // NVN semantics: samples passed is a cumulative counter on the queue - ResetCounter zeroes it, every draw afterwards adds to it, and ReportCounter writes out the cumulative value at that moment (+ timestamp) when the GPU completes.
@@ -2495,6 +2517,7 @@ static void post_run(post_rec *record, uint64_t c0, uint64_t c1) {
                 free(samples);
                 uint64_t report[2] = {sum, shared_time ? submit_clock_ticks(clock) : gpu_ticks()};
                 memcpy((void *)ops[i].addr, report, sizeof report);
+                if (DM_GAME_RENDER_COND) rc_landed(ops[i].addr);   // after the write: a condition reading it once nothing is pending sees this result
             } else if (ops[i].kind == 4) {
                 mirror_rb_land(ops[i].vis);
             } else {
@@ -15146,14 +15169,14 @@ void mtl_exec(const uint8_t *p) {
                 PD("Y signal_event cmd=%p dst=%p mode=%u value=%u", p, val, m, v); mtl_sub_event(val, m, v); break; }
             case OP_REPORT_COUNTER: { uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8); g_cnt_report[t & 31]++;
                 PD("Q report type=%llu cmd=%p dst=%#llx", (unsigned long long)t, p, (unsigned long long)ad);
-                if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : 2);
+                if (DM_GAME_RENDER_COND) rc_note(ad, t == 0 || t == 0x10 ? 1 : t == NVN_COUNTER_TYPE_SAMPLES_PASSED ? 2 : 3);   // before the post below is queued: its landing lowers what this raises
                 if (t == NVN_COUNTER_TYPE_SAMPLES_PASSED) { post((post_op){3, NULL, 0, 0, ad, (uint32_t)t, vis_snapshot()}); g_vis_cur = -1; }
                 else mtl_sub_counter(ad, (uint32_t)t);
                 break; }
             case OP_RENDER_COND: { const p_render_cond *rc = a;   // recorded only with the profile key render_cond (hle_nvn.c)
                 if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); }
                 else { uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
-                    g_rc_skip = known && (rc->mode ? x == y : x != y);
+                    g_rc_skip = known && (rc->mode ? x == y : x != y); g_rc_stat[!known ? 2 : g_rc_skip]++;
                     PD("E %llu conditional render %s addr=%#llx values %llu / %llu%s%s", g_stat_pass, rc->mode ? "draw if not equal" : "draw if equal", (unsigned long long)rc->addr, (unsigned long long)x, (unsigned long long)y, known ? "" : " (unknown, drawn)", g_rc_skip ? " → not drawn" : ""); }
                 break; }
             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = NVN_SYNC_FENCE_GPU;   // the fence value this submission (segment) commits with
@@ -16584,6 +16607,7 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
         else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL: resuming the display link (frame %llu)", (unsigned long long)atomic_load(&g_cur_frame)); }
     }
     if (ws_on()) { static uint64_t f0; uint64_t f = atomic_load(&g_cur_frame); if (!f0) f0 = f; else if (f >= f0 + 300) { ws_report(f, f - f0); f0 = f; } }
+    if (DM_GAME_RENDER_COND) { static uint64_t rf0; uint64_t f = atomic_load(&g_cur_frame); if (!rf0) rf0 = f; else if (f >= rf0 + 300) { rc_report_line(f); rf0 = f; } }
     tex_t snap; uint64_t ss = 0; int slot = 0;
     if (t && !ev_val && mtl_snap_on()) {
         slot = (int)(atomic_load(&g_snap_next) % (uint64_t)g_snap_n);

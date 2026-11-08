@@ -63,7 +63,20 @@ int main(void){@autoreleasepool{
     CHECK("a timestamp report after 9000 query reports counts as 0",rc_value((uint64_t)&rec[0],&x)&&x==0);
     CHECK("a record with no report reads memory",rc_value((uint64_t)&rec[1],&x)&&x==0);
     CHECK("a query's report stays unknown",!rc_value(0x7100000000ull+8999*16,&x)&&!rc_value(0x7100000000ull,&x));
-    (void)q;for(uint64_t i=0;i<300;i++)rc_note((uint64_t)&big+0x1000+i,1);
+    // A samples-passed result, once written (rc_landed), is read from memory; another report makes it unknown until that one lands too; another counter kind stays unknown
+    q[0]=5;rc_note((uint64_t)&q[0],2);
+    CHECK("a query whose result has not landed is unknown",!rc_value((uint64_t)&q[0],&x));
+    rc_landed((uint64_t)&q[0]);
+    CHECK("landed: the result is read from memory",rc_value((uint64_t)&q[0],&x)&&x==5);
+    rc_note((uint64_t)&q[0],2);rc_note((uint64_t)&q[0],2);rc_landed((uint64_t)&q[0]);
+    CHECK("two reports, one landed: unknown",!rc_value((uint64_t)&q[0],&x));
+    rc_landed((uint64_t)&q[0]);
+    CHECK("both landed: known again",rc_value((uint64_t)&q[0],&x)&&x==5);
+    rc_landed((uint64_t)&q[0]);
+    CHECK("a landing with none pending changes nothing",rc_value((uint64_t)&q[0],&x)&&x==5);
+    q[2]=7;rc_note((uint64_t)&q[2],3);rc_landed((uint64_t)&q[2]);
+    CHECK("another counter kind stays unknown",!rc_value((uint64_t)&q[2],&x));
+    for(uint64_t i=0;i<300;i++)rc_note((uint64_t)&big+0x1000+i,1);
     CHECK("more timestamp reports than the first table held",rc_value((uint64_t)&big+0x1000,&x)&&x==0);
     g_rc_npend=0;}
     pend_reset();
