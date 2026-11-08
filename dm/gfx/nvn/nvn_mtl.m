@@ -1673,6 +1673,13 @@ static inline void m4_end(id e) {
 // other than a draw pass ran in between (compute, copies and uploads keep their full barriers). Only vertex-stage accesses of the previous pass's results without a barrier change order
 // DM_NVN_BARRIER=ab... alternates game and full with the DM_AB phases (measurement)
 static int sw_mode(const char *name, int dflt); static inline int sw_on(int m);
+// DM_NVN_BARRIER_HEAPS=1 (test): game barriers stay on while placement heaps share image storage (g_image_heap_n). Off, as since c484b13c: any heap gives every pass the full barriers.
+// The relaxed end barrier keeps fragment work ordered and carries resource-alias visibility (resource_vis); only the next pass's vertex work starts early
+static int barrier_heaps(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_BARRIER_HEAPS"); v = e && atoi(e) != 0; if (v) MLOG("DM_NVN_BARRIER_HEAPS=1: game barriers stay on while image heaps exist (test)"); } return v; }
+static void image_heap_note(int kind) {   // which kinds of placement heap a run makes (the game-barrier gate): 0 an atomic alias of a raw texture, 1 an image family, 2 a GPU-only pool's
+    static _Atomic int seen[3]; static const char *const what[3] = {"an atomic integer alias of a raw texture (tex_upgrade)", "an image resolution family (image_texture)", "a GPU-only pool's render targets (pool_heap_texture)"};
+    if (!atomic_exchange(&seen[kind], 1)) MLOG("image heaps: the first heap of %s", what[kind]);
+}
 static int barrier_game(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_BARRIER"); v = e && !strncmp(e, "ab", 2) ? sw_mode("DM_NVN_BARRIER", 0) : e ? !strcmp(e, "game") : DM_GAME_DRAW_BARRIERS_GAME; if (v == 1) MLOG("DM_NVN_BARRIER=game: draw passes are ordered by the game's own barriers (fragment work still has barriers between passes; vertex work may overlap the previous pass's fragments)"); } return sw_on(v); }
 void mtl_barrier_stats(uint64_t *skip, uint64_t *full) { *skip = g_bar_skip; *full = g_bar_full; }
 uint64_t mtl_cut_count(void);
@@ -1755,13 +1762,13 @@ static void gp_report(int n, gp_lab *lab, uint64_t frame) {   // the frame's las
 }
 static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescriptor *d) { g_cm_enc++; cm_enc_mark(2);   // the draw passes (rp_begin_ex); see barrier_game
     id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; cm_enc_mark(0);
-    if (g_last_end_relaxed && !g_game_barrier && barrier_game() && !g_image_heap_n) g_bar_skip++;
+    if (g_last_end_relaxed && !g_game_barrier && barrier_game() && (!g_image_heap_n || barrier_heaps())) g_bar_skip++;
     else { [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; g_bar_full++; }
     g_game_barrier = 0;
     [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e;
 }
 static inline void enc_r_end_pass(id e) {
-    if (!barrier_game() || g_image_heap_n) { m4_end(e); return; }
+    if (!barrier_game() || (g_image_heap_n && !barrier_heaps())) { m4_end(e); return; }
     gp_end(e); [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | MTLStageObject | MTLStageMesh | MTLStageFragment beforeQueueStages:MTLStageObject | MTLStageMesh | MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:resource_vis()];
     [e endEncoding]; g_last_end_relaxed = 1;
 }
@@ -3336,7 +3343,7 @@ static id<MTLTexture> tex_upgrade(const tex_t *t, id<MTLTexture> asked, MTLTextu
         id<MTLTexture> raw = [heap newTextureWithDescriptor:d offset:0];
         upgraded = [raw newTextureViewWithPixelFormat:base.pixelFormat];
         if (upgraded) {
-            NvImageHeap *owner = [NvImageHeap new]; owner->heap = heap; atomic_fetch_add(&g_image_heap_n, 1);
+            NvImageHeap *owner = [NvImageHeap new]; owner->heap = heap; atomic_fetch_add(&g_image_heap_n, 1); image_heap_note(0);
             objc_setAssociatedObject(raw, &g_image_heap_owner_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             res_add(raw);
         }
@@ -4724,7 +4731,7 @@ static id<MTLTexture> image_texture(const tex_t *t, MTLTextureDescriptor *d) {
         MTLHeapDescriptor *hd = [MTLHeapDescriptor new]; hd.type = MTLHeapTypePlacement; hd.size = capacity;
         hd.storageMode = d.storageMode; hd.cpuCacheMode = d.cpuCacheMode; hd.hazardTrackingMode = d.hazardTrackingMode;
         id<MTLHeap> heap = [g_dev newHeapWithDescriptor:hd]; if (!heap) return nil;
-        owner = [NvImageHeap new]; owner->heap = heap; atomic_fetch_add(&g_image_heap_n, 1);
+        owner = [NvImageHeap new]; owner->heap = heap; atomic_fetch_add(&g_image_heap_n, 1); image_heap_note(1);
     }
     id<MTLTexture> mt = [owner->heap newTextureWithDescriptor:d offset:0]; if (!mt) return nil;
     objc_setAssociatedObject(mt, &g_image_heap_owner_key, owner, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -4793,7 +4800,7 @@ static id<MTLTexture> pool_heap_texture(const tex_t *t, MTLTextureDescriptor *d)
         hd.storageMode = MTLStorageModePrivate; hd.hazardTrackingMode = d.hazardTrackingMode;
         id<MTLHeap> heap = [g_dev newHeapWithDescriptor:hd];
         if (heap) { h = [NvPoolHeap new]; h->heap = heap; h->pool_heap = 1; h->ngrain = size / POOL_HEAP_GRAIN; h->used = calloc(h->ngrain, 1);
-            atomic_fetch_add(&g_image_heap_n, 1); nvn_hm_put(&g_pool_heap, &p, (void *)CFBridgingRetain(h)); g_pool_heap_n++; g_pool_heap_bytes += size;
+            atomic_fetch_add(&g_image_heap_n, 1); image_heap_note(2); nvn_hm_put(&g_pool_heap, &p, (void *)CFBridgingRetain(h)); g_pool_heap_n++; g_pool_heap_bytes += size;
             static int nl; if (nl++ < 8) MLOG("GPU-only pool %p (%llu MB): its render targets share one placement heap of %llu MB", p->mem, (unsigned long long)(p->size >> 20), (unsigned long long)(size >> 20)); }
     }
     pthread_mutex_unlock(&g_smu);
