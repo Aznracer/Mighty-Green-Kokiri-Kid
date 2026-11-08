@@ -13902,7 +13902,7 @@ static int ndsr_dispatch(NvShader *cs, const p_dispatch *dp);
 // data would otherwise run for ever, and committed work is not reclaimed when the process exits
 #define DPC_MAXDIM 65535u
 #define DPC_MAXTOTAL (1u << 22)
-static int dpc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_CLAMP"); v = !(e && !strcmp(e, "0")); } return v; }
+static int dpc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_CLAMP"); v = e ? strcmp(e, "0") != 0 : DM_GAME_DISPATCH_CLAMP; } return v; }   // profile key dispatch_clamp
 static int dpc_clamp_enc(id ce, uint64_t rec, __strong id<MTLBuffer> *ob, size_t *oo, uint64_t *og) {
     static id<MTLComputePipelineState> ps; static id<MTL4ArgumentTable> at; static int failed;
     if (failed) return 0;
