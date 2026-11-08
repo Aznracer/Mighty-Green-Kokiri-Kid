@@ -683,6 +683,30 @@ static void udc_selftest(void) {
         MLOG("UDC self-check %s %s %lux%lu first value %08x, values differing from it %lu / %lu", g_dev.name.UTF8String, depth ? "Depth32F_S8" : "RGBA8", (unsigned long)w, (unsigned long)h, px[0], (unsigned long)bad, (unsigned long)(w * h));
     }
 }
+// The bundled pipeline archive read ahead (DM_PSO_READAHEAD=0 turns it off): Metal reads the whole archive when it opens it, and arch_open maps it, so on an external drive the
+// open faulted it in a page at a time: Ocarina of Time's 4.3 GB took 9-16 s from a USB disk behind a grey window (read whole into memory it took 6.5 s, but stayed in the footprint).
+// A thread started with the device reads the file in 16 MB pieces while the game boots, so the open finds its pages in the file cache, which the system can take back
+static void *arch_readahead_run(void *arg) {
+    char *path = arg; uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), n = 0;
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+        fcntl(fd, F_RDAHEAD, 1);
+        enum { PIECE = 16 << 20 }; char *b = malloc(PIECE); ssize_t r;
+        while (b && (r = pread(fd, b, PIECE, (off_t)n)) > 0) n += (uint64_t)r;
+        free(b); close(fd);
+        MLOG("pipeline archive bundled with the app: read ahead, %.1f MB in %.1f ms (into the file cache, for its open)", n / 1048576.0, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6);
+    }
+    free(path);
+    return NULL;
+}
+static void arch_readahead_start(void) {
+    const char *e = getenv("DM_PSO_BUNDLE"), *ra = getenv("DM_PSO_READAHEAD");
+    if (!e || !*e || !strcmp(e, "off") || (ra && !strcmp(ra, "0")) || ![(id)g_dev respondsToSelector:@selector(architecture)]) return;
+    NSString *p = [@(e) stringByAppendingPathComponent:[g_dev.architecture.name stringByAppendingPathExtension:@"mtl4a"]];
+    if (![NSFileManager.defaultManager fileExistsAtPath:p]) return;
+    pthread_t th; char *arg = strdup(p.fileSystemRepresentation);
+    if (arg && !pthread_create(&th, NULL, arch_readahead_run, arg)) pthread_detach(th); else free(arg);
+}
 void mtl_init(void) {
     if (g_dev) return;
     const char *vbc = getenv("DM_NVN_VBUF_CACHE"); g_vbuf_cache = !(vbc && !strcmp(vbc, "0"));
@@ -694,6 +718,7 @@ void mtl_init(void) {
     g_dev = MTLCreateSystemDefaultDevice();
     if (!g_dev) MDIE("no Metal device");
     if (!g_dev.hasUnifiedMemory) MDIE("needs a unified-memory device (zero-copy memory pools)");
+    arch_readahead_start();
     g_q = [g_dev newCommandQueue];
     // A device without Metal 4 (the paravirtualized GPU of a virtual Mac, such as GitHub's macos-26 runner: no residency set, no MTL4CommandQueue) cannot run the NVN layer. The GL and
     // Vulkan layers draw on classic queues of their own and need only the device (mtl_device_classic): there the classic part starts and presents are dropped, which is all a
