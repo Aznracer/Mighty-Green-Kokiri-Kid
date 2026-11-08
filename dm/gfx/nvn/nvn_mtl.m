@@ -4495,8 +4495,14 @@ static void cpu_unc_take(const tex_t *t) {   // an uncompressed texture is taken
     nvn_hm_put(&g_cpu_unc, &s, (void *)t->pool); nvn_hm_put(&g_cpu_unc_lo, &s, (void *)t->mem); nvn_hm_put(&g_cpu_unc_sz, &s, (void *)(uintptr_t)t->L.size);
     pthread_mutex_unlock(&g_cpu_tex_mu);
 }
+static int storage_first_use_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_FIRST_USE"); on = !e || atoi(e) != 0; } return on; }
+// Whether the texture's first use takes its content from its storage (tex_cpu_content's rule, less its non-zero test): ft_add (hle_nvn.c) then protects its storage only at that first use
+int mtl_tex_first_use_reads(const tex_t *t) {
+    int unc = tex_unc(t);
+    return storage_first_use_on() && tex_storage_ok(t, unc) && !(unc && tex_storage_gpuw(t));
+}
 static int tex_cpu_content(const tex_t *t) {
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_FIRST_USE"); on = !e || atoi(e) != 0; }
+    int on = storage_first_use_on();
     int unc = tex_unc(t);
     if (!on || !tex_storage_ok(t, unc)) return 0;
     if ((unc && tex_storage_gpuw(t)) || !mem_any(t->mem, t->L.size)) return 0;   // not over storage the GPU writes
@@ -4912,7 +4918,10 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         }
     }
     id have = tex_get(t->serial);
-    if (!packaged && !have && DM_GAME_TEX_DIRTY_UPLOAD && t->mem && on_sub_thread()) { int nvn_ft_written(const tex_t *); packaged = nvn_ft_written(t); }   // first use of a texture the CPU wrote since init without a flush (hle_nvn.c)
+    if (!packaged && !have && nvn_tex_dirty_on() && t->mem) {   // first use of a texture the CPU wrote since init without a flush (hle_nvn.c); one first used off the submit thread is protected from now on
+        int nvn_ft_written(const tex_t *); void nvn_ft_arm(const tex_t *);
+        if (on_sub_thread()) packaged = nvn_ft_written(t); else nvn_ft_arm(t);
+    }   // first use of a texture the CPU wrote since init without a flush (hle_nvn.c)
     if (!packaged && !have && on_sub_thread() && tex_cpu_content(t)) { mtl_tex_cpu_written(t); packaged = 1; }   // storage the CPU wrote before its first use (tex_cpu_content)
     if (packaged) {
         NvPkg *pk = [have isKindOfClass:[NvPkg class]] ? have : nil;   // resolved as GPU-only before the CPU wrote it: dropped and rebuilt as packaged
@@ -14049,7 +14058,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     // textures from the CPU, reads them back with ReadTexels on its own thread before any draw uses them, and copies the blocks into its 5120x5120 roughness atlas. Read from the
     // never-uploaded host texture they were zeros, the atlas stayed empty, and the opening cave's stone blocks got roughness 0 and no torch light
     int nvn_ft_written(const tex_t *);
-    if (tex_from_storage(t) || (DM_GAME_TEX_DIRTY_UPLOAD && t->mem && nvn_ft_written(t))) {
+    if (tex_from_storage(t) || (nvn_tex_dirty_on() && t->mem && nvn_ft_written(t))) {
         // A sparse pool's texture is read through a copy gathered from its page table, unmapped pages as 0, as pkg_upload_ uploads it: where nothing is mapped its address range is
         // inaccessible (reading the storage directly stopped the host with SIGBUS)
         const uint8_t *mem = t->mem; uint8_t *part = NULL;

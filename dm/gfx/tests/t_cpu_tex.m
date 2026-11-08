@@ -367,13 +367,21 @@ static void poll_rewrites(void) {
     CHECK(h_nvnTextureInitialize(&drawn, &tb), "poll: a second texture initialized");
     tex_t *t = (tex_t *)&tex, *d = (tex_t *)&drawn;
     CHECK(nvn_ft_tracked(t->serial) && nvn_ft_tracked(d->serial), "poll: both textures are registered");
+    // a texture whose first use reads its storage is protected only at that first use (ft_add): its fill before costs no page fault, and the first use takes it
+    NVNtexture pre = {0}; h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, 262144);
+    CHECK(h_nvnTextureInitialize(&pre, &tb), "poll: a third texture initialized");
+    tex_t *pt = (tex_t *)&pre; uint64_t f0, p0, f1, p1; nvn_dirty_stats(&f0, &p0);
+    memset(pt->mem, 0x22, pt->L.size); nvn_dirty_stats(&f1, &p1);
+    CHECK(f1 == f0, "poll: a fill before the first use costs no page fault");
+    mtl_sub_begin(); (void)tex_mtl(pt); (void)tex_mtl(t); (void)tex_mtl(d); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "poll: first uses submitted");
+    CHECK(tex_cpu_written(pt->serial), "poll: the first use takes the fill from the storage");
     dm_guest_write_prepare(t->mem, t->L.size); memset(t->mem, 0x40, t->L.size);
     dm_guest_write_prepare(d->mem, d->L.size); memset(d->mem, 0x40, d->L.size);
     mtl_tex_gpu_written(d->pool, d->mem, d->L.size);
     nvn_ft_poll();
     CHECK(tex_cpu_written(t->serial) && !nvn_ft_tracked(t->serial), "poll: a rewrite of storage the GPU never wrote is uploaded");
     CHECK(!tex_cpu_written(d->serial) && nvn_ft_tracked(d->serial), "poll: a rewrite the GPU wrote over is left to the GPU, and the texture stays registered");
-    h_nvnTextureFinalize(&tex); h_nvnTextureFinalize(&drawn); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&pool);
+    h_nvnTextureFinalize(&tex); h_nvnTextureFinalize(&drawn); h_nvnTextureFinalize(&pre); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&pool);
     defer_drain(); munmap(mem, len);
 }
 // Writes beside a registered texture (ft_written): storage 0x200 past a host page shares its first and last pages with other data. A write there leaves the texture registered and
@@ -395,6 +403,7 @@ static void poll_beside(void) {
     CHECK(h_nvnTextureInitialize(&b, &tb), "texture b initialized");
     tex_t *tb_ = (tex_t *)&b;
     CHECK(ta->L.size > 2 * pg && nvn_ft_tracked(ta->serial) && nvn_ft_tracked(tb_->serial), "both registered, each with pages wholly inside");
+    mtl_sub_begin(); (void)tex_mtl(ta); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "a first used: protected from now on (ft_add leaves a texture whose first use reads its storage to then)");
     // beside a: the bytes before it in its first page, and after it in its last
     uint8_t *before = ta->mem - 0x100, *after = ta->mem + ta->L.size + 0x40;
     dm_guest_write_prepare(before, 0x100); memset(before, 0x5a, 0x100);
