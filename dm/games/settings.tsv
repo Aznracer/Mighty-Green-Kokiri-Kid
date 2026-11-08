@@ -9,6 +9,7 @@
 #             <ios>|<mac> selects the platform's default before resolving a profile macro or build variable
 #   shown     always; DM_GAME_<NAME>!=<value> or ==<value>; fixups:<KEY>: main's rewriter table has that key (a stub in the game's build, patch_nso.py); languages>1 (more than one to pick, so also when the control data lists none); gfxapi:<API>: the packer's GFXAPI;
 #             platform:<ios | mac>: the app's platform (SETTINGS_PLATFORM, ios when unset), for a switch only that platform's front end reads
+#             several joined by & (gfxapi:nvn&platform:mac): shown when all of them hold
 #   section   Game, Controls, Performance or Cheemu (options from cheemu21's kid-with-sword-remake fork): a heading on the single settings screen. Rows appear in table order within each section
 #             Reset to tested defaults clears all launcher choices; values fixed by an env file stay
 #   label, note  the setting's name and the line under it (may be empty; only for a setting with a cost: latency, memory, heat)
@@ -32,6 +33,7 @@ DM_SCREEN_ASPECT	choice	1.43=iPhone Duo screen (1.43:1),0=16:9 (Switch)	1.43|0	D
 DM_PRESENT_SNAP	toggle	-	DM_GAME_PRESENT_SNAP	gfxapi:nvn	Performance	Frame buffering	Up to one frame more display latency.
 DM_PSO_MTL4	toggle	-	DM_GAME_PSO_MTL4|1	gfxapi:nvn	Performance	Metal 4 pipelines	Keeps a pipeline archive; uses more memory.
 DM_PSO_PREBUILD	toggle	-	1	gfxapi:nvn	Performance	Pipeline prebuild	The first start waits a few minutes for it, once.	needs=DM_PSO_MTL4=1
+DM_PSO_MAPPED	choice	copy=Copy to boot drive,0=Load into memory,1=Read from the drive	copy	gfxapi:nvn&platform:mac	Performance	Archive on an external drive	Copy to boot drive puts the archive (about 4 GB for Ocarina of Time) on the Mac's boot drive once and uses no extra memory. Loading uses as much memory as the archive; reading from the drive can make the game hitch. All the same with the app on the Mac's own disk.	needs=DM_PSO_MTL4=1
 DM_NVN_ENC_THREAD	toggle	-	1|DM_GAME_ENC_THREAD	gfxapi:nvn	Performance	Encode thread
 DM_FPS_HOLD	toggle	on/off	DM_GAME_FPS_HOLD	DM_GAME_FPS_TARGET!=0	Performance	Hold frames when late
 DM_METAL_HUD	toggle	-	0	always	Performance	Performance HUD

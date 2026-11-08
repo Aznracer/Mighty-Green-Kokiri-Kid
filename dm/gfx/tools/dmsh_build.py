@@ -51,6 +51,46 @@ XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-textur
 # GX lighting takes max(0, NaN) from light directions left at zero, and the half of Mario its fill light faces came out white on the iPhone (GitHub issue 72; vk_shaders.py PRECISE)
 def precise(msl): return re.sub(r'\bfast::(min|max|clamp)\(', r'precise::\1(', msl)
 
+# A fragment shader that compares its own depth with what the same surface stored: Metal's [[position]].z and the depth the rasterizer stores are not one value. On an M4 Max position.z is one ULP
+# above the stored depth on some pixels and never below (2.55 % of 552,671 pixels in t_frag_z; other GPUs not measured). The Switch GPU evidently gives equal values, since games rely on it: The Legend of
+# Zelda: Ocarina of Time draws its ground mist after a mesh depth pre-pass and discards when z > stored (5ad65c0eefd09c7f), which left black specks, often in pairs, through the mist. So the two
+# comparisons whose answer such a pixel changes, z > x (it must fail) and its negation z <= x (it must pass), take z one ULP down, and so do their mirrors x < z and x >= z. z >= x and z < x stay:
+# position.z never being below the stored depth, they already give the answer, and one ULP down would turn it. z of 0 stays 0: position.z is never below the stored depth, so the stored depth is 0
+# too and both comparisons already give the answer (one ULP down from 0 would be a NaN). z is gl_FragCoord.z or a plain copy of it, also through a select with 0.0 (the translator's flush of a
+# denormal, x ? 0.0 : z). Not reached: z scaled before the comparison (40 more of that game's shaders multiply z by a constant first; the one read is a depth fade against a sampled depth
+# times the same constant), a comparison other than two variables into a bool, == and != (none in that game), and the Vulkan and GL routes (vk_shaders.py, gl_shaders.py).
+def frag_z(msl):
+    if 'gl_FragCoord.z' not in msl: return msl
+    z = set(re.findall(r'float (_\d+) = gl_FragCoord\.z;', msl))
+    n = -1
+    while n != len(z):
+        n = len(z)
+        for m in re.finditer(r'float (_\d+) = (?:_\d+ \? 0\.0 : )?(_\d+);', msl):
+            if m.group(2) in z: z.add(m.group(1))
+    down = lambda v: f'as_type<float>(as_type<uint>({v}) - uint({v} > 0.0))'
+    def one(m):
+        a, op, b = m.group(2), m.group(3), m.group(4)
+        if op in ('>', '<=') and a in z and b not in z: a = down(a)
+        elif op in ('<', '>=') and b in z and a not in z: b = down(b)
+        else: return m.group(0)
+        return f'bool {m.group(1)} = {a} {op} {b};'
+    return re.sub(r'bool (_\d+) = (_\d+) (>=|<=|>|<) (_\d+);', one, msl)
+# Keep SPIRV-Cross's mulhi workaround, but allow constant folding for scalar uint products with a non-power-of-two literal multiplier.
+# Power-of-two high-word products have a separate shift identity; vector, signed and dynamic products retain the original helper.
+def extended_multiply_msl(msl):
+    if 'spvMulExtended<' not in msl or 'using namespace metal;\n' not in msl: return msl
+    helper = r'template<typename T, typename U, typename V>\s*\[\[clang::optnone\]\] T spvMulExtended\(V l, V r\)\s*\{\s*return T\{U\(l \* r\), U\(mulhi\(l, r\)\)\};\s*\}'
+    if len(re.findall(helper, msl)) != 1 or len(re.findall(r'\bT spvMulExtended\(', msl)) != 1: return msl
+    call = r'\bspvMulExtended<(\w+), uint>\(((?:uint|as_type<uint>)\([^()]*\)), ([0-9]+)u\)'
+    def replace(m):
+        n = int(m[3])
+        if n <= 1 or n > 0xffffffff or n & (n - 1) == 0: return m[0]
+        return f'dmsh_mul_extended_uint<{m[1]}>({m[2]}, {m[3]}u)'
+    changed = re.sub(call, replace, msl)
+    if changed == msl: return msl
+    body = 'template<typename T> static inline __attribute__((always_inline)) T dmsh_mul_extended_uint(uint l, uint r) { ulong p = ulong(l) * ulong(r); return T{uint(p), uint(p >> 32)}; }\n'
+    return changed.replace('using namespace metal;\n', 'using namespace metal;\n' + body, 1)
+
 # Ampere HMMA.16816 with an f16 accumulator (agl's upscaler networks, the NDVE video networks) reaches the MSL as calls of dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1,
 # flags, A's LDSM address, A0..A3's offsets, A's row stride, out D1) → D0, the subgroup's 256-word block of the scratch shared memory as the last argument (InstEmitAmpereTensor.AHmma,
 # TensorPass, HelperFunctionManager.GenerateHmma16816F16). The translator's body computes D lane by lane from the block; here it becomes simdgroup_matrix code over the same block:
@@ -714,6 +754,13 @@ def early_fragment_tests(ctl, code):
     lattice on the Great Sky Island; 1,677 of its 13,646 pixel shaders set it, none writes depth). A shader whose SPH (code, after the 0x30 header) writes depth (word 19 bit 1, OmapDepth)
     is left as it is: tested early, the depth it computes would not be the one tested"""
     return len(ctl) > 0x718 and ctl[0x718] != 0 and len(code) >= 0x50 and not struct.unpack_from('<I', code, 19 * 4)[0] & 2
+
+def ps_omap(code):
+    """A pixel shader's output map: SPH word 18 (Maxwell's 0x50-byte SPH and NVN2's 0x80-byte one alike, at the start of the job's code; Ryujinx ShaderHeader OmapTargets),
+    4 bits per colour output, R G B A from the low bit. The GPU writes only these components of a bound target and leaves the others as they were; the translator stores only
+    them, and Metal writes the whole attachment under its write mask, so the host masks each target with its nibble (nvn_mtl.m). Lichii (a Switch 2 emulator) traced a band of
+    NaN above Ocarina of Time's horizon to the missing per-component mask (their commit 79c1516; Ocarina's agl_common depth pass has map 0x10f: output 0 RGBA, output 2 R only)"""
+    return struct.unpack_from('<I', code, 18 * 4)[0] if len(code) >= 0x50 else None
 
 def job_for(key, name, rec, w):
     ci = rec.find(bytes.fromhex('34127698')); code = rec[0x38:ci]; stage = name[:2]
@@ -1566,6 +1613,8 @@ def finish(key, w, j, c1):
     try: src = dmsh_atomic.check_msl(src)
     except ValueError as e: return 'image atomic MSL failed', str(e), None
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
+    if j['stage'] == 'ps': src = frag_z(src)   # position.z against the depth the same surface stored (see frag_z)
+    src = extended_multiply_msl(src)   # exact scalar products without the unoptimized mulhi wrapper
     try: src = gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)
     except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
     try: src = hmma_msl(src)   # Ampere HMMA through simdgroup_matrix (see hmma_msl)
@@ -1643,7 +1692,7 @@ def finish(key, w, j, c1):
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr, mesh['kind'] if mesh else j['stage']),
             'bindings': binds,
             'vertex_inputs': [{'location': int(m.group(3)), 'msl_type': m.group(1)} for m in attributes(src)],
-            'raster': raster_facts(j['stage'], src), 'vs_pad': pad}
+            'raster': {**raster_facts(j['stage'], src), **({'omap': ps_omap(open(j['code'], 'rb').read())} if j['stage'] == 'ps' else {})}, 'vs_pad': pad}
     if j['stage'] == 'vs': full = open(msl).read(); vin_finish(key, full, refl); pull_finish(key, full, refl)   # the shadow-input and pulling libraries (dmsh_vin.py, dmsh_pull.py), from the source with every entry point
     refl.update(side)   # the alpha test and logic operation entry points (ps_libraries)
     write_refl(key, refl)

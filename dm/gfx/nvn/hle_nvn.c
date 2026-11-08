@@ -407,7 +407,10 @@ NVN(nvnTextureBuilderGetSparseTileLayout, void, const NVNtextureBuilder *b, NVNt
 // the CPU can write) are registered by address range; a flush that covers part of one marks it CPU-written (mtl_tex_cpu_written: uploaded from guest memory, re-uploaded
 // when its pages change). Off by default: in another game a flushed range could cover an image a shader writes, whose GPU content the upload would replace
 // stamp: dirty-page generation at registration (tex_dirty_upload); span: its tracked range (nvn_dirty_span), so a check needs no search over every pool; edge_h: hashes of its bytes in its edge pages at the stamp (ft_edges_take), edged = they hold
-typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; const void *span; uint64_t edge_h[2]; int edged; } flush_tex;
+// The profile's tex_flush_upload / tex_dirty_upload, which DM_NVN_TEX_FLUSH / DM_NVN_TEX_DIRTY (=0 / =1) override for measuring what they cost
+static int tex_flush_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TEX_FLUSH"); v = e ? atoi(e) != 0 : DM_GAME_TEX_FLUSH_UPLOAD; } return v; }
+int nvn_tex_dirty_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TEX_DIRTY"); v = e ? atoi(e) != 0 && tex_flush_on() : DM_GAME_TEX_DIRTY_UPLOAD; } return v; }
+typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; const void *span; uint64_t edge_h[2]; int edged, armed; } flush_tex;   // armed: stamped and protected (ft_arm)
 static flush_tex *g_ft; static size_t g_nft, g_cft; static pthread_mutex_t g_ft_mu = PTHREAD_MUTEX_INITIALIZER;
 // Writes beside a registered texture (tex_dirty_upload). The tracker marks whole host pages (16 KB) dirty, and a texture's storage need not start or end on one: its first and last pages
 // are shared with whatever lies beside it, as for the packaged textures' re-uploads (pkg_edges_clean in nvn_mtl.m). The Great Ace Attorney Chronicles keeps its window textures and render
@@ -452,19 +455,24 @@ static void ft_add(const tex_t *t) {
     // background never appeared). A CPU_NO_ACCESS pool keeps the exclusion: there the compression tags may really be there.
     // A sparse pool's addresses are no memory the CPU writes or flushes, and no range nvn_dirty tracks, so they read as dirty at once: every texture in one, a render target too, came out CPU-written at its first
     // use in a profile with tex_dirty_upload. What the CPU wrote into the physical pages behind one is seen through the page table instead (tex_from_storage, sparse_look)
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->pool->vp || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+    if (!tex_flush_on() || !t->mem || !t->pool || t->pool->vp || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
         (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return;
-    flush_tex f = {t->mem, t->L.size, *t, nvn_dirty_now(), NULL, {0, 0}, 0};
-    if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
+    // tex_dirty_upload protects the storage when the texture is first used, not here, where the first use takes its content from the storage anyway (mtl_tex_first_use_reads): the
+    // fills that follow an initialization (a stream-in, a file read into the storage) then cost no page faults and no unprotects before host writes. Walking through Ocarina of Time's
+    // Castle Town with protection from here: 89,563 write faults and 443,466 pages unprotected before host writes, each a scan of its 4,500 pools, and the long frames twice as many.
+    // A texture whose first use does not read the storage (an uncompressed image, a compressible one, one over storage the GPU wrote) is still protected here, as before
+    int dirty = nvn_tex_dirty_on();
+    flush_tex f = {t->mem, t->L.size, *t, nvn_dirty_now(), NULL, {0, 0}, 0, !dirty || !mtl_tex_first_use_reads(t)};
+    if (dirty && f.armed) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
     f.span = nvn_dirty_span(t->mem, t->L.size);
-    if (DM_GAME_TEX_DIRTY_UPLOAD) ft_edges_take(&f);
+    if (dirty && f.armed) ft_edges_take(&f);
     pthread_mutex_lock(&g_ft_mu);
     if (g_nft == g_cft && !(g_ft = realloc(g_ft, (g_cft = g_cft ? 2 * g_cft : 1024) * sizeof *g_ft))) die("flush_tex allocation failed");
     g_ft[g_nft++] = f;
     pthread_mutex_unlock(&g_ft_mu);
 }
 static void ft_del(uint64_t serial) {
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !serial) return;
+    if (!tex_flush_on() || !serial) return;
     pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { g_ft[i] = g_ft[--g_nft]; break; }
     pthread_mutex_unlock(&g_ft_mu);
@@ -472,18 +480,30 @@ static void ft_del(uint64_t serial) {
 // Profile tex_dirty_upload: Tears of the Kingdom fills some textures from the CPU after creating them and publishes them with no NVN flush at all (os::FlushDataCache runs
 // natively; its 121-layer ASTC terrain material arrays, 42 MB each). They stayed GPU-only textures with content 0, which ASTC decodes as the error colour, and the cave came out magenta.
 // ft_add write-protects a registered texture's pages, and on its first resolution (tex_mtl, submit thread) a write since then makes it CPU-written like a flushed one
+static void ft_arm(flush_tex *f) {   // g_ft_mu held: the stamp, the protection, then the edges, as ft_add does for one protected from its registration
+    f->stamp = nvn_dirty_now(); nvn_dirty_protect(f->mem, f->size); ft_edges_take(f); f->armed = 1;
+}
+// At a texture's first use (tex_mtl_): one protected since its registration is CPU-written when the CPU wrote it since then; one left unprotected (ft_add) is protected now, before
+// tex_cpu_content reads its storage, so a write after that read is seen by nvn_ft_poll
 int nvn_ft_written(const tex_t *t) {
-    if (!DM_GAME_TEX_DIRTY_UPLOAD || !t->serial) return 0;
+    if (!nvn_tex_dirty_on() || !t->serial) return 0;
     int r = 0; pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == t->serial) {
-        if (ft_written(&g_ft[i])) { r = 1; g_ft[i] = g_ft[--g_nft]; }
+        if (!g_ft[i].armed) ft_arm(&g_ft[i]);
+        else if (ft_written(&g_ft[i])) { r = 1; g_ft[i] = g_ft[--g_nft]; }
         break; }
     pthread_mutex_unlock(&g_ft_mu);
     if (r) mtl_tex_cpu_written(t);
     return r;
 }
+void nvn_ft_arm(const tex_t *t) {   // a first use off the submit thread, where nvn_ft_written is not asked: protected from now on all the same
+    if (!nvn_tex_dirty_on() || !t->serial) return;
+    pthread_mutex_lock(&g_ft_mu);
+    for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == t->serial) { if (!g_ft[i].armed) ft_arm(&g_ft[i]); break; }
+    pthread_mutex_unlock(&g_ft_mu);
+}
 int nvn_ft_tracked(uint64_t serial) {   // registered and not resolved yet: its storage holds whatever the CPU has written (nvn_tex_mirror_b2t / nvn_tex_mirror_t2t)
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !serial) return 0;
+    if (!tex_flush_on() || !serial) return 0;
     int r = 0; pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == serial) { r = 1; break; }
     pthread_mutex_unlock(&g_ft_mu);
@@ -500,7 +520,7 @@ int nvn_ft_tracked(uint64_t serial) {   // registered and not resolved yet: its 
 // Checking every texture at every submission cost TOTK 0.4 ms of submit CPU per frame on the Mac; this way a texture is picked up a few submissions later at most
 enum { FT_POLL_BYTES = 128 << 20 };
 void nvn_ft_poll(void) {
-    if (!DM_GAME_TEX_DIRTY_UPLOAD) return;
+    if (!nvn_tex_dirty_on()) return;
     static uint64_t gen; static size_t cur, left;
     static struct { tex_t t; size_t at; int how; } *hit; static size_t chit; size_t nhit = 0;
     uint64_t now = nvn_dirty_now(), scanned = 0;
@@ -509,7 +529,7 @@ void nvn_ft_poll(void) {
     while (left && g_nft && scanned < FT_POLL_BYTES) {
         if (cur >= g_nft) cur = 0;
         scanned += g_ft[cur].size; left--;
-        if (ft_written(&g_ft[cur])) {   // writes beside it only (its edge pages, its bytes there unchanged) restamp it and are no hit
+        if (g_ft[cur].armed && ft_written(&g_ft[cur])) {   // one not used yet is not protected: its first use reads its storage   // writes beside it only (its edge pages, its bytes there unchanged) restamp it and are no hit
             if (nhit == chit && !(hit = realloc(hit, (chit = chit ? 2 * chit : 64) * sizeof *hit))) die("nvn_ft_poll allocation failed");
             hit[nhit].t = g_ft[cur].t; hit[nhit++].at = cur;
         }
@@ -542,7 +562,7 @@ void nvn_ft_poll(void) {
     pthread_mutex_unlock(&g_ft_mu);
 }
 static void ft_flush(const uint8_t *a, uint64_t n) {
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !a || !n) return;
+    if (!tex_flush_on() || !a || !n) return;
     pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft;)
         if (g_ft[i].mem < a + n && a < g_ft[i].mem + g_ft[i].size) { mtl_tex_cpu_written(&g_ft[i].t); g_ft[i] = g_ft[--g_nft]; } else i++;

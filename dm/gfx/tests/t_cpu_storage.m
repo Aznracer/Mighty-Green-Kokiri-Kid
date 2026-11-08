@@ -39,6 +39,27 @@ static void setup(fixture *f, uint64_t serial, uint32_t pool_flags, int format, 
 }
 static void teardown(fixture *f) { mtl_tex_release(&f->t); mtl_alias_drop_pool(&f->pool); mtl_pool_del(f->mem); mtl_drain(); free(f->mem); }
 static const uint32_t CACHED = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED;
+// A pool whose pages are tracked (nvn_dirty), as a game's CPU-accessible pools are: a GPU-written span there is protected, and a CPU write into it afterwards is seen (gws_span)
+enum { TRACKED = 1 << 20, LARGE = 256 };
+static tex_t texture_at(fixture *f, uint64_t serial, uint64_t off, uint32_t size) {
+    tex_t t = {.magic = MAGIC('T', 'E', 'X', 0), .serial = serial, .pool = &f->pool, .off = off, .mem = (uint8_t *)f->mem + off};
+    t.d = (nvn_texdesc){.target = NVN_TEXTURE_TARGET_2D, .format = NVN_FORMAT_RGBA8, .width = size, .height = size, .depth = 1, .levels = 1, .samples = 1};
+    nvn_tex_layout(&t.d, &t.L);
+    return t;
+}
+static void fill_any(tex_t *t, uint8_t v) {   // fill for any size, after dm_guest_write_prepare
+    uint32_t w = t->d.width, h = t->d.height; uint8_t *linear = malloc((size_t)w * h * 4); if (!linear) abort();
+    for (uint32_t i = 0; i < w * h; i++) { linear[i * 4] = v; linear[i * 4 + 1] = v + 1; linear[i * 4 + 2] = v + 2; linear[i * 4 + 3] = 255; }
+    CHECK("fixture swizzle succeeds", !nvn_swizzle(&t->d, 0, 0, linear, w * 4, t->mem)); free(linear);
+}
+static void setup_tracked(fixture *f, uint64_t serial) {
+    if (posix_memalign(&f->mem, getpagesize(), TRACKED)) abort();
+    memset(f->mem, 0, TRACKED);
+    f->pool = (pool_t){.magic = MAGIC('P', 'O', 'O', 'L'), .mem = f->mem, .size = TRACKED, .flags = CACHED};
+    mtl_pool_add(f->mem, TRACKED); nvn_dirty_add_range(f->mem, TRACKED);
+    f->t = texture_at(f, serial, 0, SIZE);
+}
+static void teardown_tracked(fixture *f) { mtl_tex_release(&f->t); mtl_alias_drop_pool(&f->pool); nvn_dirty_remove_range(f->mem); mtl_pool_del(f->mem); mtl_drain(); free(f->mem); }
 
 int main(void) {
     @autoreleasepool {
@@ -105,6 +126,40 @@ int main(void) {
             CHECK(left_out[i].label, !tex_cpu_content(&f.t));
             teardown(&f);
         }
+
+        // Storage the GPU wrote, then the CPU rewrote (gws_span): Ocarina of Time reuses a terrain tile slot whose normal map the GPU drew for a height or blend / hole map the CPU fills;
+        // with the GPU's mark kept until the pool went, every tile streamed in after a scene change came out as zeros (holes in the ground, leaving the Deku Tree)
+        setup_tracked(&f, 7040);
+        tex_t large = texture_at(&f, 7041, 0x40000, LARGE);
+        mtl_tex_gpu_written(&f.pool, large.mem, large.L.size);
+        dm_guest_write_prepare(large.mem - 64, 64); memset(large.mem - 64, 0x5a, 64);   // the page before it: outside the span
+        CHECK("over storage the GPU wrote, a CPU write beside it leaves it the GPU's", !tex_cpu_content(&large));
+        dm_guest_write_prepare(large.mem, large.L.size); fill_any(&large, 40);
+        CHECK("over storage the GPU wrote, then the CPU rewrote, it is taken from storage", tex_cpu_content(&large));
+        mtl_tex_gpu_written(&f.pool, large.mem, large.L.size);
+        mtl_sub_begin(); cpu_unc_drop(); finish();
+        CHECK("and the GPU's next write there makes it a GPU texture", !tex_cpu_written(large.serial));
+        CHECK("which then is not taken from storage again", !tex_cpu_content(&large));
+        mtl_tex_release(&large);
+        teardown_tracked(&f);
+
+        setup_tracked(&f, 7042);
+        large = texture_at(&f, 7043, 0x40000, LARGE);
+        tex_t upper = texture_at(&f, 7044, 0x40000 + large.L.size / 2, LARGE / 2), lower = texture_at(&f, 7045, 0x40000, LARGE / 2);
+        mtl_tex_gpu_written(&f.pool, large.mem, large.L.size);
+        dm_guest_write_prepare(upper.mem, upper.L.size); fill_any(&upper, 40);
+        mtl_tex_gpu_written(&f.pool, lower.mem, lower.L.size);
+        CHECK("a GPU write over another part of the storage leaves the CPU's rewrite seen", tex_cpu_content(&upper));
+        CHECK("and the part it wrote is the GPU's", gpuw_overlaps((uint64_t)(uintptr_t)lower.mem, (uint64_t)(uintptr_t)lower.mem + lower.L.size));
+        mtl_tex_release(&upper);
+        teardown_tracked(&f);
+
+        setup_tracked(&f, 7046);
+        large = texture_at(&f, 7047, 0x40000, LARGE);
+        mtl_tex_gpu_written(&f.pool, NULL, 0);
+        dm_guest_write_prepare(large.mem, large.L.size); fill_any(&large, 40);
+        CHECK("a mark on the whole pool stays the GPU's whatever the CPU writes", !tex_cpu_content(&large));
+        teardown_tracked(&f);
     }
     printf("t_cpu_storage: %d checks, %d failed\n", checks, failed);
     return failed != 0;

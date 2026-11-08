@@ -195,6 +195,8 @@ def header_one(g):
     if rcd not in ('on', 'off'): sys.exit(f'{g.id}: render_cond must be on or off: {rcd}')
     psr = g.get('pool_skip_retired', 'off')   # pool tables give a retired texture ID without a view the dummy instead of a texture made again (nvn_mtl.m pool_entry; DM_NVN_POOL_SKIP_RETIRED overrides): on / off
     if psr not in ('on', 'off'): sys.exit(f'{g.id}: pool_skip_retired must be on or off: {psr}')
+    dcl = g.get('dispatch_clamp', 'on')   # GPU-written indirect dispatch counts clamped before the dispatch reads them (nvn_mtl.m dpc_clamp_enc; DM_NVN_DISPATCH_CLAMP overrides): on / off
+    if dcl not in ('on', 'off'): sys.exit(f'{g.id}: dispatch_clamp must be on or off: {dcl}')
     dov = g.get('dispatch_overlap', 'off')   # the game's dispatches with no barrier of its between them run side by side in the copy encoder (nvn_mtl.m dispatch_enc; DM_NVN_DISPATCH_OVERLAP overrides): on / off
     if dov not in ('on', 'off'): sys.exit(f'{g.id}: dispatch_overlap must be on or off: {dov}')
     tfu = g.get('tex_flush_upload', 'off')   # textures written by the CPU into a pool and published with nvnMemoryPoolFlushMappedRange are uploaded like packaged ones (hle_nvn.c): on / off
@@ -265,6 +267,7 @@ def header_one(g):
          f'#define DM_GAME_RENDER_COND {int(rcd == "on")}',
          f'#define DM_GAME_POOL_SKIP_RETIRED {int(psr == "on")}',
          f'#define DM_GAME_DISPATCH_OVERLAP {int(dov == "on")}',
+         f'#define DM_GAME_DISPATCH_CLAMP {int(dcl == "on")}',
          f'#define DM_GAME_TEX_DIRTY_UPLOAD {int(tdu == "on")}',
          f'#define DM_GAME_TEX_DYN_SLOTS {int(tds == "on")}',
          f'#define DM_GAME_GPU_TS_SEGMENT {int(gts == "segment")}',

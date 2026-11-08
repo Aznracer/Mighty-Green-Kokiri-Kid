@@ -51,6 +51,9 @@ pool_skip_retired	on
 # The game's compute dispatches with no barrier of its between them run side by side (nvn_mtl.m dispatch_enc): 117 at the start of a frame in Kokiri Forest waited each for the one
 # before, 5.7 ms; side by side 3.7 ms, the frame 27.1 -> 24.9 ms (docked, Apple M4 Pro), the picture within run-to-run noise
 dispatch_overlap	on
+# The indirect dispatch clamp off: walking through Hyrule Castle Town, 6-9 long frames in 47 s with it off against 13-24 with it on (an extra dispatch and barrier before each
+# indirect dispatch; docked, render scale 1.0, Apple M4 Pro), and no indirect dispatch of this game has hung the GPU. DM_NVN_DISPATCH_CLAMP=1 turns it back on
+dispatch_clamp	off
 # The terrain tiles' height, blend and hole maps (260x260, one CPU_CACHED | GPU_CACHED pool) are rewritten from the CPU with no flush as tile slots are reused: without these the
 # tiles kept what they held before, flat blue and grey holes in the ground with the grass drawn over them (Kokiri Forest, the Lost Woods)
 tex_flush_upload	on

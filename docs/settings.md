@@ -5,7 +5,7 @@ The screen before the game starts shows the settings the game supports. A settin
 - [Tested defaults](#tested-defaults)
 - [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff)
-- [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+- [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Archive on an external drive](#archive-on-an-external-drive-mac), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [Cheemu](#cheemu): [Softer textures](#softer-textures), [Lossy render targets](#lossy-render-targets), [Skip unused pools](#skip-unused-pools), [Large pools by chunk](#large-pools-by-chunk), [Guest memory in files](#guest-memory-in-files-mac)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
 - [In-game menu](#in-game-menu)
@@ -175,6 +175,15 @@ Built in the background while playing instead, the stand-ins took an iPhone 17 P
 - **When to change it:** turn it off if you don't want to wait at that first start.
 - **Cost:** on, a wait of a few minutes once. Off, no wait, but a pipeline seen for the first time makes the game stall briefly while it is built, until the archive holds it.
 
+### Archive on an external drive (Mac)
+
+Where the pipeline archive is read from while you play, when the app is on an external drive. **Copy to boot drive** (the default) copies it to the Mac's boot drive the first time (`~/Library/Caches/nxnative/<game>`, about 4 GB for Ocarina of Time; that first start takes a little longer) and reads it from there: finding a pipeline never waits on the external drive, and it costs no extra memory. A rebuilt app copies again and the old copy is removed. Without 8 GB to spare on the disk it reads from the drive instead. **Load into memory** reads the whole archive into memory at the start, so it never waits on the drive either, but costs as much memory as the archive: on a 24 GB Mac Ocarina of Time went into swap with it. **Read from the drive** leaves it on the drive: no copy and no memory, but when the Mac has dropped the parts a scene needs, the game waits for the drive and hitches. With the app on the Mac's own disk all three behave the same.
+
+Measured in Ocarina of Time's Hyrule Castle Town on a USB drive, a pipeline lookup took 1.4 ms read from the drive and 0.33 ms loaded into memory.
+
+- **When to change it:** choose Read from the drive if the Mac's disk is nearly full.
+- **Cost:** Copy to boot drive, about 4 GB of the boot drive; Load into memory, as much memory as the archive.
+
 ### Encode thread
 
 The app turns the game's graphics commands into Metal commands on a thread of its own instead of the game's submitting thread, so the game's thread can go on sooner (in Breath of the Wild about 4 ms per frame instead of 8). Frame buffering needs it for games that present their frames from another thread than the one that draws them. It is on by default on the iPhone; on the Mac it is off, where it lowered the typical frame time but made the slowest frames slower.
@@ -305,6 +314,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Frame buffering | `DM_PRESENT_SNAP` | `1`, `0` |
 | Metal 4 pipelines | `DM_PSO_MTL4` | `1`, `0` |
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |
+| Archive on an external drive (Mac) | `DM_PSO_MAPPED` | `copy` copy to the boot drive, `0` load into memory, `1` read from the drive |
 | Encode thread | `DM_NVN_ENC_THREAD` | `1`, `0` |
 | Hold frames when late | `DM_FPS_HOLD` | `on`, `off` |
 | Performance HUD | `DM_METAL_HUD` | `1`, `0` |

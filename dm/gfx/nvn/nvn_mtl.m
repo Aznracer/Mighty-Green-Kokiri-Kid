@@ -22,6 +22,8 @@
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <fcntl.h>
+#include <copyfile.h>
+#include <sys/mount.h>
 #include <signal.h>
 #include <TargetConditionals.h>
 #if TARGET_OS_IPHONE
@@ -539,16 +541,21 @@ static void defer_drain(void) { @autoreleasepool {
     pthread_mutex_unlock(&g_deferred_mu);
     // A retired resource a serial entry still holds keeps its residency (g_retire_held). g_smu is only tried: this runs on the completion handler's thread too, which must not wait on
     // the submit thread's long holds; when it is busy, those entries wait for the next drain
-    NSMutableArray<NvDeferredRelease *> *res_ready = nil;
-    for (NvDeferredRelease *d in ready) if (!d->keep_resident && [d->object conformsToProtocol:@protocol(MTLResource)]) { if (!res_ready) res_ready = [NSMutableArray array]; [res_ready addObject:d]; }
+    // Each entry is sorted once, here, into the resources that may leave the residency set and the rest. When g_smu is busy, the rest are drained now and the resources go back to
+    // g_deferred: from then on they belong to whichever drain takes them next (the submit thread or a completion handler), which releases the object and clears d->object. So nothing
+    // here may read an entry it has handed back: sorting them again after the hand-back sent conformsToProtocol: to an object another drain had just freed (a crash in
+    // class_conformsToProtocol from a completion handler, ROMANCE OF THE THREE KINGDOMS XIV in its main menu)
+    NSMutableArray<NvDeferredRelease *> *res_ready = nil, *rest = [NSMutableArray arrayWithCapacity:ready.count];
+    for (NvDeferredRelease *d in ready) {
+        if (!d->keep_resident && [d->object conformsToProtocol:@protocol(MTLResource)]) { if (!res_ready) res_ready = [NSMutableArray array]; [res_ready addObject:d]; }
+        else [rest addObject:d];
+    }
     if (res_ready && !pthread_mutex_trylock(&g_smu)) {
         for (NvDeferredRelease *d in res_ready) if (entry_holds((__bridge void *)d->object)) { retire_wait(d->object); d->keep_resident = 1; }
         pthread_mutex_unlock(&g_smu);
     } else if (res_ready) {
-        pthread_mutex_lock(&g_deferred_mu); [g_deferred addObjectsFromArray:res_ready]; pthread_mutex_unlock(&g_deferred_mu);
-        NSMutableArray<NvDeferredRelease *> *rest = [NSMutableArray arrayWithCapacity:ready.count];
-        for (NvDeferredRelease *d in ready) if (d->keep_resident || ![d->object conformsToProtocol:@protocol(MTLResource)]) [rest addObject:d];
         ready = rest;
+        pthread_mutex_lock(&g_deferred_mu); [g_deferred addObjectsFromArray:res_ready]; pthread_mutex_unlock(&g_deferred_mu);
     }
     // A release queued twice for one object in this pass (a holder's own release and retire_resume's) goes through once: the second could bin a texture the bin had
     // handed out again meanwhile (trc_released)
@@ -688,8 +695,50 @@ static void udc_selftest(void) {
 // The bundled pipeline archive read ahead (DM_PSO_READAHEAD=0 turns it off): Metal reads the whole archive when it opens it, and arch_open maps it, so on an external drive the
 // open faulted it in a page at a time: Ocarina of Time's 4.3 GB took 9-16 s from a USB disk behind a grey window (read whole into memory it took 6.5 s, but stayed in the footprint).
 // A thread started with the device reads the file in 16 MB pieces while the game boots, so the open finds its pages in the file cache, which the system can take back
+// DM_PSO_MAPPED=copy (the Mac launcher's Archive on an external drive, Copy to boot drive): the bundled archive on another volume than the home folder (the app on a USB drive) is copied
+// once to ~/Library/Caches/nxnative/<game>/ and mapped from there. Mapped from the drive, a lookup whose pages the system dropped waits on the drive (Hyrule Castle Town: 1.4 ms a lookup,
+// hitches of 50-80 ms); read whole into memory (DM_PSO_MAPPED=0) it costs about its size: 4.3 GB on a 24 GB Mac took Ocarina of Time to 19.4 GB resident and into swap, and the GPU
+// waited 25-37 ms a frame entering the town. On the internal disk its pages are clean and cheap to read again. The copy's name holds the archive's size and date, so a rebuilt app
+// copies again and the old copy goes. Not enough room (its size and 8 GB to spare): mapped from where it is
+static int pso_copy_mode(void) { const char *e = getenv("DM_PSO_MAPPED"); return e && !strcmp(e, "copy"); }
+static void bundle_local_make(const char *src, char *out, size_t cap) {
+    struct stat ss, hs; const char *home = getenv("HOME");
+    if (stat(src, &ss) || !home || stat(home, &hs)) return;
+    if (ss.st_dev == hs.st_dev) { MLOG("pipeline archive bundled with the app: on the home folder's volume, mapped where it is (DM_PSO_MAPPED=copy)"); return; }
+    const char *root = getenv("DM_ROOT"), *game = root ? strrchr(root, '/') : NULL; game = game && game[1] ? game + 1 : "pso";
+    char dir[PATH_MAX]; snprintf(dir, sizeof dir, "%s/Library/Caches/nxnative/%s", home, game);
+    [NSFileManager.defaultManager createDirectoryAtPath:@(dir) withIntermediateDirectories:YES attributes:nil error:nil];
+    const char *base = strrchr(src, '/'); base = base ? base + 1 : src;
+    const char *dot = strrchr(base, '.'); int stem = dot ? (int)(dot - base) : (int)strlen(base);
+    char dst[PATH_MAX]; snprintf(dst, sizeof dst, "%s/%.*s-%lld-%ld.mtl4a", dir, stem, base, (long long)ss.st_size, (long)ss.st_mtimespec.tv_sec);
+    char pre[PATH_MAX]; snprintf(pre, sizeof pre, "%.*s-", stem, base);
+    for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(dir) error:nil]) {   // older copies of this archive, and a copy a stopped run left unfinished
+        NSString *full = [@(dir) stringByAppendingPathComponent:f];
+        if ([f hasPrefix:@(pre)] && strcmp(full.fileSystemRepresentation, dst)) { unlink(full.fileSystemRepresentation); MLOG("pipeline archive copy: %s removed (another build's)", f.UTF8String); }
+    }
+    struct stat ds;
+    if (!stat(dst, &ds) && ds.st_size == ss.st_size) { snprintf(out, cap, "%s", dst); return; }
+    struct statfs fs;
+    if (statfs(dir, &fs) || (uint64_t)fs.f_bavail * fs.f_bsize < (uint64_t)ss.st_size + (8ull << 30)) {
+        MLOG("pipeline archive copy: not enough room in %s for %.1f GB and 8 GB to spare: mapped from the drive", dir, ss.st_size / 1073741824.0); return; }
+    char tmp[PATH_MAX]; snprintf(tmp, sizeof tmp, "%s.part", dst); unlink(tmp);
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (copyfile(src, tmp, NULL, COPYFILE_DATA) || rename(tmp, dst)) { MLOG("[RED] pipeline archive copy to %s failed (%s): mapped from the drive", dst, strerror(errno)); unlink(tmp); return; }
+    snprintf(out, cap, "%s", dst);
+    MLOG("pipeline archive bundled with the app: copied to %s, %.1f MB in %.1f s (once for this build of the app)", dst, ss.st_size / 1048576.0, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e9);
+}
+static pthread_mutex_t g_bl_mu = PTHREAD_MUTEX_INITIALIZER; static int g_bl_done; static char g_bl_path[PATH_MAX];
+static const char *bundle_local(const char *src) {   // the copy on the internal disk to open instead (DM_PSO_MAPPED=copy), or NULL; the first caller makes it, the others wait
+    if (!pso_copy_mode() || !src) return NULL;
+    pthread_mutex_lock(&g_bl_mu);
+    if (!g_bl_done) { g_bl_done = 1; bundle_local_make(src, g_bl_path, sizeof g_bl_path); }
+    pthread_mutex_unlock(&g_bl_mu);
+    return *g_bl_path ? g_bl_path : NULL;
+}
 static void *arch_readahead_run(void *arg) {
-    char *path = arg; uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), n = 0;
+    char *path = arg;
+    { const char *l = bundle_local(path); if (l) { free(path); path = strdup(l); if (!path) return NULL; } }   // the copy is what gets opened (made here, early, when it is not there yet)
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), n = 0;
     int fd = open(path, O_RDONLY);
     if (fd >= 0) {
         fcntl(fd, F_RDAHEAD, 1);
@@ -4376,45 +4425,94 @@ static nvn_hmap g_cpu_tex = {.klen = 8}, g_cpu_tex_retired = {.klen = 8};   // s
 static nvn_hmap g_cpu_unc = {.klen = 8};   // serial → pool: the uncompressed 2D textures tex_cpu_content took from their storage, which leave the CPU-written set at their pool's first GPU write
 static _Atomic int g_pool_gpuw_new;   // the GPU has written storage it had not written before since cpu_unc_drop last looked
 static nvn_hmap g_cpu_unc_lo = {.klen = 8}, g_cpu_unc_sz = {.klen = 8};   // serial → storage start and size of those textures, under g_cpu_tex_mu
-// The storage ranges the GPU has written (render targets, clears, copy destinations, image stores), sorted and merged, until their pool goes. A mark on the whole pool was too coarse for one
-// that holds both kinds: The Legend of Zelda: Ocarina of Time keeps its terrain height tiles (260x260 R32F, written by the CPU with no flush) in a 202 MB pool with textures the GPU writes,
-// so the pool counted as GPU-written, every height tile stayed zeros and each terrain patch was a flat plane far below the player: the sky showed wherever only the terrain covers the ground.
-// An uncompressed texture is kept from its storage only where its own range overlaps one the GPU wrote (aCidcOde, GitHub issue #1326)
-static struct gpuw_rng { uint64_t lo, hi; } *g_gpuw; static uint32_t g_ngpuw, g_gpuw_cap; static pthread_mutex_t g_gpuw_mu = PTHREAD_MUTEX_INITIALIZER;
-static int gpuw_overlaps(uint64_t lo, uint64_t hi) {
-    pthread_mutex_lock(&g_gpuw_mu);
-    uint32_t a = 0, b = g_ngpuw; while (a < b) { uint32_t m = (a + b) / 2; if (g_gpuw[m].hi <= lo) a = m + 1; else b = m; }
-    int r = a < g_ngpuw && g_gpuw[a].lo < hi;
-    pthread_mutex_unlock(&g_gpuw_mu);
+// The storage the GPU has written (render targets, clears, copy destinations, image stores), by span, until their pool goes. A mark on the whole pool was too coarse for one that holds
+// both kinds: The Legend of Zelda: Ocarina of Time keeps its terrain height tiles (260x260 R32F, written by the CPU with no flush) in a 202 MB pool with textures the GPU writes, so the pool
+// counted as GPU-written, every height tile stayed zeros and each terrain patch was a flat plane far below the player (aCidcOde, GitHub issue #1326). Spans that only grew were still too
+// coarse: the game reuses a tile slot whose normal map the GPU drew for a height or blend / hole map the CPU fills, and that storage stayed the GPU's until the pool went, so tiles streamed
+// in after a scene change came out as zeros: holes in the ground with the sky or fog below showing through, leaving the Deku Tree, until a reload (upstream e2b76d4e, PR #1604). So a span
+// keeps the dirty-page generation of its last GPU write (stamp) and has its whole pages write-protected, and a CPU write into it afterwards makes the storage the CPU's content again.
+// Only whole pages count: a span's first and last pages are shared with whatever lies beside it. Spans do not merge: a GPU write over part of one cuts it, and the parts outside keep their
+// own stamp. A span without a tracked range (whole-pool marks, storage the CPU cannot write) stays the GPU's. GPU writes are stamped when recorded, so a command buffer submitted again
+// does not stamp its writes again (open: storage the CPU wrote since counts as the CPU's until the next recorded GPU write there)
+typedef struct { uint64_t lo, hi, stamp, seen; const void *rg; int taken; } gws_span;   // seen: dirty generation at the last look; rg: the dirty-page range of its whole pages; taken: a texture was taken from it since its stamp
+static gws_span *g_gws; static uint32_t g_ngws, g_cgws; static pthread_mutex_t g_gws_mu = PTHREAD_MUTEX_INITIALIZER;
+static void whole_pages(uint64_t lo, uint64_t hi, uint64_t *a, uint64_t *e) { uint64_t pg = (uint64_t)getpagesize(); *a = (lo + pg - 1) & ~(pg - 1); *e = hi & ~(pg - 1); }
+static uint32_t gws_find(uint64_t a) { uint32_t l = 0, h = g_ngws; while (l < h) { uint32_t m = (l + h) / 2; if (g_gws[m].hi <= a) l = m + 1; else h = m; } return l; }   // the first span that ends after a; g_gws_mu held
+static void gws_stamp(gws_span *s, int track) {   // the stamp first, then the protection (nvn_dirty_now); g_gws_mu held
+    uint64_t a, e; whole_pages(s->lo, s->hi, &a, &e);
+    s->stamp = s->seen = nvn_dirty_now();
+    s->rg = track && e > a ? nvn_dirty_span((const void *)(uintptr_t)a, e - a) : NULL;
+    if (s->rg) nvn_dirty_protect((const void *)(uintptr_t)a, e - a);
+}
+static int gws_cpu_since(gws_span *s, uint64_t lo, uint64_t hi) {   // the CPU wrote a whole page of [lo, hi) within the span after its stamp; g_gws_mu held
+    uint64_t a, e; whole_pages(MAX(lo, s->lo), MIN(hi, s->hi), &a, &e);
+    if (e <= a || !s->rg) return 0;
+    return nvn_dirty_since_cached(&s->rg, (const void *)(uintptr_t)a, e - a, s->stamp);
+}
+static int gws_rewritten(gws_span *s) {   // the GPU writes a span again: a CPU write since its stamp is overwritten now. 1: a texture taken from it must become a GPU texture again; g_gws_mu held
+    uint64_t now = nvn_dirty_now();
+    if (now == s->seen) return 0;
+    s->seen = now;
+    if (!gws_cpu_since(s, s->lo, s->hi)) return 0;
+    gws_stamp(s, 1);
+    if (s->taken) { s->taken = 0; return 1; }
+    return 0;
+}
+static void gws_room(uint32_t more) {   // g_gws_mu held
+    if (g_ngws + more <= g_cgws) return;
+    uint32_t cap = g_cgws ? 2 * g_cgws : 256; while (cap < g_ngws + more) cap *= 2;
+    g_gws = realloc_or_die(g_gws, cap * sizeof *g_gws, "the GPU-written spans"); g_cgws = cap;
+}
+static void gws_set(uint64_t lo, uint64_t hi, int track) {   // [lo, hi) becomes one span, stamped now; the spans it overlaps keep their parts outside it, with their own stamps; g_gws_mu held
+    uint32_t i = gws_find(lo), j = i;
+    while (j < g_ngws && g_gws[j].lo < hi) j++;   // spans i .. j-1 overlap [lo, hi)
+    int nl = i < j && g_gws[i].lo < lo, nr = i < j && g_gws[j - 1].hi > hi;
+    gws_span left = nl ? g_gws[i] : (gws_span){0}, right = nr ? g_gws[j - 1] : (gws_span){0};
+    left.hi = lo; right.lo = hi;
+    uint32_t n = (uint32_t)nl + 1 + (uint32_t)nr;
+    gws_room(n);
+    memmove(g_gws + i + n, g_gws + j, (g_ngws - j) * sizeof *g_gws);
+    g_ngws = g_ngws - (j - i) + n;
+    if (nl) g_gws[i++] = left;
+    g_gws[i] = (gws_span){.lo = lo, .hi = hi}; gws_stamp(&g_gws[i], track);
+    if (nr) g_gws[i + 1] = right;
+}
+static int gpuw_add(uint64_t lo, uint64_t hi, int track) {   // 1 when a texture taken from its storage may now lie over storage the GPU writes (cpu_unc_drop looks again)
+    if (hi <= lo) return 0;
+    pthread_mutex_lock(&g_gws_mu);
+    uint32_t i = gws_find(lo); int r = 1;
+    if (track && i < g_ngws && g_gws[i].lo == lo && g_gws[i].hi == hi && g_gws[i].rg) r = gws_rewritten(&g_gws[i]);
+    else gws_set(lo, hi, track);
+    pthread_mutex_unlock(&g_gws_mu);
     return r;
 }
-static void gpuw_room(void) { if (g_ngpuw < g_gpuw_cap) return; g_gpuw_cap = g_gpuw_cap ? g_gpuw_cap * 2 : 256; g_gpuw = realloc_or_die(g_gpuw, g_gpuw_cap * sizeof *g_gpuw, "the GPU-written ranges"); }
-static int gpuw_add(uint64_t lo, uint64_t hi) {   // 1 when it covers storage that was not covered before
-    if (hi <= lo) return 0;
-    pthread_mutex_lock(&g_gpuw_mu);
-    uint32_t a = 0, b = g_ngpuw; while (a < b) { uint32_t m = (a + b) / 2; if (g_gpuw[m].hi < lo) a = m + 1; else b = m; }   // the first range that touches or follows lo
-    if (a < g_ngpuw && g_gpuw[a].lo <= lo && g_gpuw[a].hi >= hi) { pthread_mutex_unlock(&g_gpuw_mu); return 0; }
-    b = a; while (b < g_ngpuw && g_gpuw[b].lo <= hi) { if (g_gpuw[b].lo < lo) lo = g_gpuw[b].lo; if (g_gpuw[b].hi > hi) hi = g_gpuw[b].hi; b++; }
-    if (b == a) { gpuw_room(); memmove(g_gpuw + a + 1, g_gpuw + a, (g_ngpuw - a) * sizeof *g_gpuw); g_ngpuw++; }
-    else if (b > a + 1) { memmove(g_gpuw + a + 1, g_gpuw + b, (g_ngpuw - b) * sizeof *g_gpuw); g_ngpuw -= b - a - 1; }
-    g_gpuw[a].lo = lo; g_gpuw[a].hi = hi;
-    pthread_mutex_unlock(&g_gpuw_mu);
-    return 1;
+static int gpuw_overlaps(uint64_t lo, uint64_t hi) {   // the GPU wrote some of [lo, hi) and the CPU has not rewritten it since: the storage is not the content
+    int owned = 0;
+    pthread_mutex_lock(&g_gws_mu);
+    for (uint32_t i = gws_find(lo); i < g_ngws && g_gws[i].lo < hi && !owned; i++) owned = !gws_cpu_since(&g_gws[i], lo, hi);
+    pthread_mutex_unlock(&g_gws_mu);
+    return owned;
 }
-// A pool's storage goes with it: a pool made later at those addresses starts unwritten, as its gpu_written does. Ranges merge across neighbouring pools, so one may be cut in two
+static void gpuw_take(uint64_t lo, uint64_t hi) {   // a texture over [lo, hi) is taken from its storage: the next GPU write there makes it a GPU texture again (gws_rewritten, gws_set)
+    pthread_mutex_lock(&g_gws_mu);
+    for (uint32_t i = gws_find(lo); i < g_ngws && g_gws[i].lo < hi; i++) g_gws[i].taken = 1;
+    pthread_mutex_unlock(&g_gws_mu);
+}
+// A pool's storage goes with it: a pool made later at those addresses starts unwritten, as its gpu_written does. A span that reaches past the pool is cut
 static void gpuw_drop(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return;
-    pthread_mutex_lock(&g_gpuw_mu);
-    uint32_t a = 0, b = g_ngpuw; while (a < b) { uint32_t m = (a + b) / 2; if (g_gpuw[m].hi <= lo) a = m + 1; else b = m; }
-    for (b = a; b < g_ngpuw && g_gpuw[b].lo < hi; b++) {}
+    pthread_mutex_lock(&g_gws_mu);
+    uint32_t a = gws_find(lo), b = a;
+    while (b < g_ngws && g_gws[b].lo < hi) b++;
     if (b > a) {
-        struct gpuw_rng left = {g_gpuw[a].lo, lo}, right = {hi, g_gpuw[b - 1].hi}; uint32_t keep = (left.lo < left.hi) + (right.lo < right.hi);
-        gpuw_room();
-        memmove(g_gpuw + a + keep, g_gpuw + b, (g_ngpuw - b) * sizeof *g_gpuw); g_ngpuw = g_ngpuw - (b - a) + keep;
-        if (left.lo < left.hi) g_gpuw[a++] = left;
-        if (right.lo < right.hi) g_gpuw[a] = right;
+        gws_span left = g_gws[a], right = g_gws[b - 1]; left.hi = lo; right.lo = hi;
+        uint32_t keep = (left.lo < left.hi) + (right.lo < right.hi);
+        gws_room(keep);
+        memmove(g_gws + a + keep, g_gws + b, (g_ngws - b) * sizeof *g_gws); g_ngws = g_ngws - (b - a) + keep;
+        if (left.lo < left.hi) g_gws[a++] = left;
+        if (right.lo < right.hi) g_gws[a] = right;
     }
-    pthread_mutex_unlock(&g_gpuw_mu);
+    pthread_mutex_unlock(&g_gws_mu);
 }
 static void cpu_tex_drop_pool(const void *pool) {
     pthread_mutex_lock(&g_cpu_tex_mu);
@@ -4497,12 +4595,18 @@ static void cpu_unc_take(const tex_t *t) {   // an uncompressed texture is taken
     nvn_hm_put(&g_cpu_unc, &s, (void *)t->pool); nvn_hm_put(&g_cpu_unc_lo, &s, (void *)t->mem); nvn_hm_put(&g_cpu_unc_sz, &s, (void *)(uintptr_t)t->L.size);
     pthread_mutex_unlock(&g_cpu_tex_mu);
 }
+static int storage_first_use_on(void) { static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_FIRST_USE"); on = !e || atoi(e) != 0; } return on; }
+// Whether the texture's first use takes its content from its storage (tex_cpu_content's rule, less its non-zero test): ft_add (hle_nvn.c) then protects its storage only at that first use
+int mtl_tex_first_use_reads(const tex_t *t) {
+    int unc = tex_unc(t);
+    return storage_first_use_on() && tex_storage_ok(t, unc) && !(unc && tex_storage_gpuw(t));
+}
 static int tex_cpu_content(const tex_t *t) {
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_NVN_STORAGE_FIRST_USE"); on = !e || atoi(e) != 0; }
+    int on = storage_first_use_on();
     int unc = tex_unc(t);
     if (!on || !tex_storage_ok(t, unc)) return 0;
     if ((unc && tex_storage_gpuw(t)) || !mem_any(t->mem, t->L.size)) return 0;   // not over storage the GPU writes
-    if (unc) cpu_unc_take(t);
+    if (unc) { cpu_unc_take(t); gpuw_take((uint64_t)(uintptr_t)t->mem, (uint64_t)(uintptr_t)t->mem + t->L.size); }
     static uint64_t n[2]; if (n[unc]++ < 4) MLOG("texture written by the CPU before its first use ser=%llu %ux%ux%u format %#x%s pool flags %#x: uploaded from its storage, re-uploaded when it changes (%llu so far)",
                                          (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, unc ? " (uncompressed, storage the GPU has not written)" : "", t->pool->flags, (unsigned long long)n[unc]);
     return 1;
@@ -4510,8 +4614,9 @@ static int tex_cpu_content(const tex_t *t) {
 void mtl_tex_gpu_written(const void *pool, const void *mem, uint64_t size) {
     pool_t *p = (pool_t *)pool;
     if (!p) return;
-    if (!mem || !size) { mem = p->mem; size = p->size; }
-    int fresh = mem && size && gpuw_add((uint64_t)(uintptr_t)mem, (uint64_t)(uintptr_t)mem + size);
+    int whole = !mem || !size;   // the whole pool: no texture's storage, so not tracked (the GPU's until the pool goes)
+    if (whole) { mem = p->mem; size = p->size; }
+    int fresh = mem && size && gpuw_add((uint64_t)(uintptr_t)mem, (uint64_t)(uintptr_t)mem + size, !whole);
     if (!atomic_load_explicit(&p->gpu_written, memory_order_relaxed)) { atomic_store(&p->gpu_written, 1); fresh = 1; }
     if (fresh) atomic_store(&g_pool_gpuw_new, 1);
 }
@@ -4529,7 +4634,7 @@ int mtl_tex_cpu_rewritten(const tex_t *t) {
         if (unc && tex_storage_gpuw(t)) return MTL_REWRITE_GPU_NOW;
         mtl_tex_cpu_written(t);
         if (unc) {
-            cpu_unc_take(t);
+            cpu_unc_take(t); gpuw_take((uint64_t)(uintptr_t)t->mem, (uint64_t)(uintptr_t)t->mem + t->L.size);
         }
         return MTL_REWRITE_UPLOADED;
     }
@@ -4917,7 +5022,10 @@ static void *tex_mtl_(const tex_t *ct) {
         }
     }
     id have = tex_get(t->serial);
-    if (!packaged && !have && DM_GAME_TEX_DIRTY_UPLOAD && t->mem && on_sub_thread()) { int nvn_ft_written(const tex_t *); packaged = nvn_ft_written(t); }   // first use of a texture the CPU wrote since init without a flush (hle_nvn.c)
+    if (!packaged && !have && nvn_tex_dirty_on() && t->mem) {   // first use of a texture the CPU wrote since init without a flush (hle_nvn.c); one first used off the submit thread is protected from now on
+        int nvn_ft_written(const tex_t *); void nvn_ft_arm(const tex_t *);
+        if (on_sub_thread()) packaged = nvn_ft_written(t); else nvn_ft_arm(t);
+    }   // first use of a texture the CPU wrote since init without a flush (hle_nvn.c)
     if (!packaged && !have && on_sub_thread() && tex_cpu_content(t)) { mtl_tex_cpu_written(t); packaged = 1; }   // storage the CPU wrote before its first use (tex_cpu_content)
     if (packaged) {
         NvPkg *pk = [have isKindOfClass:[NvPkg class]] ? have : nil;   // resolved as GPU-only before the CPU wrote it: dropped and rebuilt as packaged
@@ -8340,6 +8448,19 @@ static int unorm_chan_masks(MTLPixelFormat f, uint32_t m[4]) {   // the bits eac
     for (int c = 0; c < 4; c++) m[c] = b;
     return 1;
 }
+static uint32_t pf_chan_bits(MTLPixelFormat f) {   // the channels a colour format stores, R G B A from the low bit (a write mask's bits past them change nothing)
+    switch (f) {
+        case MTLPixelFormatA8Unorm: return 0x8;
+        case MTLPixelFormatR8Unorm: case MTLPixelFormatR8Unorm_sRGB: case MTLPixelFormatR8Snorm: case MTLPixelFormatR8Uint: case MTLPixelFormatR8Sint:
+        case MTLPixelFormatR16Unorm: case MTLPixelFormatR16Snorm: case MTLPixelFormatR16Uint: case MTLPixelFormatR16Sint: case MTLPixelFormatR16Float:
+        case MTLPixelFormatR32Uint: case MTLPixelFormatR32Sint: case MTLPixelFormatR32Float: return 0x1;
+        case MTLPixelFormatRG8Unorm: case MTLPixelFormatRG8Unorm_sRGB: case MTLPixelFormatRG8Snorm: case MTLPixelFormatRG8Uint: case MTLPixelFormatRG8Sint:
+        case MTLPixelFormatRG16Unorm: case MTLPixelFormatRG16Snorm: case MTLPixelFormatRG16Uint: case MTLPixelFormatRG16Sint: case MTLPixelFormatRG16Float:
+        case MTLPixelFormatRG32Uint: case MTLPixelFormatRG32Sint: case MTLPixelFormatRG32Float: return 0x3;
+        case MTLPixelFormatB5G6R5Unorm: case MTLPixelFormatRG11B10Float: case MTLPixelFormatRGB9E5Float: case MTLPixelFormatBGR10_XR: case MTLPixelFormatBGR10_XR_sRGB: return 0x7;
+        default: return 0xf;
+    }
+}
 static uint32_t lop_key(const pso_key *k, NvShader *fs, int merged) {   // pso_key.logic, after the formats and the alpha test are in k
     if (!fs || !lop_on()) return 0;
     int any = 0, norm = 0, other = 0;
@@ -8462,6 +8583,9 @@ static MTLRenderPipelineDescriptor *pso_desc(const pso_key *k, NvShader *vs, NvS
         // while targets 1 (normals) and 3 (pre-lighting) have SRC_ALPHA blending and all channels enabled
         int unwritten = fs && fs->rf.color_known && !fsfn && l != 0xff && (!(fs->rf.color_mask >> l & 1) || (dual_fn && l == 1));
         if (unwritten) m = 0;
+        // Components of a written output outside the shader's output map (SPH word 18): the GPU leaves them as they were; Metal writes the whole attachment, those components undefined
+        // (the translator stores only the mapped ones). Lichii traced a NaN band above Ocarina of Time's horizon to this; its agl_common depth pass maps output 2's R only
+        else if (fs && fs->rf.omap_known && !fsfn && l != 0xff) m &= fs->rf.omap >> (4 * l) & 0xf;
         c.writeMask = (m & 1 ? MTLColorWriteMaskRed : 0) | (m & 2 ? MTLColorWriteMaskGreen : 0) | (m & 4 ? MTLColorWriteMaskBlue : 0) | (m & 8 ? MTLColorWriteMaskAlpha : 0);
         // Integer targets: no blending. Maxwell ignores the blend enable on them; Metal refuses the pipeline (an assertion even without the API validation layer): Luigi's Mansion 3's integer G-buffer (PR #105)
         if (!k->logic && l != 0xff && k->blend_en >> l & 1 && !unwritten && !pf_int_kind(c.pixelFormat)) {   // a logic operation takes the place of blending (lop_key)
@@ -8540,7 +8664,9 @@ static id arch_read_mapped(id self, SEL cmd, NSString *path, NSUInteger options,
     return g_ns_read(self, cmd, path, options, max, err);
 }
 static Method arch_read_method(void) { return class_getInstanceMethod([NSData class], sel_registerName("initWithContentsOfFile:options:maxLength:error:")); }
-static void arch_open_begin(void) {
+static void arch_open_begin(void) {   // DM_PSO_MAPPED=0: read whole into memory as Foundation does on an external drive (a lookup then never waits on the drive; about the archive's size more memory)
+    static int mapped = -1; if (mapped < 0) { const char *e = getenv("DM_PSO_MAPPED"); mapped = !(e && !strcmp(e, "0")); if (!mapped) MLOG("pipeline archives: read into memory, not mapped (DM_PSO_MAPPED=0)"); }
+    if (!mapped) return;
     Method m = arch_read_method(); if (!m || g_ns_swapped) return;
     IMP prev = method_setImplementation(m, (IMP)arch_read_mapped); if (!g_ns_read) g_ns_read = (ns_read_fn)prev; g_ns_swapped = 1;
 }
@@ -8571,16 +8697,22 @@ static id<MTL4Compiler> g_comp4;
 static NSArray<id<MTL4Archive>> *g_arch4, *g_arch4p; static NSString *g_arch_dir; static int g_arch_seq;
 // Compaction: every start writes a file or more (each flush captures only what is new), Breath of the Wild 5-7 per start, and each file a base is not in costs a lookup about 0.06 ms.
 // With more than PSO_ARCH_COMPACT files of bases with a vertex layout, the bases the prewarm takes from them are captured again from the original shader functions, so the flush
-// after the prewarm writes them into one file; the old files are then removed (open archives stay usable for the rest of the run). Bases the
-// prewarm did not take (pso_user.tsv never named them) go with them and are built again when drawn. The prebuild's files (p<seq>) are left as they are
+// after the prewarm writes them into one file, or one per ARCH_PERIOD_MAX of them; once every period that may hold them is written, the old files are removed (open archives stay
+// usable for the rest of the run). Bases the prewarm did not take (pso_user.tsv never named them) go with them and are built again when drawn. The prebuild's files (p<seq>) are
+// left as they are
 enum { PSO_ARCH_COMPACT = 8 };
 static int g_compact_enabled;   // immutable after pso4_init; unlike g_compact_files, never cleared by the archive queue
-static NSArray<NSString *> *g_compact_files; static _Atomic int g_compacted, g_compact_taken;   // g_compact_taken: a flush period holds the recaptured bases (arch_flush)
+static NSArray<NSString *> *g_compact_files; static _Atomic int g_compacted;
+// g_compact_periods: periods that may hold recaptured bases, handed over and not written yet; g_compact_closed: the last of them is handed over (the first flush after the prewarm);
+// g_compact_bad: one was not written, or a base the prewarm took from an old file was not captured again: the old files stay (arch_compact_finish)
+static _Atomic int g_compact_periods, g_compact_closed, g_compact_bad;
 // Keep the crash-recovery guard if a compaction still fails in Metal. Markers name the OS build and capture method: a marker from the old archive-import path must not
 // disable the safer original-function capture. A failed flush of this method disables compaction on this OS build until it changes; ordinary archive reads remain available.
 static NSString *arch_compact_marker(void) { return [g_arch_dir stringByAppendingPathComponent:@"compacting"]; }
 static NSString *arch_os_build(void) { char b[64] = ""; size_t n = sizeof b; sysctlbyname("kern.osversion", b, &n, NULL, 0); return [NSString stringWithFormat:@"os\t%s\n", b]; }
-static NSString *arch_compact_stamp(void) { return [arch_os_build() stringByAppendingString:@"capture\toriginal-functions-v1\n"]; }
+// v2: recaptured bases in periods of ARCH_PERIOD_MAX. A v1 marker on this system build is most likely the period that filled Metal's archiver store (one of 8,693 bases on Ocarina
+// of Time, from Nov 6): it took compaction away for good and the files piled up (215 on an M4 Pro), so a v1 marker lets compaction be tried once more
+static NSString *arch_compact_stamp(void) { return [arch_os_build() stringByAppendingString:@"capture\toriginal-functions-v2\n"]; }
 static int arch_compact_allowed(void) {
     NSString *m = [NSString stringWithContentsOfFile:arch_compact_marker() encoding:NSUTF8StringEncoding error:nil];
     if (!m) return 1;
@@ -8599,8 +8731,9 @@ static dispatch_queue_t g_arch_q; static _Atomic int g_arch_new, g_arch_new_vd, 
 // pipeline found in the files. The flush used to hold a lock against every such compile instead, and one compile that did not return (Super Mario Odyssey's alRenderMaterialUber
 // with the front end at -O2: 33.7 minutes until Metal gave up, GitHub issue #294) held the flush, and the flush every compile and draw that came after it. Now such a compile
 // holds back the file of its own period and nothing else
-@interface ArchEpoch : NSObject { @public id<MTL4Compiler> comp; id<MTL4PipelineDataSetSerializer> ser; dispatch_group_t busy; _Atomic int active, n, vd; int compacting; } @end
-// n, vd: bases captured, those with a vertex layout
+@interface ArchEpoch : NSObject { @public id<MTL4Compiler> comp; id<MTL4PipelineDataSetSerializer> ser; dispatch_group_t busy; _Atomic int active, n, vd, failed; int compacting; } @end
+// n, vd: pipelines captured, those of them that are bases with a vertex layout (compute pipelines count as such); failed: a capture in it failed (arch_cap_failed); compacting: it may
+// hold recaptured bases (arch_flush_from)
 @implementation ArchEpoch @end
 static ArchEpoch *g_ep; static os_unfair_lock g_ep_lock = OS_UNFAIR_LOCK_INIT;   // the current period
 static _Atomic uint64_t g_cps_archived, g_cps_arch_ns, g_cps_compiled, g_cps_comp_ns;   // compute pipelines taken from the archives / compiled (cps_make)
@@ -8697,6 +8830,7 @@ static void pso_bundle_open(NSMutableArray<id<MTL4Archive>> *archp) {
              have.count ? [have componentsJoinedByString:@", "].UTF8String : "none");
         return;
     }
+    { const char *l = bundle_local(p.fileSystemRepresentation); if (l) p = @(l); }   // DM_PSO_MAPPED=copy: the copy on the internal disk (its folder stays the app's: prebuilt.tsv)
     uint64_t t0 = bp_now(); NSError *ae = nil;
     if (!arch_file_ok(p)) { MLOG("[RED] pipeline archive bundled with the app: %s is not a pipeline archive: the bases are built on the device", p.UTF8String); return; }
     id<MTL4Archive> a = arch_open(p, &ae);
@@ -8734,14 +8868,55 @@ static ArchEpoch *ep_enter(void) {   // the current period, joined: a flush hand
     return ep;
 }
 static void ep_leave(ArchEpoch *ep) { atomic_fetch_sub(&ep->active, 1); dispatch_group_leave(ep->busy); }
-// A compile the archive captures, in the current flush period, counted there when it built (vd: the base has a vertex layout). No task options: a captured base never imports
-// archive entries (see the compaction crash below)
-static id<MTLRenderPipelineState> arch_capture(MTL4RenderPipelineDescriptor *d, NSError **e, int vd) {
-    if (!g_arch_cap) return [g_comp4 newRenderPipelineStateWithDescriptor:d compilerTaskOptions:nil error:e];
-    ArchEpoch *ep = ep_enter();
-    id<MTLRenderPipelineState> ps = [ep->comp newRenderPipelineStateWithDescriptor:d compilerTaskOptions:nil error:e];
-    if (ps) { atomic_fetch_add(&ep->n, 1); atomic_fetch_add(&g_arch_new, 1); if (vd) { atomic_fetch_add(&ep->vd, 1); atomic_fetch_add(&g_arch_new_vd, 1); } }
+// A flush period's size. Metal keeps each serializer's state in an LMDB environment of fixed map size (10 MB, in its own com.apple.gpuarchiver/gpuarchiver-* folder under the
+// user cache folder), and once that is full every compile through the period's compiler fails ("cannot write 'UNITSMAPPINGS' database: MDB_MAP_FULL"), not only its capture.
+// Ocarina of Time's compacting prewarm of a 40,000-row list, whose flushes waited for the prewarm's end, put 8,693 bases into one period and filled it: 1,502 pipelines failed to
+// build in Kakariko Village, and players saw the pipelines built again at every start, as none of them reached a file (upstream eed7c429, PR #1735). So the ARCH_PERIOD_MAX-th
+// capture of a period hands it over (arch_flush_from), compaction or not, and each period gets a fresh environment. g_arch_period_max: the tests lower it
+enum { ARCH_PERIOD_MAX = 2000 };
+static int g_arch_period_max = ARCH_PERIOD_MAX;
+static _Atomic int g_arch_cap_off;   // capturing failed in a period that held nothing yet: the store was not full, so no more captures this run (arch_cap_failed)
+static int arch_capturing(void) { return g_arch_cap && !atomic_load_explicit(&g_arch_cap_off, memory_order_relaxed); }
+static void arch_flush_from(ArchEpoch *only);
+// The capture refused a pipeline the plain compiler built. The archive is a cache and never a condition of drawing: the pipeline is used all the same. A period that has captured
+// pipelines is taken as full and handed over, so the next captures go into a fresh environment (once per period: compiles under way in it fail too); a failure in a period that
+// has captured nothing is not the store's size, and the run captures no more
+static void arch_cap_failed(ArchEpoch *ep, NSError *ce, const char *what) {
+    const char *why = ce ? ce.localizedDescription.UTF8String : "no error given";
+    int n = atomic_load(&ep->n);
+    if (!n) { if (!atomic_exchange(&g_arch_cap_off, 1)) MLOG("[RED] pipeline archive: capturing a %s pipeline failed in a new flush period (%s): no more captures this run, pipelines are built without the archive", what, why); return; }
+    if (atomic_exchange(&ep->failed, 1)) return;
+    MLOG("[RED] pipeline archive: capturing a %s pipeline failed after %d in its flush period (%s): built without the archive, the captures go on in a new period", what, n, why);
+    arch_flush_from(ep);
+}
+// A compile the archive captures, in the current flush period, counted there when it built (vd: the base has a vertex layout; *captured: it is in the period). No task options: a
+// captured base never imports archive entries (see the compaction crash below). One the capture refuses is built by the plain compiler (arch_cap_failed); a pipeline both refuse
+// returns the plain compiler's error, or the capture's when it gave none
+static id<MTLRenderPipelineState> arch_capture(MTL4RenderPipelineDescriptor *d, NSError **e, int vd, int *captured) {
+    if (captured) *captured = 0;
+    if (!arch_capturing()) return [g_comp4 newRenderPipelineStateWithDescriptor:d compilerTaskOptions:nil error:e];
+    ArchEpoch *ep = ep_enter(); NSError *ce = nil;
+    id<MTLRenderPipelineState> ps = [ep->comp newRenderPipelineStateWithDescriptor:d compilerTaskOptions:nil error:&ce];
+    int full = 0;
+    if (ps) { atomic_fetch_add(&g_arch_new, 1); if (vd) { atomic_fetch_add(&ep->vd, 1); atomic_fetch_add(&g_arch_new_vd, 1); } full = atomic_fetch_add(&ep->n, 1) + 1 == g_arch_period_max; }
     ep_leave(ep);
+    if (ps) { if (captured) *captured = 1; if (full) arch_flush_from(ep); return ps; }
+    ps = [g_comp4 newRenderPipelineStateWithDescriptor:d compilerTaskOptions:nil error:e];
+    if (ps) arch_cap_failed(ep, ce, "render"); else if (e && !*e) *e = ce;
+    return ps;
+}
+// The same for a compute pipeline (cps_make). It counts as a base with a vertex layout does: its file is a plain one, never a p<seq> file
+static id<MTLComputePipelineState> arch_capture_cs(MTL4ComputePipelineDescriptor *d, NSError **e, int *captured) {
+    if (captured) *captured = 0;
+    if (!arch_capturing()) return [g_comp4 newComputePipelineStateWithDescriptor:d compilerTaskOptions:nil error:e];
+    ArchEpoch *ep = ep_enter(); NSError *ce = nil;
+    id<MTLComputePipelineState> ps = [ep->comp newComputePipelineStateWithDescriptor:d compilerTaskOptions:nil error:&ce];
+    int full = 0;
+    if (ps) { atomic_fetch_add(&g_arch_new, 1); full = atomic_fetch_add(&ep->n, 1) + 1 == g_arch_period_max; }
+    ep_leave(ep);
+    if (ps) { if (captured) *captured = 1; if (full) arch_flush_from(ep); return ps; }
+    ps = [g_comp4 newComputePipelineStateWithDescriptor:d compilerTaskOptions:nil error:e];
+    if (ps) arch_cap_failed(ep, ce, "compute"); else if (e && !*e) *e = ce;
     return ps;
 }
 // A compute pipeline: from the archives (the bundled one first, then this Mac's files) in about 0.3 ms, else compiled through the current flush period's compiler so the flush
@@ -8757,16 +8932,14 @@ static id<MTLComputePipelineState> cps_make(NvShader *cs, NSError **e) {
     for (id<MTL4Archive> a in g_arch4p) if ((ps = [a newComputePipelineStateWithDescriptor:d error:nil])) { from_run = a != g_arch_bundle; break; }
     if (!ps) for (id<MTL4Archive> a in g_arch4) if ((ps = [a newComputePipelineStateWithDescriptor:d error:nil])) { from_run = a != g_arch_bundle; break; }
     if (ps) { g_cps_archived++; g_cps_arch_ns += bp_now() - t0;
-        if (from_run && g_compact_enabled && atomic_load(&g_warm_running)) {   // as a render base taken from this Mac's files during a compaction: captured again for the new file
-            if (!g_arch_cap) return ps;
-            ArchEpoch *ep = ep_enter(); id<MTLComputePipelineState> cb = [ep->comp newComputePipelineStateWithDescriptor:d compilerTaskOptions:nil error:nil];
-            if (cb) { atomic_fetch_add(&ep->n, 1); atomic_fetch_add(&g_arch_new, 1); ps = cb; g_compacted++; }
-            ep_leave(ep); }
+        if (from_run && g_compact_enabled && atomic_load(&g_warm_running)) {   // as a render base taken from this Mac's files during a compaction: captured again for the new files
+            int cap = 0; id<MTLComputePipelineState> cb = arch_capturing() ? arch_capture_cs(d, nil, &cap) : nil;
+            if (cb) ps = cb;
+            if (cap) g_compacted++; else g_compact_bad = 1;   // not in the new files: the old ones stay
+        }
         return ps; }
     NSError *ce = nil;
-    if (!g_arch_cap) ps = [g_comp4 newComputePipelineStateWithDescriptor:d compilerTaskOptions:nil error:&ce];
-    else { ArchEpoch *ep = ep_enter(); ps = [ep->comp newComputePipelineStateWithDescriptor:d compilerTaskOptions:nil error:&ce];
-           if (ps) { atomic_fetch_add(&ep->n, 1); atomic_fetch_add(&g_arch_new, 1); } ep_leave(ep); }
+    ps = arch_capture_cs(d, &ce, NULL);
     if (ps) { g_cps_compiled++; g_cps_comp_ns += bp_now() - t0; return ps; }
     static int lg = 4; if (lg > 0) { lg--; MLOG("compute pipeline %s: the Metal 4 compiler refused it (%s): built through the device", cs->key, ce.localizedDescription.UTF8String); }
     return [g_dev newComputePipelineStateWithFunction:cs->fn error:e];
@@ -8815,13 +8988,16 @@ static void pso4_init(void) {
     });
 }
 static int pso4_compiler(void) { pso4_init(); return g_comp4 != nil; }   // render pipelines go through the Metal 4 compiler (fn_spec)
-// Writes one flush period's captures as the next file of the archive, on g_arch_q once every compile in the period has returned; g_arch_flush_ok: the last one wrote its file
-static int g_arch_flush_ok;
+// Writes one flush period's captures as the next file of the archive, on g_arch_q once every compile in the period has returned
 static void arch_compact_finish(void);
+static void arch_write_file(ArchEpoch *ep);
 static void arch_write(ArchEpoch *ep) {
+    arch_write_file(ep);
+    if (ep->compacting && atomic_fetch_sub(&g_compact_periods, 1) == 1 && atomic_load(&g_compact_closed)) arch_compact_finish();   // the compaction's last period to be written
+}
+static void arch_write_file(ArchEpoch *ep) {
     int n = atomic_load(&ep->n), vd = atomic_load(&ep->vd);   // exact: no compile of the period is under way
     if (!n) return;
-    g_arch_flush_ok = 0;
     [NSFileManager.defaultManager createDirectoryAtPath:g_arch_dir withIntermediateDirectories:YES attributes:nil error:nil];
     uint64_t t0 = bp_now(); NSError *e = nil;
     NSString *path = [g_arch_dir stringByAppendingPathComponent:[NSString stringWithFormat:vd ? @"%05d.mtl4a" : @"p%05d.mtl4a", g_arch_seq++]], *tmp = [path stringByAppendingString:@".tmp"];
@@ -8830,45 +9006,48 @@ static void arch_write(ArchEpoch *ep) {
     if (ep->compacting) unlink(arch_compact_marker().fileSystemRepresentation);
     atomic_fetch_sub(&g_arch_new, n); atomic_fetch_sub(&g_arch_new_vd, vd);
     ok = ok && !rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation);
-    if (!ok) { MLOG("[RED] pipeline archive: writing %s failed%s%s", path.UTF8String, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); unlink(tmp.fileSystemRepresentation); }
+    if (!ok) { MLOG("[RED] pipeline archive: writing %s failed%s%s", path.UTF8String, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); unlink(tmp.fileSystemRepresentation); if (ep->compacting) g_compact_bad = 1; }
     else {
-        g_arch_flush_ok = 1;
         MLOG("pipeline archive: %d new pipeline bases written to %s (%.1f MB, %.0f ms)", n, path.lastPathComponent.UTF8String,
              [[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileSize] / 1048576.0, (bp_now() - t0) / 1e6);
     }
-    if (ep->compacting) arch_compact_finish();
 }
 // A flush: the compiles from here on capture into a new period, and the current one is written once its compiles have returned. Returns at once, on any thread; a compile that
-// does not return holds back only its own period's file
-static void arch_flush(void) {
-    // Keep all recaptured bases in one serialization, even when a prewarm lasts beyond the timer.
-    if (!g_arch_cap || (g_compact_enabled && atomic_load(&g_warm_running))) return;
-    os_unfair_lock_lock(&g_ep_lock); int any = atomic_load(&g_ep->n) || atomic_load(&g_ep->active); os_unfair_lock_unlock(&g_ep_lock);
+// does not return holds back only its own period's file. only: hand over that period alone, and only while it is the current one (a full period, a failed capture); those go
+// ahead during a compacting prewarm, where the timer's flushes wait so that the recaptured bases make as few files as they can
+static void arch_flush_from(ArchEpoch *only) {
+    if (!g_arch_cap || (!only && g_compact_enabled && atomic_load(&g_warm_running))) return;
+    os_unfair_lock_lock(&g_ep_lock); int any = (!only || g_ep == only) && (atomic_load(&g_ep->n) || atomic_load(&g_ep->active)); os_unfair_lock_unlock(&g_ep_lock);
     if (!any) return;   // nothing captured or under way: the period goes on
     ArchEpoch *ne = ep_new();
     if (!ne) { MLOG("[RED] pipeline archive: Metal made no compiler for a new flush period: the captures go on into the current one"); return; }
     os_unfair_lock_lock(&g_ep_lock);
-    ArchEpoch *old = g_ep; any = atomic_load(&old->n) || atomic_load(&old->active);   // again: another flush may just have handed it over
+    ArchEpoch *old = g_ep; any = (!only || old == only) && (atomic_load(&old->n) || atomic_load(&old->active));   // again: another flush may just have handed it over
     if (any) {
         g_ep = ne;
-        old->compacting = g_compact_enabled && atomic_load(&g_compacted) && !atomic_exchange(&g_compact_taken, 1);   // this period holds the recaptured bases (see arch_compact_allowed)
+        // Every period from the first recaptured base on may hold some (see arch_compact_allowed); the first one handed over after the prewarm is the compaction's last
+        if (g_compact_enabled && atomic_load(&g_compacted) && !atomic_load(&g_compact_closed)) {
+            old->compacting = 1; atomic_fetch_add(&g_compact_periods, 1);
+            if (!atomic_load(&g_warm_running)) atomic_store(&g_compact_closed, 1);
+        }
     }
     os_unfair_lock_unlock(&g_ep_lock);
     if (!any) return;
     dispatch_group_enter(g_arch_pending);
     dispatch_group_notify(old->busy, g_arch_q, ^{ @autoreleasepool { arch_write(old); } dispatch_group_leave(g_arch_pending); });
 }
+static void arch_flush(void) { arch_flush_from(nil); }
 // A flush, then every period handed over is written (not on g_arch_q, which writes them)
 static void arch_flush_wait(void) { arch_flush(); if (g_arch_pending) dispatch_group_wait(g_arch_pending, DISPATCH_TIME_FOREVER); }
 static void arch_note_new(void) {   // a base was compiled: flush 10 s later (one flush for a burst of them)
     if (!g_arch_q || atomic_exchange(&g_arch_sched, 1)) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * (int64_t)NSEC_PER_SEC), g_arch_q, ^{ atomic_store(&g_arch_sched, 0); arch_flush(); });
 }
-static void arch_compact_finish(void) {   // after the period that holds the recaptured bases is written (arch_write): the old files go once their bases are in the new one
+static void arch_compact_finish(void) {   // after every period that may hold recaptured bases is written (arch_write): the old files go once their bases are in the new ones
     if (!g_compact_files || !g_compacted) return;
-    if (!g_arch_flush_ok) { MLOG("[RED] pipeline archive: compaction left the old files (the flush failed)"); return; }
+    if (g_compact_bad) { MLOG("[RED] pipeline archive: compaction left the old files (a flush failed, or a base was not captured again)"); return; }
     for (NSString *f in g_compact_files) unlink(f.fileSystemRepresentation);
-    MLOG("pipeline archive compacted: %lu files of bases with a vertex layout gave %d bases to the file just written and were removed", (unsigned long)g_compact_files.count, (int)g_compacted);
+    MLOG("pipeline archive compacted: %lu files of bases with a vertex layout gave %d bases to the files just written and were removed", (unsigned long)g_compact_files.count, (int)g_compacted);
     g_compact_files = nil;
 }
 static void pso_col4(MTL4RenderPipelineColorAttachmentDescriptor *a, MTLRenderPipelineColorAttachmentDescriptor *c) {
@@ -8965,13 +9144,14 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, N
         if (base && from_run && g_compact_enabled && atomic_load(&g_warm_running)) {
             // Metal can crash in materializeAirNTFromOnlineForSlice when serializing archive imports mixed with fresh bases (#342).
             // Work around that framework bug by capturing the original shader functions, without lookupArchives. The normal compiler cache still applies.
-            id<MTLRenderPipelineState> cb = arch_capture(b, nil, vd);
-            if (cb) { base = cb; g_compacted++; }
+            int cap = 0; id<MTLRenderPipelineState> cb = arch_capturing() ? arch_capture(b, nil, vd, &cap) : nil;
+            if (cb) base = cb;
+            if (cap) g_compacted++; else g_compact_bad = 1;   // not in the new files: the old ones stay
         }
         if (!base) {
             if (g_arch4.count + g_arch4p.count) { g_pt_miss_n++; g_pt_miss_ns += t1 - t0; }
             if (compile) {
-                NSError *be = nil; base = arch_capture(b, &be, vd); job->error = be; job->compiled = 1;
+                NSError *be = nil; base = arch_capture(b, &be, vd, NULL); job->error = be; job->compiled = 1;
                 g_pt_comp_ns += bp_now() - t1;
                 if (base) { g_pb_built++; if (g_arch_cap) arch_note_new(); }
             }
@@ -9228,7 +9408,7 @@ static void pre_pair(NSString *vk, NSString *fk, int zero) {
         if (!m) { g_pre_skipped++; return; }
         for (id<MTL4Archive> a in g_arch4p) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
         for (id<MTL4Archive> a in g_arch4) if ([a newRenderPipelineStateWithDescriptor:m error:nil]) { g_pre_archived++; return; }
-        NSError *e = nil; id ps = arch_capture(m, &e, 0);
+        NSError *e = nil; id ps = arch_capture(m, &e, 0, NULL);
         if (ps) g_pre_built++;
         else {
             if (g_pre_failed++ < 4) MLOG("[RED] pipeline prebuild: the base of %s + %s failed: %s", vk.UTF8String, fk.UTF8String, e.localizedDescription.UTF8String);
@@ -10990,6 +11170,7 @@ static int first_draw_covers(int i, id<MTLTexture> t, NSUInteger level) {
     NvShader *vs = pr->sh[0], *fs = pr->sh[1];
     if (!vs || !fs || vs->rf.pos_attr < 0 || fs->rf.may_discard || atest_on() || lop_on() || fs->rf.writes_smask || !(fs->rf.color_mask >> i & 1)) return g_fd_why = 2, 0;   // atest_on: the alpha test may drop fragments; lop_on: the logic operation reads the target
     if (!t || t.sampleCount != 1 || t.textureType == MTLTextureType3D) return g_fd_why = 3, 0;
+    if (fs->rf.omap_known && pf_chan_bits(t.pixelFormat) & ~(fs->rf.omap >> (4 * i))) return g_fd_why = 4, 0;   // a stored channel outside the shader's output map keeps its old value (pso_build's write mask)
     if ((S.color.blend_en >> i & 1) || ((S.chmask.mask >> (4 * i)) & 0xf) != 0xf || S.ms.a2c || S.poly.mode != NVN_POLYGON_MODE_FILL) return g_fd_why = 4, 0;
     if (R.rt.depth && ((S.ds.dt && S.ds.df != NVN_DEPTH_FUNC_ALWAYS) || S.ds.st)) return g_fd_why = 5, 0;
     if (n < 3 || n > 64) return g_fd_why = 6, 0;
@@ -13898,7 +14079,7 @@ static int ndsr_dispatch(NvShader *cs, const p_dispatch *dp);
 // data would otherwise run for ever, and committed work is not reclaimed when the process exits
 #define DPC_MAXDIM 65535u
 #define DPC_MAXTOTAL (1u << 22)
-static int dpc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_CLAMP"); v = !(e && !strcmp(e, "0")); } return v; }
+static int dpc_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_DISPATCH_CLAMP"); v = e ? strcmp(e, "0") != 0 : DM_GAME_DISPATCH_CLAMP; } return v; }   // profile key dispatch_clamp
 static int dpc_clamp_enc(id ce, uint64_t rec, __strong id<MTLBuffer> *ob, size_t *oo, uint64_t *og) {
     static id<MTLComputePipelineState> ps; static id<MTL4ArgumentTable> at; static int failed;
     if (failed) return 0;
@@ -13988,7 +14169,7 @@ static void dispatch(const p_dispatch *dp) {
         uint64_t cg; id<MTLBuffer> cb_; size_t co;
         if (dpc_clamp_enc(ce, ig, &cb_, &co, &cg)) { ib = (__bridge void *)cb_; io = co; ig = cg; }
         [(id<MTL4ComputeCommandEncoder>)ce setArgumentTable:g_ct]; if (!own) g_blit_ct = 1;
-        args_dirty_all();
+        g_args_dirty[5] = 1; g_args_ogen[5]++;   // the clamp bound a table of its own and g_ct is back unchanged: only this dispatch's arguments are encoded again, not every stage's
     }
     PD("X %llu dispatch %s groups %llux%llux%llu%s%s", g_stat_pass, cs->key, (unsigned long long)dp->x, (unsigned long long)dp->y, (unsigned long long)dp->z, dp->ind ? " indirect" : "", own ? " (own encoder)" : g_disp_last_beside ? " beside the one before" : " after a barrier");
     enc_c_pso(ce, ps);
@@ -14083,7 +14264,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     // textures from the CPU, reads them back with ReadTexels on its own thread before any draw uses them, and copies the blocks into its 5120x5120 roughness atlas. Read from the
     // never-uploaded host texture they were zeros, the atlas stayed empty, and the opening cave's stone blocks got roughness 0 and no torch light
     int nvn_ft_written(const tex_t *);
-    if (tex_from_storage(t) || (DM_GAME_TEX_DIRTY_UPLOAD && t->mem && nvn_ft_written(t))) {
+    if (tex_from_storage(t) || (nvn_tex_dirty_on() && t->mem && nvn_ft_written(t))) {
         // A sparse pool's texture is read through a copy gathered from its page table, unmapped pages as 0, as pkg_upload_ uploads it: where nothing is mapped its address range is
         // inaccessible (reading the storage directly stopped the host with SIGBUS)
         const uint8_t *mem = t->mem; uint8_t *part = NULL;
