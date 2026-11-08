@@ -406,7 +406,10 @@ PRE_STATS = collections.Counter()
 SHADER_MATH = {'fast': [], 'relaxed': ['-fmetal-math-mode=relaxed'], 'safe': ['-fno-fast-math']}
 _math = GAME.get('shader_math', 'fast') if GAME else 'fast'
 if _math not in SHADER_MATH: sys.exit(f'[RED] game.tsv shader_math: {_math} (fast, relaxed or safe)')
-MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance']
+# -fwrapv: signed integer arithmetic wraps, as on Maxwell / Ampere and in SPIR-V (OpIMul, OpIAdd, OpShiftLeftLogical are modular), which spirv-cross writes as MSL int arithmetic, whose
+# overflow the front end takes as impossible. Ocarina of Time's mesh shaders take the low half of a packed word sign-extended as (w * 65536) >> 16: without the flag that became w's
+# high half shifted into place (the lightmap UV 65536 times too large: a bright band on a Deku Tree wall, a pale patch at the Kokiri exit; 64 of its 42,848 shaders hold the form)
+MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance', '-fwrapv']
 MAC_METAL += SHADER_MATH[_math]   # its own statement: tests that run the assignment above alone (test_dmsh_raw_last) compile as the default
 MAC_RECORD = ' '.join(MAC_METAL) + '; xcrun -sdk macosx metallib'
 # -fbracket-depth: the front end stops at 256 nested brackets ("bracket nesting level exceeded maximum of 256"). Ocarina of Time's compute shaders 1f78730053feb036 and e172bd7ec218ab8e
