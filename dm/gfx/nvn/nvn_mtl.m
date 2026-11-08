@@ -8709,6 +8709,23 @@ static _Atomic int g_compact_periods, g_compact_closed, g_compact_bad;
 // Keep the crash-recovery guard if a compaction still fails in Metal. Markers name the OS build and capture method: a marker from the old archive-import path must not
 // disable the safer original-function capture. A failed flush of this method disables compaction on this OS build until it changes; ordinary archive reads remain available.
 static NSString *arch_compact_marker(void) { return [g_arch_dir stringByAppendingPathComponent:@"compacting"]; }
+// The files the last compaction wrote (arch_compact_finish), one name a line: they do not count toward PSO_ARCH_COMPACT. A compaction writes a file per ARCH_PERIOD_MAX bases, so
+// Ocarina of Time's 11,238 recaptured bases made 6 files; counted, three more starts' files passed the limit and every few starts compacted again, about 9 minutes of compiles at
+// the title (a headless walk of Castle Town never left it). The next compaction still takes them along with the newer files
+static NSString *arch_compacted_list(void) { return [g_arch_dir stringByAppendingPathComponent:@"compacted"]; }
+static NSSet<NSString *> *arch_compacted_names(void) {
+    NSString *s = [NSString stringWithContentsOfFile:arch_compacted_list() encoding:NSUTF8StringEncoding error:nil];
+    NSMutableSet<NSString *> *names = [NSMutableSet set];
+    for (NSString *l in [s componentsSeparatedByString:@"\n"]) if (l.length) [names addObject:l];
+    return names;
+}
+// Whether the plain files of an archive folder call for a compaction: more than PSO_ARCH_COMPACT of them, not counting what the last compaction wrote (the tests call it)
+static int arch_compact_wanted(NSArray<NSString *> *plain) {
+    NSSet<NSString *> *done = arch_compacted_names(); NSUInteger n = 0;
+    for (NSString *p in plain) n += ![done containsObject:p.lastPathComponent];
+    return n > PSO_ARCH_COMPACT;
+}
+static NSMutableArray<NSString *> *g_compact_written;   // the files the compacting periods wrote (arch_write_file, on g_arch_q)
 static NSString *arch_os_build(void) { char b[64] = ""; size_t n = sizeof b; sysctlbyname("kern.osversion", b, &n, NULL, 0); return [NSString stringWithFormat:@"os\t%s\n", b]; }
 // v2: recaptured bases in periods of ARCH_PERIOD_MAX. A v1 marker on this system build is most likely the period that filled Metal's archiver store (one of 8,693 bases on Ocarina
 // of Time, from Nov 6): it took compaction away for good and the files piled up (215 on an M4 Pro), so a v1 marker lets compaction be tried once more
@@ -8963,6 +8980,10 @@ static void pso4_init(void) {
             });
 #endif
             uint64_t t0 = bp_now(); unsigned long long bytes = 0;
+            // A write a stopped run left: Metal's own serialization file (<UUID>.metallib) or ours (.mtl4a.tmp). Nothing writes the folder yet; one was 286 MB
+            NSRegularExpression *uuid_lib = [NSRegularExpression regularExpressionWithPattern:@"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\\.metallib$" options:0 error:nil];
+            for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:g_arch_dir error:nil])
+                if ([uuid_lib numberOfMatchesInString:f options:0 range:NSMakeRange(0, f.length)] || [f hasSuffix:@".mtl4a.tmp"]) { [NSFileManager.defaultManager removeItemAtPath:[g_arch_dir stringByAppendingPathComponent:f] error:nil]; MLOG("pipeline archive: %s removed (a write a stopped run left)", f.UTF8String); }
             NSMutableArray<NSString *> *runf = [NSMutableArray array];
             NSArray<NSString *> *names = [[[NSFileManager.defaultManager contentsOfDirectoryAtPath:g_arch_dir error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.mtl4a'"]]
                                           sortedArrayUsingSelector:@selector(compare:)];
@@ -8974,7 +8995,7 @@ static void pso4_init(void) {
                 else MLOG("[RED] pipeline archive file %s not usable (%s): its bases are built again", p.UTF8String, ae ? ae.localizedDescription.UTF8String : "not a pipeline archive");
                 g_arch_seq = MAX(g_arch_seq, [n substringFromIndex:pf].intValue + 1);
             }
-            if (runf.count > PSO_ARCH_COMPACT && arch_compact_allowed()) { g_compact_enabled = 1; g_compact_files = runf; }
+            if (arch_compact_wanted(runf) && arch_compact_allowed()) { g_compact_enabled = 1; g_compact_files = runf; }
             MLOG("pipeline archive %s: %lu files (%lu of bases without a vertex layout), %.1f MB, opened in %.1f ms", g_arch_dir.UTF8String, (unsigned long)(arch.count + archp.count - (g_arch_bundle != nil)),
                  (unsigned long)archp.count - (g_arch_bundle != nil), bytes / 1048576.0, (bp_now() - t0) / 1e6);
         }
@@ -9008,6 +9029,7 @@ static void arch_write_file(ArchEpoch *ep) {
     ok = ok && !rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation);
     if (!ok) { MLOG("[RED] pipeline archive: writing %s failed%s%s", path.UTF8String, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); unlink(tmp.fileSystemRepresentation); if (ep->compacting) g_compact_bad = 1; }
     else {
+        if (ep->compacting) { if (!g_compact_written) g_compact_written = [NSMutableArray array]; [g_compact_written addObject:path.lastPathComponent]; }
         MLOG("pipeline archive: %d new pipeline bases written to %s (%.1f MB, %.0f ms)", n, path.lastPathComponent.UTF8String,
              [[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileSize] / 1048576.0, (bp_now() - t0) / 1e6);
     }
@@ -9047,6 +9069,7 @@ static void arch_compact_finish(void) {   // after every period that may hold re
     if (!g_compact_files || !g_compacted) return;
     if (g_compact_bad) { MLOG("[RED] pipeline archive: compaction left the old files (a flush failed, or a base was not captured again)"); return; }
     for (NSString *f in g_compact_files) unlink(f.fileSystemRepresentation);
+    [[[g_compact_written ?: @[] componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"] writeToFile:arch_compacted_list() atomically:YES encoding:NSUTF8StringEncoding error:nil];
     MLOG("pipeline archive compacted: %lu files of bases with a vertex layout gave %d bases to the files just written and were removed", (unsigned long)g_compact_files.count, (int)g_compacted);
     g_compact_files = nil;
 }
@@ -14163,6 +14186,11 @@ static void dispatch(const p_dispatch *dp) {
     if (ndsr_dispatch(cs, dp)) return;   // agl's four-dispatch NDSR upscaler, replaced as a whole (DM_NDSR)
     if (up_mfx_wanted(cs) && !dp->ind && up_mfx_encode(cs)) return;   // the game's upscaler, drawn by MetalFX instead (DM_UPSCALER=metalfx)
     int own = dispatch_own();
+    g_dispatch_dim[0] = (uint32_t)dp->x; g_dispatch_dim[1] = (uint32_t)dp->y; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
+    g_c0_dim_buf = nil;
+    // A sampled format view may upgrade its texture and copy its pixels. Prepare the compute table before opening an encoder of its own,
+    // or before dispatch_enc's copy-to-dispatch barrier: otherwise the upgrade opens a second encoder, or its copy races the dispatch (#1743).
+    encode_args(nil, cs, 5, 0);
     if (own && g_blit) { enc_b_end(g_blit); g_blit = nil; }
     id<MTLComputeCommandEncoder> ce = own ? pg_compute() : (id<MTLComputeCommandEncoder>)dispatch_enc(1);
     if (dp->ind && dpc_on()) {   // the GPU-written group counts, clamped into the frame arena first (see dpc_clamp); the dispatch and the c0 copy below read the clamped ones
@@ -14174,9 +14202,6 @@ static void dispatch(const p_dispatch *dp) {
     PD("X %llu dispatch %s groups %llux%llux%llu%s%s", g_stat_pass, cs->key, (unsigned long long)dp->x, (unsigned long long)dp->y, (unsigned long long)dp->z, dp->ind ? " indirect" : "", own ? " (own encoder)" : g_disp_last_beside ? " beside the one before" : " after a barrier");
     enc_c_pso(ce, ps);
     { char ck[17]; subrec_key(ck, cs->key, cs->builtin); subrec_add("-", ck, (__bridge const void *)cs, 1); }   // GPU hang watchdog: the compute shaders of this submission
-    g_dispatch_dim[0] = (uint32_t)dp->x; g_dispatch_dim[1] = (uint32_t)dp->y; g_dispatch_dim[2] = (uint32_t)dp->z;   // read back by the driver segment c0 (encode_args_)
-    g_c0_dim_buf = nil;
-    encode_args(ce, cs, 5, 0);
     if (cs->rf.tg_spill) {   // threadgroup memory past Metal's 32 KB, in a device buffer (dmsh_build.py tg_spill): a slice per workgroup, the workgroup's index modulo DMSH_TG_GROUPS
         uint64_t groups = dp->ind ? DMSH_TG_GROUPS : MIN((uint64_t)dp->x * dp->y * dp->z, (uint64_t)DMSH_TG_GROUPS);
         __strong id<MTLBuffer> tb = nil; size_t to = arena_alloc((size_t)MAX(groups, 1ull) * cs->rf.tg_spill, &tb);
@@ -14881,6 +14906,38 @@ static int cut_draws(void) { static int v = -1; if (v < 0) { const char *e = get
 static uint64_t g_cut_draw0, g_cuts, g_copy_cuts;
 // The count starts with the submission (mtl_sub_begin). It used to start at the submission's first sub_cut, which only a render target change reaches (OP_SET_RT): the draws a
 // submission makes into the target it inherited, before its first target change, were never counted, and the first segment came that many draws late
+// DM_NVN_CHUNK_MERGE=1 (0 / 1 / ab, alternated with the DM_AB phases; off by default): the queue scheduler (nvn_queue_dispatch.inc qe_pump) encodes the chunks it offers in a row into one
+// command buffer instead of committing each as a submission of its own. Under #1245 a guest submission is cut into chunks at its event waits and signals and each chunk was a host
+// submission: Ocarina of Time (Switch 2) went from 6 to 37 submissions a frame on an iPad Pro (M5), with the GPU draining between a chunk and the next while the host committed it (2.5 ms
+// of idle inside a 22.9 ms frame), the 64-draw segment cuts reset at every chunk, and a drain of the encode thread per chunk. The order is the scheduler's either way (one host queue, the
+// chunks in the order they were offered, a blocked queue's chunk still waits for its producer's offer), so a satisfied wait or a signal costs nothing: no commit, allocator, visibility
+// buffer, completion record or drain. In submission timestamp mode (gpu_timestamps submission) one buffer holds one logical submission's clock (post_run), so a chunk of another logical
+// submission opens a new buffer; in segment mode (Ocarina of Time) chunks of any submission share one. The open buffer's fence is g_fence + 1 (as OP_FENCE_SYNC and the PASSGPU ring take it);
+// the scheduler records it for the chunk and the event projection, and the pump commits before it returns, so no thread waits on a fence not yet committed
+static int chunk_merge_mode(void) {
+    static int m = -1;
+    if (m < 0) { m = sw_mode("DM_NVN_CHUNK_MERGE", 0); if (m) MLOG("DM_NVN_CHUNK_MERGE: the queue scheduler's chunks share one command buffer while they are offered in a row%s", m >= 2 ? " (alternated with the DM_AB phases)" : ""); }
+    return m;
+}
+int mtl_chunk_merge(mtl_submit_clock *clock, int open) {
+    if (!sw_on(chunk_merge_mode())) return 0;
+    if (open && !seg_ts() && g_submit_clock != clock) return 0;   // submission-mode reports take the buffer's one clock (post_run)
+    return 1;
+}
+uint64_t mtl_pending_fence(void) { return g_fence + 1; }
+void mtl_chunk_end(void) {   // the chunk's work lands in the open buffer: what mtl_sub_commit does before it commits (waiting clears, the deferred pass, the open pass, uniform updates, the blit encoder)
+    lc_land();
+    defer_fallback();
+    rp_flush(); ubd_land();
+    if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
+    treg_finish_submission();   // this chunk's transient views (g_sub_serial advances per chunk)
+}
+void mtl_chunk_begin(int resume) {   // the next chunk in the open buffer: sub_begin's per-chunk state, without a new buffer, allocator, visibility buffer, completion record or segment clock
+    g_sub_serial++;
+    if (!resume) { g_rc_npend = 0; g_rc_skip = 0; }
+    defer_reset();
+    zskip_clear(); g_zskip_count = 0;
+}
 static void sub_cut_begin(void) { g_cut_draw0 = g_stat_draw; }
 // DM_FSTEP_PROBE_RAMP=1 (default) / 0 / ab: a frame-step probe's grace is renewed while its frames keep getting cheaper (nvn_fstep.h FSTEP_RAMP), the time macOS's GPU clock takes to rise for the shorter deadline
 static int probe_ramp_mode(void) { static int m = -1; if (m < 0) m = sw_mode("DM_FSTEP_PROBE_RAMP", 1); return m; }
