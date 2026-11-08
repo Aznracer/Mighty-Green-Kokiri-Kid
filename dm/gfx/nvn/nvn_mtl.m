@@ -693,7 +693,7 @@ static void udc_selftest(void) {
 // The bundled pipeline archive read ahead (DM_PSO_READAHEAD=0 turns it off): Metal reads the whole archive when it opens it, and arch_open maps it, so on an external drive the
 // open faulted it in a page at a time: Ocarina of Time's 4.3 GB took 9-16 s from a USB disk behind a grey window (read whole into memory it took 6.5 s, but stayed in the footprint).
 // A thread started with the device reads the file in 16 MB pieces while the game boots, so the open finds its pages in the file cache, which the system can take back
-// DM_PSO_MAPPED=copy (the Mac launcher's Archive on an external drive, Copy to this Mac): the bundled archive on another volume than the home folder (the app on a USB drive) is copied
+// DM_PSO_MAPPED=copy (the Mac launcher's Archive on an external drive, Copy to boot drive): the bundled archive on another volume than the home folder (the app on a USB drive) is copied
 // once to ~/Library/Caches/nxnative/<game>/ and mapped from there. Mapped from the drive, a lookup whose pages the system dropped waits on the drive (Hyrule Castle Town: 1.4 ms a lookup,
 // hitches of 50-80 ms); read whole into memory (DM_PSO_MAPPED=0) it costs about its size: 4.3 GB on a 24 GB Mac took Ocarina of Time to 19.4 GB resident and into swap, and the GPU
 // waited 25-37 ms a frame entering the town. On the internal disk its pages are clean and cheap to read again. The copy's name holds the archive's size and date, so a rebuilt app

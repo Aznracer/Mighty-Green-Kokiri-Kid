@@ -177,12 +177,12 @@ Built in the background while playing instead, the stand-ins took an iPhone 17 P
 
 ### Archive on an external drive (Mac)
 
-Where the pipeline archive is read from while you play, when the app is on an external drive. **Copy to this Mac** (the default) copies it to the Mac's own disk the first time (`~/Library/Caches/nxnative/<game>`, about 4 GB for Ocarina of Time; that first start takes a little longer) and reads it from there: finding a pipeline never waits on the external drive, and it costs no extra memory. A rebuilt app copies again and the old copy is removed. Without 8 GB to spare on the disk it reads from the drive instead. **Load into memory** reads the whole archive into memory at the start, so it never waits on the drive either, but costs as much memory as the archive: on a 24 GB Mac Ocarina of Time went into swap with it. **Read from the drive** leaves it on the drive: no copy and no memory, but when the Mac has dropped the parts a scene needs, the game waits for the drive and hitches. With the app on the Mac's own disk all three behave the same.
+Where the pipeline archive is read from while you play, when the app is on an external drive. **Copy to boot drive** (the default) copies it to the Mac's boot drive the first time (`~/Library/Caches/nxnative/<game>`, about 4 GB for Ocarina of Time; that first start takes a little longer) and reads it from there: finding a pipeline never waits on the external drive, and it costs no extra memory. A rebuilt app copies again and the old copy is removed. Without 8 GB to spare on the disk it reads from the drive instead. **Load into memory** reads the whole archive into memory at the start, so it never waits on the drive either, but costs as much memory as the archive: on a 24 GB Mac Ocarina of Time went into swap with it. **Read from the drive** leaves it on the drive: no copy and no memory, but when the Mac has dropped the parts a scene needs, the game waits for the drive and hitches. With the app on the Mac's own disk all three behave the same.
 
 Measured in Ocarina of Time's Hyrule Castle Town on a USB drive, a pipeline lookup took 1.4 ms read from the drive and 0.33 ms loaded into memory.
 
 - **When to change it:** choose Read from the drive if the Mac's disk is nearly full.
-- **Cost:** Copy to this Mac, about 4 GB of the Mac's disk; Load into memory, as much memory as the archive.
+- **Cost:** Copy to boot drive, about 4 GB of the boot drive; Load into memory, as much memory as the archive.
 
 ### Encode thread
 
@@ -314,7 +314,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Frame buffering | `DM_PRESENT_SNAP` | `1`, `0` |
 | Metal 4 pipelines | `DM_PSO_MTL4` | `1`, `0` |
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |
-| Archive on an external drive (Mac) | `DM_PSO_MAPPED` | `copy` copy to the Mac's disk, `0` load into memory, `1` read from the drive |
+| Archive on an external drive (Mac) | `DM_PSO_MAPPED` | `copy` copy to the boot drive, `0` load into memory, `1` read from the drive |
 | Encode thread | `DM_NVN_ENC_THREAD` | `1`, `0` |
 | Hold frames when late | `DM_FPS_HOLD` | `on`, `off` |
 | Performance HUD | `DM_METAL_HUD` | `1`, `0` |
