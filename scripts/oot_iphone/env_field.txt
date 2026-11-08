@@ -1,0 +1,22 @@
+# Ocarina of Time, iPhone Duo (tested with a phone cooler): Hyrule Field, Castle Town, outdoor areas.
+# Stable (no memory crash); 60 fps standing still, drops while moving or in busy scenes.
+# Load only outdoor saves with it (DM_POOL_ANON=0 has frozen loading a save inside the Deku Tree).
+# Launcher: GMEM_NOBIG and GMEM_SKIP off.
+DM_PRESENT_SNAP=1
+DM_PRESENT_UPSCALE=off
+DM_RENDER_SCALE=0.5
+DM_NDSR=metalfx
+DM_NVN_RES_LIMIT_MB=6900
+DM_NVN_TEX_MIP_SKIP=512
+DM_NVN_TEX_MIP_LEVELS=1
+DM_TEX_LAZY=2
+DM_TEX_LAZY_MIN_KB=1024
+DM_TEX_RELEASE=1
+DM_OPMODE=0
+DM_GFX_SCALE=0
+DM_NVN_DISPATCH_OVERLAP=0
+DM_NVN_CUT=256
+DM_PRESENT_LINK=2
+DM_NVN_NDVE_MOVIE_DIRECT=1
+DM_FPS_TARGET=60
+DM_POOL_ANON=0
