@@ -23,6 +23,7 @@ void mtl_sp_phys_gone(const void *mem, uint64_t size);
 void mtl_tex_gpu_written(const void *pool, const void *mem, uint64_t size);   // the GPU writes this storage of the pool (a texture's; mem NULL or size 0: the whole pool): the uncompressed textures over it are no longer taken from storage (tex_cpu_content)
 int mtl_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off);   // 1 on success; buf is a (__bridge) id<MTLBuffer>
 void mtl_pool_buffer_addr(const void *mem, uint64_t size);   // the game took a buffer address in [mem, mem+size): raw global memory may reach it (gmem_map_gpu)
+int mtl_addr_known(uint64_t addr, uint64_t len);   // 1 when the range lies in one memory pool (as mtl_addr finds it); does not make the pool resident
 
 typedef struct {
     uint32_t pso, cps, shaders, dss;
@@ -37,6 +38,24 @@ void mtl_res_snapshot(mtl_res_count *out);
 // One submit: begin -> several operations -> commit (returns the fence value at which this submit completes)
 void mtl_prepare(void);                                // the first submission's prepare step (prewarm, pipeline prebuild): no GPU work, called outside the graphics gate
 void mtl_sub_begin(void);
+void mtl_queue_seal(void);                         // own persistent target snapshots before record retirement
+void mtl_sub_resume(void);                         // continuation after a guest event boundary
+// Serialized by the submit lock. Event chunks append to one allocator lease;
+// pressure may revoke its completed prefix so blocked submissions cannot pin
+// the bounded allocator pool forever. Unencoded continuations reacquire it.
+typedef struct mtl_submit_alloc mtl_submit_alloc;
+mtl_submit_alloc *mtl_submit_alloc_new(void);
+void mtl_submit_alloc_close(mtl_submit_alloc *alloc); // last chunk committed, or owner released
+void mtl_submit_alloc_release(mtl_submit_alloc *alloc);
+void mtl_sub_begin_alloc(mtl_submit_alloc *alloc, int resume);
+// Submission-mode timestamps share one clock across host event chunks. The
+// logical submission owns the token; set_clock retains it until completion.
+// Segment-mode GPU timestamps and direct submits without a token are unchanged.
+typedef struct mtl_submit_clock mtl_submit_clock;
+mtl_submit_clock *mtl_submit_clock_new(void);
+void mtl_submit_clock_release(mtl_submit_clock *clock);
+void mtl_sub_set_clock(mtl_submit_clock *clock);    // after begin/resume, before encoding reports
+uint64_t mtl_completed_fence(void);                // post-operations are visible through this fence
 void mtl_queue_activate(uint64_t serial);              // submit lock held: restore this queue's persistent GPU state
 void mtl_queue_forget(uint64_t serial);                // finalize: discard its state, including guest object pointers
 void mtl_sub_copy(uint64_t src, uint64_t dst, uint64_t n);               // Buffer copy in GPU ordering

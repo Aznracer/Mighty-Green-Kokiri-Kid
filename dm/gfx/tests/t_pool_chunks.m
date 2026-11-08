@@ -30,6 +30,15 @@ static id<MTLBuffer> look(uint64_t a, uint64_t n) {
     void *cb = NULL; uint64_t co = 0; CHECK("the CPU lookup agrees", mtl_addr(a, n, &cb, &co) && (uint64_t)(uintptr_t)((__bridge id<MTLBuffer>)cb).contents + co == a);
     return b;
 }
+// A GPU fill of [a, a + n) through the buffer a lookup gives, then whether the guest's memory holds it
+static int gpu_fill_ok(uint64_t a, uint64_t n, uint8_t v) {
+    id<MTLBuffer> b = look(a, n); if (!b) return 0;
+    uint64_t off = a - (uint64_t)(uintptr_t)b.contents;
+    id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> ce = [cb blitCommandEncoder];
+    [ce fillBuffer:b range:NSMakeRange(off, n) value:v]; [ce endEncoding]; [cb commit]; [cb waitUntilCompleted];
+    const uint8_t *p = (const uint8_t *)(uintptr_t)a; for (uint64_t i = 0; i < n; i++) if (p[i] != v) return 0;
+    return 1;
+}
 int main(void) { @autoreleasepool {
     mtl_init();
     const uint64_t GB = 1ull << 30, MB = 1ull << 20;
@@ -148,5 +157,18 @@ int main(void) { @autoreleasepool {
     mtl_sub_begin(); gmem_map_gpu(); finish();
     CHECK("with the pools gone the table is the least again", g_gmem_buf.length / DMSH_GMEM_MAP_ENTRY == DMSH_GMEM_MAP_ENTRIES);
     mtl_pool_del(small); mtl_drain();
+    // A buffer made while any of its pages is write-protected (nvn_dirty_protect: a packaged texture's upload, an index range) drops every GPU write through it, with no error, even to pages
+    // never protected (issue #1591; upstream 2d544e0d). A chunk made, or lengthened, over a protected page must still take the GPU's writes (pool_zc_buf)
+    {
+        uint8_t *wp = mmap(NULL, GB, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0); if (wp == MAP_FAILED) abort();
+        uint64_t wb = (uint64_t)(uintptr_t)wp;
+        mtl_pool_add(wp, GB); nvn_dirty_add_range(wp, GB);
+        nvn_dirty_protect(wp + 40 * MB, 4096);   // a texture's page in the stride the lookup below makes a chunk for
+        CHECK("a new chunk over a protected page takes GPU writes", gpu_fill_ok(wb + 41 * MB, 4096, 0x5a));
+        (void)look(wb + 200 * MB, 64);   // a short chunk, made over writable pages
+        nvn_dirty_protect(wp + 220 * MB, 4096);   // then a page past its end is protected, and a longer lookup lengthens it over that page
+        CHECK("a lengthened chunk over a protected page takes GPU writes", gpu_fill_ok(wb + 200 * MB, 32 * MB, 0x6b));
+        mtl_pool_del(wp); mtl_drain(); nvn_dirty_remove_range(wp); munmap(wp, GB);
+    }
     printf("t_pool_chunks: %d checks, %d failed\n", checks, failed); return failed != 0;
 }}

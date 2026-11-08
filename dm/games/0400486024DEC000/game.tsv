@@ -36,14 +36,22 @@ sys_resource	0x3000000
 # ---- Shader split ----
 shader_groups	/Shader/=shader /Lib/=lib /Effect/=effect /Layout2Shader/=layout /Movie/=movie
 shader_note	0400486024DEC000 shaders
+# Mac shader libraries without fast math (dmsh_build.py SHADER_MATH): with fast or relaxed maths single grass blades went pure white for a frame (Hyrule Field, the castle moat)
+shader_math	safe
 
 # ---- Graphics ----
 # agl wraps its depth clears in render conditions, as on Donkey Kong Bananza and Splatoon Raiders: in Kokiri Forest the main opaque pass tests EQUAL against a copy of the prepass depth
 # that a conditional clear (skipped on the console) wiped first, so no lit geometry landed and the full-screen sky showed through everywhere (a white scene)
 render_cond	on
+# The game turns the difference of two raw counter reports into its wind and particle time step at the Switch 2's system counter rate. At NVN's 614.4 MHz the step was 19.66 times too large: foliage, leaves and hanging plants moved about 20 times too fast
+gpu_ts_hz	31250000
 # Pool tables (shaders reading textures through handles cover every registered ID, about 33,000) made a texture again for each ID whose texture the game had finalized: at the
 # house-to-forest change 1,500 textures and 2.5 GB held only by retired IDs, as much again in deferred release, 16 GB GPU allocated and out of GPU memory. Retired IDs get the dummy
 pool_skip_retired	on
 # The game's compute dispatches with no barrier of its between them run side by side (nvn_mtl.m dispatch_enc): 117 at the start of a frame in Kokiri Forest waited each for the one
 # before, 5.7 ms; side by side 3.7 ms, the frame 27.1 -> 24.9 ms (docked, Apple M4 Pro), the picture within run-to-run noise
 dispatch_overlap	on
+# The terrain tiles' height, blend and hole maps (260x260, one CPU_CACHED | GPU_CACHED pool) are rewritten from the CPU with no flush as tile slots are reused: without these the
+# tiles kept what they held before, flat blue and grey holes in the ground with the grass drawn over them (Kokiri Forest, the Lost Woods)
+tex_flush_upload	on
+tex_dirty_upload	on

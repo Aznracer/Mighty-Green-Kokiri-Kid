@@ -100,6 +100,9 @@ DM_MEMSTAT_DUMP	diagnostic	`=<seconds>`: with `DM_MEMSTAT`, at that second write
 DM_MEM_CAP_GB	switch	`=<GB>`: the memory watchdog exits when resident memory exceeds that many GB (default 24 on the Mac, none on iOS; `0` turns it off)
 DM_METAL_CAPTURE	diagnostic	`=1` makes `build_ipa.sh` produce a build that can write GPU frame captures (`MetalCaptureEnabled` in `Info.plist`), for `DM_GPU_CAPTURE`
 DM_METAL_HUD	player	`1` shows Apple's Metal performance HUD over the game (frame rate, frame and GPU time, memory)
+DM_MIC	player	`1` lists the Mac's default audio input as the game's microphone (input streams, `hle_audio.c`; macOS asks for permission at the first capture): Ocarina of Time plays the ocarina from it. Off by default; no microphone on iOS
+DM_MIC_DUMP	diagnostic	`=<file>` writes the microphone's frames as the game's stream takes them (after the gain), 16-bit mono 48 kHz raw PCM, to hear what the game hears
+DM_MIC_GAIN	player	`=<x>` multiplies the microphone's frames by x before the game reads them (with `DM_MIC=1`); unset or `0`, the gain follows the loudest of the last seconds (falling 6 dB a second), up to 64 (a Mac's input is quieter than what a Switch's system hands the game)
 DM_MOTION	switch	`0` ignores live motion: every six-axis sensor lies flat as before (a shake still plays), and neither controllers' motion sensors nor the phone's device motion are switched on (`hle_hid.c`, `motion_apple.h`, `DmGamepad.m`); the NSP script's `--no-motion` (`MOTION = False`) builds it in
 DM_MOTION_ACC_SIGN	switch	`-1` flips only GameController's acceleration, for a source that reports the specific force (+1 G up at rest) instead of the gravity direction (`motion_fusion.h`); phone and raw HID samples are already in the Switch frame
 DM_MOTION_AXES	switch	`=<map>` such as `x,-z,y`: maps Apple's controller axes to the Switch's, a signed permutation applied to acceleration and rotation alike, for a controller whose axes differ (default `x,y,z`; phone and raw HID samples are already in the Switch frame)
@@ -142,6 +145,7 @@ DM_NVN_DEPTHOVR	diagnostic	`=<fragment shader key prefix>,…`: those draws comp
 DM_NVN_DESWZ_GPU	switch	`0` deswizzles textures on the CPU instead of the GPU, so their pools stay out of the residency set (default `1`)
 DM_NVN_DIRECT_UPLOAD	switch	0 disables bounded direct RGBA16F array uploads and keeps staged copies; on by default for supported non-sparse textures.
 DM_NVN_DIRTYCHECK	diagnostic	`=1` fully hashes pool content on every use to find changes the dirty-page tracking missed
+DM_NVN_DISPATCH_CLAMP	switch	`0` turns off the clamp of GPU-written indirect dispatch counts (each dimension to 65535, the total to 2^22 threadgroups); garbage counts hang the GPU without it
 DM_NVN_DISPATCH_OVERLAP	switch	`1` runs the game's compute dispatches with no barrier of its and nothing else between them side by side in the copy encoder, as NVN allows; `0` orders each after the one before (the default unless the profile sets dispatch_overlap: Ocarina of Time does)
 DM_NVN_DISPATCH_OWN	switch	`=1` gives every compute dispatch a compute encoder of its own with full barriers, as before (by default dispatches share the copy encoder); `DM_NVN_PASSGPU` does the same
 DM_NVN_DUAL_WANT	path	`=<file>`: appends the key of each pixel shader a pipeline blends with its output 1 as the second source, while it has no dual-source entry point, to that file, once per key (the profile's `dual_want.tsv`)
@@ -211,6 +215,8 @@ DM_NVN_SHOT	diagnostic	`=<frame>[,<frame>…]:<path>` saves the swapchain textur
 DM_NVN_SHOT_OUT	diagnostic	`=<W>x<H>` makes `DM_NVN_SHOT` capture the picture as the present pass upscales it to that size, the crop included, instead of the raw swapchain texture
 DM_NVN_SKIP_FS	diagnostic	`=<fragment key>[,…]` (up to 16) drops all draws of those fragment shaders, to measure their GPU cost, bisect a wrong draw, or play on past a fragment shader that hangs the GPU (the one the `DM_NVN_GPU_WATCHDOG` line names); the picture is wrong where they drew
 DM_NVN_SKIP_MESH	diagnostic	`=1` drops every task / mesh draw (the picture is wrong): tells their GPU cost apart from the rest of a frame
+DM_NVN_SKIP_FS	diagnostic	`=<fragment key>[,…]` (up to 16) drops all draws of those fragment shaders, to measure their GPU cost or bisect a wrong draw; the picture is wrong
+DM_NVN_SKIP_MESH	diagnostic	`=1` drops every task and mesh draw, to measure what they cost in all; the picture is wrong
 DM_NVN_SKIP_SMALL	diagnostic	`=<width>` drops all draws whose target width is at most that, to measure the cost of tiny render passes; the picture is wrong
 DM_NVN_SLICE_MERGE	switch	`0` keeps passes into other layers of one array or cube texture level apart (on by default: they run as one layered pass)
 DM_NVN_SNAPRAW	diagnostic	`=1` makes `DM_NVN_TEXDUMP` also save each target's raw bytes, with a text header line, since converting an HDR target to an 8-bit image truncates
@@ -231,6 +237,7 @@ DM_NVN_TEX_SOFT	player	`1` (the launcher's Cheemu section, Softer textures; off 
 DM_NVN_TREG_ID	diagnostic	`=<n>` logs every registration of texture ID n: what it holds from then on, and the frame being recorded
 DM_NVN_TSV	diagnostic	`=<path>` writes the per-frame NVN call table and timing rows (frame, metric, value) to a TSV, read by `scripts/bench.py`
 DM_NVN_TSV_CALLS	diagnostic	`0` makes `DM_NVN_TSV` write only the timing rows, without the call counts (about two thirds of the file)
+DM_NVN_TS_HZ	switch	`=<Hz>` sets the tick rate of the raw counter timestamps instead of the profile's `gpu_ts_hz` (default 614,400,000)
 DM_NVN_UB	diagnostic	`="name=item,…;…"`: alternating measurement in one run; odd phases of `DM_NVN_UB_N` frames (default 180) take one category in turn (`@set:<global>=<value>` or dropped shader keys) and log present times
 DM_NVN_UBD_MEMO	diagnostic	`0` scans the deferred uniform update list for every lookup instead of remembering answers per range until the list changes (for timing)
 DM_NVN_UBP_CHECK	diagnostic	`=1` checks every uniform shadow made from memory: the pass ends, the updates land, the replay waits for the GPU and compares (a difference is a red line; slow)
@@ -281,6 +288,7 @@ DM_PREV_PROGRAM	switch	What `oe::GetPreviousProgramIndex` answers (default -1, s
 DM_PROBE	diagnostic	`=module:offset,…` (Mac only): puts a `brk` at each guest address and on every hit prints the thread, registers, strings they point to and a backtrace, then runs the original instruction
 DM_PROBE_ALL	diagnostic	Set: probe hits (`DM_PROBE`) also print x8–x18
 DM_PROBE_DUMP	diagnostic	`=module:offset:length[:file]`: on the first hit of any probe, writes that range of guest memory to a file (default `run/<platform>/probe_dump.bin`)
+DM_PROBE_EVERY	diagnostic	`=N`: every guest probe hit inside `DM_PROBE_FRAMES` counts, every N-th prints (its `#` is then the true hit count, for rates); `DM_PROBE_LIMIT` caps the printed ones
 DM_PROBE_FRAMES	diagnostic	Presented frame or inclusive `start-end` range in which guest probes print observations
 DM_PROBE_HEAP	diagnostic	`=<name>,<start>,<size>,<free list>,<used list>`: hex offsets of the sead heap layout the probes' `!xN` heap walk uses (default Mario's `0,28,30,b0,c8`)
 DM_PROBE_HEAPFRAME	diagnostic	`=<vtable offset in main>` (hex): the probes' heap walk treats heaps of that class as frame heaps (head +0xe0, tail +0xe8)

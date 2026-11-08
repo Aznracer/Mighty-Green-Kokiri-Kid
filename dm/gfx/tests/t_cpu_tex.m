@@ -215,7 +215,8 @@ static void flushed_buffer_upload(int flush_kind) {
     CHECK(h_nvnTextureInitialize(&tex, &tb), "flush test texture initialized without packaged layout");
     uint8_t pixels[64], zeros[64] = {0}; for (int i=0;i<64;i++) pixels[i]=(uint8_t)(i+32);
     const tex_t *t = (const tex_t *)&tex;
-    // Write block-linear bytes directly; TextureWriteTexels would bypass the flush path.
+    // Write block-linear bytes directly; TextureWriteTexels would bypass the flush path. With tex_dirty_upload the registered texture's pages are write-protected (ft_add)
+    dm_guest_write_prepare(mem + buffer_off + flush_off, t->L.size);
     CHECK(nvn_swizzle(&t->d, 0, 0, pixels, 16, mem + buffer_off + flush_off) == 0, "CPU pixels swizzled into buffer storage");
     if (flush_kind == 1) h_nvnMemoryPoolFlushMappedRange(&pool, buffer_off + flush_off, t->L.size);
     if (flush_kind == 2) h_nvnBufferFlushMappedRange(&buffer, flush_off, t->L.size);
@@ -227,9 +228,11 @@ static void flushed_buffer_upload(int flush_kind) {
     state_reset(); memset(&R,0,sizeof R); mtl_sub_begin(); mtl_exec((const uint8_t *)handle);
     CHECK(mtl_wait(mtl_sub_commit(),5000000000ull), "flushed storage GPU readback completed");
     CHECK(!mtl_last_commit_error(), "flushed storage readback has no GPU error");
-    CHECK(!memcmp(mem + output_off, flush_kind ? pixels : zeros, sizeof pixels),
+    // with tex_dirty_upload a write after registration is seen at first use without a flush too (nvn_ft_written)
+    CHECK(!memcmp(mem + output_off, flush_kind || DM_GAME_TEX_DIRTY_UPLOAD ? pixels : zeros, sizeof pixels),
           flush_kind == 2 ? "buffer flush publishes texture pixels to Metal" :
-          flush_kind == 1 ? "pool flush publishes texture pixels to Metal" : "unflushed cached storage does not trigger first-use upload");
+          flush_kind == 1 ? "pool flush publishes texture pixels to Metal" :
+          DM_GAME_TEX_DIRTY_UPLOAD ? "with tex_dirty_upload an unflushed write after registration is uploaded at first use" : "unflushed cached storage does not trigger first-use upload");
     h_nvnCommandBufferFinalize(&cmd); h_nvnTextureFinalize(&tex); h_nvnBufferFinalize(&buffer); h_nvnMemoryPoolFinalize(&pool);
     CHECK(!nvn_flushed(mem + buffer_off + flush_off, 1), "pool finalization retires buffer flush ranges");
     defer_drain(); munmap(mem,len);
@@ -303,6 +306,134 @@ static void finalize_during_walk(void) {
     mtl_reg_tex(1,NULL,NULL); h_nvnTextureFinalize(&tex);
     defer_drain(); munmap(mem,len);
 }
+static int resident(id o) { pthread_mutex_lock(&g_res_mu); int r = [g_res_objects containsObject:o]; pthread_mutex_unlock(&g_res_mu); return r; }
+static void settle(void) { for (int i = 0; i < 2; i++) { g_fence++; pthread_mutex_lock(&g_mu); g_done = g_fence; pthread_mutex_unlock(&g_mu); defer_drain(); } }   // the GPU passed every fence
+// The GPU's first write over a texture taken from its storage (cpu_unc_drop): every serial that held the package now holds its texture, the package goes, and the serials go one by
+// one, the last through the ghost ring. The texture stays resident while any serial entry, live or finalized, holds it, and leaves the residency set with the last. Ocarina of Time's
+// 260x260 terrain tiles handed over this way left the set with the package, or with the first holder a ghost-ring eviction dropped, while still drawn: GPU address faults (#1326)
+static void handover_holders(void) {
+    const size_t len = 262144;
+    uint8_t *mem = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (mem == MAP_FAILED) abort();
+    memset(mem + 65536, 0x5a, 4096);   // what the CPU wrote before the first use
+    pool_t pool = {0}; pool_builder_t pb = {.mem=mem, .size=len, .flags=NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    CHECK(h_nvnMemoryPoolInitialize((NVNmemoryPool *)&pool, (const NVNmemoryPoolBuilder *)&pb), "hand-over: pool initialized");
+    NVNtextureBuilder tb; NVNtexture a = {0}, b = {0}; h_nvnTextureBuilderSetDefaults(&tb);
+    h_nvnTextureBuilderSetWidth(&tb, 4); h_nvnTextureBuilderSetHeight(&tb, 4); h_nvnTextureBuilderSetFormat(&tb, NVN_FORMAT_RGBA8);
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, 65536);
+    CHECK(h_nvnTextureInitialize(&a, &tb) && h_nvnTextureInitialize(&b, &tb), "hand-over: two texture objects over the same storage");
+    uint64_t sa = ((tex_t *)&a)->serial, sb = ((tex_t *)&b)->serial;
+    mtl_sub_begin();
+    id<MTLTexture> ta0 = tex_mtl((const tex_t *)&a), tb0 = tex_mtl((const tex_t *)&b);
+    CHECK(ta0 && tb0, "hand-over: both texture objects resolve");
+    { const tex_t *ta_ = (const tex_t *)&a; mtl_tex_gpu_written(ta_->pool, ta_->mem, ta_->L.size); }   // the GPU writes over the storage
+    cpu_unc_drop();
+    // This tree's first-use rules decide whether the two serials share one package; what each holds after the hand-over is the texture under test
+    id ha = tex_get(sa), hb = tex_get(sb);
+    CHECK([ha conformsToProtocol:@protocol(MTLTexture)] && [hb conformsToProtocol:@protocol(MTLTexture)], "hand-over: both serials hold a texture, not a package");
+    NVNtexture c = {0}; CHECK(h_nvnTextureInitialize(&c, &tb), "hand-over: a new texture object over the same storage");
+    id<MTLTexture> tc = tex_mtl((const tex_t *)&c);
+    CHECK(tc && tc != (id)ha && tc != (id)hb, "hand-over: the new object gets a texture of its own");
+    CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "hand-over: submission completed");
+    settle();
+    CHECK(resident(ha) && resident(hb), "hand-over: the packages' release leaves the textures resident for their serials");
+    h_nvnTextureFinalize(&a); settle();
+    CHECK(resident(hb), "hand-over: one serial's release leaves the other's texture resident");
+    if (ha != hb) CHECK(!resident(ha), "hand-over: a texture no entry holds any more leaves the residency set");
+    tex_put(sa, hb);   // a record of the finalized object replayed resolves to b's texture through the ghost ring
+    h_nvnTextureFinalize(&b); settle();
+    CHECK(resident(hb), "hand-over: a finalized serial in the ghost ring keeps the texture resident after the last live serial goes");
+    for (uint64_t i = 0; i < NGHOST; i++) tex_put((1ull << 61) + i, [NSObject new]);   // the ring evicts that entry
+    settle();
+    pthread_mutex_lock(&g_smu); int left = g_retire_held.n; pthread_mutex_unlock(&g_smu);
+    CHECK(!resident(hb) && !left, "hand-over: the last holder's release takes it out of the residency set");
+    h_nvnTextureFinalize(&c); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&pool); settle();
+    munmap(mem, len);
+}
+#if DM_GAME_TEX_DIRTY_UPLOAD
+// nvn_ft_poll (tex_dirty_upload): a registered texture the CPU rewrites after its first use is uploaded from its storage, though tex_desc gave it render-target use; one whose storage
+// the GPU wrote is left to the GPU and stays registered (Ocarina of Time's terrain tiles: the height, blend and hole maps are rewritten as tile slots are reused, the normal maps the GPU draws)
+static void poll_rewrites(void) {
+    const size_t len = 1 << 20;
+    uint8_t *mem = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (mem == MAP_FAILED) abort();
+    pool_t pool = {0}; pool_builder_t pb = {.mem=mem, .size=len, .flags=NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    CHECK(h_nvnMemoryPoolInitialize((NVNmemoryPool *)&pool, (const NVNmemoryPoolBuilder *)&pb), "poll: CPU-cached pool initialized");
+    NVNtextureBuilder tb; NVNtexture tex = {0}, drawn = {0}; h_nvnTextureBuilderSetDefaults(&tb);
+    h_nvnTextureBuilderSetWidth(&tb, 256); h_nvnTextureBuilderSetHeight(&tb, 256); h_nvnTextureBuilderSetFormat(&tb, NVN_FORMAT_RGBA8);
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, 65536);
+    CHECK(h_nvnTextureInitialize(&tex, &tb), "poll: texture initialized");
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, 524288);
+    CHECK(h_nvnTextureInitialize(&drawn, &tb), "poll: a second texture initialized");
+    tex_t *t = (tex_t *)&tex, *d = (tex_t *)&drawn;
+    CHECK(nvn_ft_tracked(t->serial) && nvn_ft_tracked(d->serial), "poll: both textures are registered");
+    dm_guest_write_prepare(t->mem, t->L.size); memset(t->mem, 0x40, t->L.size);
+    dm_guest_write_prepare(d->mem, d->L.size); memset(d->mem, 0x40, d->L.size);
+    mtl_tex_gpu_written(d->pool, d->mem, d->L.size);
+    nvn_ft_poll();
+    CHECK(tex_cpu_written(t->serial) && !nvn_ft_tracked(t->serial), "poll: a rewrite of storage the GPU never wrote is uploaded");
+    CHECK(!tex_cpu_written(d->serial) && nvn_ft_tracked(d->serial), "poll: a rewrite the GPU wrote over is left to the GPU, and the texture stays registered");
+    h_nvnTextureFinalize(&tex); h_nvnTextureFinalize(&drawn); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&pool);
+    defer_drain(); munmap(mem, len);
+}
+// Writes beside a registered texture (ft_written): storage 0x200 past a host page shares its first and last pages with other data. A write there leaves the texture registered and
+// not CPU-written, at the poll and at first use (nvn_ft_written); a write of the texture's own bytes in those pages, or of a page wholly inside it, is still taken as written.
+// The Great Ace Attorney Chronicles' window textures and render targets lie so beside textures it fills from the CPU, and were all made CPU-written
+static void poll_beside(void) {
+    const size_t len = 4 << 20, pg = (size_t)getpagesize(), off = 4 * pg + 0x200;
+    uint8_t *mem = mmap(NULL, len, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    if (mem == MAP_FAILED) abort();
+    pool_t pool = {0}; pool_builder_t pb = {.mem=mem, .size=len, .flags=NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED};
+    CHECK(h_nvnMemoryPoolInitialize((NVNmemoryPool *)&pool, (const NVNmemoryPoolBuilder *)&pb), "CPU-cached pool initialized");
+    NVNtextureBuilder tb; NVNtexture a = {0}, b = {0}; h_nvnTextureBuilderSetDefaults(&tb);
+    h_nvnTextureBuilderSetWidth(&tb, 256); h_nvnTextureBuilderSetHeight(&tb, 256); h_nvnTextureBuilderSetFormat(&tb, NVN_FORMAT_RGBA8);
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, (ptrdiff_t)off);
+    CHECK(h_nvnTextureInitialize(&a, &tb), "texture a initialized");
+    tex_t *ta = (tex_t *)&a;
+    size_t boff = (off + ta->L.size + 2 * pg) & ~(pg - 1); boff += 0x200;   // b: two pages on, 0x200 past a page too
+    h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, (ptrdiff_t)boff);
+    CHECK(h_nvnTextureInitialize(&b, &tb), "texture b initialized");
+    tex_t *tb_ = (tex_t *)&b;
+    CHECK(ta->L.size > 2 * pg && nvn_ft_tracked(ta->serial) && nvn_ft_tracked(tb_->serial), "both registered, each with pages wholly inside");
+    // beside a: the bytes before it in its first page, and after it in its last
+    uint8_t *before = ta->mem - 0x100, *after = ta->mem + ta->L.size + 0x40;
+    dm_guest_write_prepare(before, 0x100); memset(before, 0x5a, 0x100);
+    dm_guest_write_prepare(after, 0x40); memset(after, 0x5a, 0x40);
+    nvn_ft_poll();
+    CHECK(!tex_cpu_written(ta->serial) && nvn_ft_tracked(ta->serial), "a write beside it, in the pages it shares, does not make it CPU-written (poll)");
+    dm_guest_write_prepare(after, 0x40); memset(after, 0x33, 0x40);   // again, after the restamp
+    nvn_ft_poll();
+    CHECK(!tex_cpu_written(ta->serial) && nvn_ft_tracked(ta->serial), "nor a second write beside it");
+    dm_guest_write_prepare(ta->mem + ta->L.size - 4, 4); ta->mem[ta->L.size - 1] ^= 0xff;
+    nvn_ft_poll();
+    CHECK(tex_cpu_written(ta->serial) && !nvn_ft_tracked(ta->serial), "a write of its own bytes in its last page is uploaded");
+    // b at first use: a write beside it, then one into a page wholly inside it
+    uint8_t *bb = tb_->mem - 0x80;
+    dm_guest_write_prepare(bb, 0x80); memset(bb, 0x11, 0x80);
+    CHECK(!nvn_ft_written(tb_) && nvn_ft_tracked(tb_->serial) && !tex_cpu_written(tb_->serial), "a write beside it does not make it CPU-written at first use");
+    uint8_t *mid = (uint8_t *)(((uintptr_t)tb_->mem + 2 * pg) & ~(uintptr_t)(pg - 1));
+    dm_guest_write_prepare(mid, 1); mid[0] = 1;
+    CHECK(nvn_ft_written(tb_) && tex_cpu_written(tb_->serial), "a write of a page wholly inside it does");
+    // c: COMPRESSIBLE (out of the first-use rule, as GAAC's targets), resolved as a GPU texture that can be rendered into: a write beside it does not make it CPU-written
+    size_t coff = (boff + tb_->L.size + 2 * pg) & ~(pg - 1); coff += 0x200;
+    NVNtexture c = {0};
+    h_nvnTextureBuilderSetFlags(&tb, NVN_TEXTURE_FLAGS_COMPRESSIBLE); h_nvnTextureBuilderSetStorage(&tb, (NVNmemoryPool *)&pool, (ptrdiff_t)coff);
+    CHECK(h_nvnTextureInitialize(&c, &tb), "texture c initialized");
+    tex_t *tc = (tex_t *)&c;
+    mtl_sub_begin(); id<MTLTexture> hc = tex_mtl(tc); CHECK(mtl_wait(mtl_sub_commit(), 5000000000ull), "c resolved");
+    tex_gpu_wrote(tc, GW_ATTACH);   // this tree's mtl_tex_gpu_owned also asks that the GPU has written it: c is drawn into
+    CHECK(hc && mtl_tex_gpu_owned(tc->serial) && nvn_ft_tracked(tc->serial), "c is a GPU texture that can be rendered into, still registered");
+    uint8_t *cb = tc->mem - 0x80;
+    dm_guest_write_prepare(cb, 0x80); memset(cb, 0x22, 0x80);
+    nvn_ft_poll();
+    CHECK(!tex_cpu_written(tc->serial) && mtl_tex_gpu_owned(tc->serial), "a write beside a GPU texture leaves it the GPU's, not CPU-written");
+    h_nvnTextureFinalize(&a); h_nvnTextureFinalize(&b); h_nvnTextureFinalize(&c); h_nvnMemoryPoolFinalize((NVNmemoryPool *)&pool);
+    defer_drain(); munmap(mem, len);
+}
+#else
+static void poll_rewrites(void) { printf("poll_rewrites: skipped, the profile has no tex_dirty_upload\n"); }
+static void poll_beside(void) { printf("poll_beside: skipped, the profile has no tex_dirty_upload\n"); }
+#endif
 int main(int argc, const char **argv) { @autoreleasepool {
     setenv("DM_NVN_POOL_SKIP_RETIRED", "0", 1);   // finalized_bindless_pool checks that retired IDs are made again; a profile with pool_skip_retired (Ocarina of Time) gives them the dummy
     enum { N = 6442, BASE = 1000 };
@@ -329,6 +460,6 @@ int main(int argc, const char **argv) { @autoreleasepool {
     CHECK(mtl_cpu_tex_count() == N - 2, "a texture with no serial is not recorded");
     for (int i=0;i<N;i++) mtl_tex_release(&t[i]);
     retired_classification(); descriptor_replacement(); gpu_written_ranges();
-    if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); finalized_bindless_pool(); for (int i=0;i<3;i++) flushed_buffer_upload(i); packaged_entry_outside_the_set(); finalize_during_walk(); gpu_owned_after_write(); }
+    if (argc > 1 && !strcmp(argv[1], "--metal")) { mtl_init(); finalized_upload(0); finalized_upload(1); finalized_bindless_pool(); for (int i=0;i<3;i++) flushed_buffer_upload(i); packaged_entry_outside_the_set(); finalize_during_walk(); gpu_owned_after_write(); handover_holders(); poll_rewrites(); poll_beside(); }
     printf("t_cpu_tex: %d checks, %d failed\n", checks, failed); return failed != 0;
 } }

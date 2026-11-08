@@ -17,6 +17,8 @@
 #include "nvn_pace.h"
 #include "nvn_fstep.h"
 #include "nvn_timestamp.h"
+#include "nvn_queue_schedule.h"
+#include "nvn_obj.h"
 #include "../../host/front.h"
 #include "nvn_dirty.h"
 #include <mach/mach_time.h>
@@ -85,6 +87,14 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 
 static int g_log;
 static pthread_mutex_t g_sub_mu = PTHREAD_MUTEX_INITIALIZER;
+static _Atomic int g_event_waits;
+static void qe_queue_fence(const queue_t *, sync_t *);
+static int qe_wait(nvn_qs_ticket, uint64_t, int);
+static int qe_wait_recorded(const sync_t *, uint64_t);
+static void qe_flush_queue(void);
+static void qe_finish(const queue_t *);
+static void qe_cpu_signal(const ev_t *, int, uint32_t);
+static void qe_sync_wait(const queue_t *, const sync_t *);
 static _Atomic uint64_t g_serial;
 uint64_t nvn_new_serial(void) { return ++g_serial; }
 void nvn_serial_floor(uint64_t s) { uint64_t c = atomic_load(&g_serial); while (c < s && !atomic_compare_exchange_weak(&g_serial, &c, s)) {} }
@@ -396,19 +406,61 @@ NVN(nvnTextureBuilderGetSparseTileLayout, void, const NVNtextureBuilder *b, NVNt
 // textures with content 0, and the G-buffer's base colour came out black. Textures that can hold such data (not render targets, not linear, no packaged layout, in a pool
 // the CPU can write) are registered by address range; a flush that covers part of one marks it CPU-written (mtl_tex_cpu_written: uploaded from guest memory, re-uploaded
 // when its pages change). Off by default: in another game a flushed range could cover an image a shader writes, whose GPU content the upload would replace
-typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; const void *span; } flush_tex;   // stamp: dirty-page generation at registration (tex_dirty_upload); span: its tracked range (nvn_dirty_span), so a check needs no search over every pool
+// stamp: dirty-page generation at registration (tex_dirty_upload); span: its tracked range (nvn_dirty_span), so a check needs no search over every pool; edge_h: hashes of its bytes in its edge pages at the stamp (ft_edges_take), edged = they hold
+typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; const void *span; uint64_t edge_h[2]; int edged; } flush_tex;
 static flush_tex *g_ft; static size_t g_nft, g_cft; static pthread_mutex_t g_ft_mu = PTHREAD_MUTEX_INITIALIZER;
+// Writes beside a registered texture (tex_dirty_upload). The tracker marks whole host pages (16 KB) dirty, and a texture's storage need not start or end on one: its first and last pages
+// are shared with whatever lies beside it, as for the packaged textures' re-uploads (pkg_edges_clean in nvn_mtl.m). The Great Ace Attorney Chronicles keeps its window textures and render
+// targets in its 1000 MB CPU_CACHED pool at 0x200 past a page, beside textures it fills from the CPU (ser=262, 256x256, shares the first window texture's last page): every 1920x1080 one,
+// no page wholly inside it written, came out CPU-written at the first poll, and the present thread then re-uploaded a window texture from its storage ([RED] "up_begin called on thread
+// 'nvn-present'", abort about a second into boot). So hashes of the texture's bytes in its edge pages are kept at the stamp, and a texture whose only written pages are its edges, with
+// those bytes unchanged, is stamped and protected again instead of taken as written. The edges are the whole storage when it lies within two pages (no page wholly inside)
+static void ft_edge_ranges(const uint8_t *mem, uint64_t size, uintptr_t r[2][2], uintptr_t *ia, uintptr_t *ie) {   // as pkg_edge_ranges
+    uintptr_t pg = (uintptr_t)getpagesize(), a = (uintptr_t)mem, e = a + size;
+    *ia = (a + pg - 1) & ~(pg - 1); *ie = e & ~(pg - 1);
+    if (*ie <= *ia) { r[0][0] = a; r[0][1] = e; r[1][0] = r[1][1] = 0; *ia = *ie = 0; return; }
+    r[0][0] = a; r[0][1] = *ia; r[1][0] = *ie; r[1][1] = e;
+}
+static uint64_t ft_hash(uintptr_t lo, uintptr_t hi) {
+    const uint8_t *p = (const uint8_t *)lo; size_t n = hi - lo, i = 0; uint64_t h = 0x9e3779b97f4a7c15ull ^ n, w;
+    for (; i + 8 <= n; i += 8) { memcpy(&w, p + i, 8); h ^= w * 0x87c37b91114253d5ull; h = ((h << 31) | (h >> 33)) * 0x4cf5ad432745937full; }
+    for (; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+    return h ^ (h >> 29);
+}
+static void ft_edges_take(flush_tex *f) {   // right after the stamp and the protection: read after them, then dropped if a write reached them meanwhile
+    uintptr_t r[2][2], ia, ie; ft_edge_ranges(f->mem, f->size, r, &ia, &ie);
+    for (int i = 0; i < 2; i++) f->edge_h[i] = r[i][1] > r[i][0] ? ft_hash(r[i][0], r[i][1]) : 0;
+    f->edged = !nvn_dirty_since_span(f->span, f->mem, f->size, f->stamp);
+}
+static uint64_t g_ft_edge_skips;
+static int ft_written(flush_tex *f) {   // g_ft_mu held: the CPU wrote the texture's bytes since its stamp. Only its edge pages written, with its bytes there unchanged: stamped again, 0
+    if (!nvn_dirty_since_span(f->span, f->mem, f->size, f->stamp)) return 0;
+    if (!f->edged) return 1;
+    uintptr_t r[2][2], ia, ie; ft_edge_ranges(f->mem, f->size, r, &ia, &ie);
+    uint64_t st = nvn_dirty_now(); nvn_dirty_protect(f->mem, f->size);   // take the stamp, protect, then read: a later write is seen at the next check
+    if (ie > ia && nvn_dirty_since_span(f->span, (const void *)ia, ie - ia, f->stamp)) return 1;
+    for (int i = 0; i < 2; i++) if (r[i][1] > r[i][0] && ft_hash(r[i][0], r[i][1]) != f->edge_h[i]) return 1;
+    f->stamp = st;
+    if (++g_ft_edge_skips <= 4) LOG("[nvn] registered texture: only the pages it shares with other data were written, its bytes there unchanged: not taken as written (ser=%llu %ux%u format %#x, %llu so far)",
+                                    (unsigned long long)f->t.serial, f->t.d.width, f->t.d.height, f->t.d.format, (unsigned long long)g_ft_edge_skips);
+    return 0;
+}
 static void ft_add(const tex_t *t) {
     // Buffer textures are views onto the pool buffer the GPU reads directly (tex_mtl in nvn_mtl.m); an upload would push Age of Calamity's 1,048,576-texel R32F one through tex_desc, past Metal's 2D limit
     // COMPRESSIBLE is a memory-compression hint, not a data format: a game that sets it on every texture it creates (SD GUNDAM G GENERATION CROSS RAYS,
     // SDK 9.4.1) still writes plain texels, so those textures must be registered too or the CPU writes that follow stay invisible (its tutorial overlay's
     // background never appeared). A CPU_NO_ACCESS pool keeps the exclusion: there the compression tags may really be there.
-    if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
+    // A sparse pool's addresses are no memory the CPU writes or flushes, and no range nvn_dirty tracks, so they read as dirty at once: every texture in one, a render target too, came out CPU-written at its first
+    // use in a profile with tex_dirty_upload. What the CPU wrote into the physical pages behind one is seen through the page table instead (tex_from_storage, sparse_look)
+    if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->pool->vp || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
         (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return;
+    flush_tex f = {t->mem, t->L.size, *t, nvn_dirty_now(), NULL, {0, 0}, 0};
+    if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
+    f.span = nvn_dirty_span(t->mem, t->L.size);
+    if (DM_GAME_TEX_DIRTY_UPLOAD) ft_edges_take(&f);
     pthread_mutex_lock(&g_ft_mu);
     if (g_nft == g_cft && !(g_ft = realloc(g_ft, (g_cft = g_cft ? 2 * g_cft : 1024) * sizeof *g_ft))) die("flush_tex allocation failed");
-    uint64_t st = nvn_dirty_now(); if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
-    g_ft[g_nft++] = (flush_tex){t->mem, t->L.size, *t, st, nvn_dirty_span(t->mem, t->L.size)};
+    g_ft[g_nft++] = f;
     pthread_mutex_unlock(&g_ft_mu);
 }
 static void ft_del(uint64_t serial) {
@@ -424,7 +476,7 @@ int nvn_ft_written(const tex_t *t) {
     if (!DM_GAME_TEX_DIRTY_UPLOAD || !t->serial) return 0;
     int r = 0; pthread_mutex_lock(&g_ft_mu);
     for (size_t i = 0; i < g_nft; i++) if (g_ft[i].t.serial == t->serial) {
-        if (nvn_dirty_since_span(g_ft[i].span, g_ft[i].mem, g_ft[i].size, g_ft[i].stamp)) { r = 1; g_ft[i] = g_ft[--g_nft]; }
+        if (ft_written(&g_ft[i])) { r = 1; g_ft[i] = g_ft[--g_nft]; }
         break; }
     pthread_mutex_unlock(&g_ft_mu);
     if (r) mtl_tex_cpu_written(t);
@@ -438,39 +490,56 @@ int nvn_ft_tracked(uint64_t serial) {   // registered and not resolved yet: its 
     return r;
 }
 // Later writes (tex_dirty_upload): a texture first resolved before the CPU filled it stays a GPU-only texture, and the first-use check above never runs for it again.
-// Once per submission, when guest memory has changed since the last look, the registered textures whose pages were written since registration become CPU-written
-// (tex_mtl_ in nvn_mtl.m then drops the GPU-only texture and uploads it). Tears of the Kingdom fills its 5120x5120 BC4 roughness atlas from the CPU after first binding it,
-// as tiles stream in. A texture the GPU has written (an attachment, an image, a copy's or a clear's destination: mtl_tex_gpu_owned) may share pages with data the CPU writes: it leaves the
-// list without an upload, which would replace the GPU's content. One only made for such use, never written, is uploaded like any other (Ocarina of Time's terrain tiles)
+// Once per submission, when guest memory has changed since the last look, the registered textures whose pages were written since registration are handed to mtl_tex_cpu_rewritten
+// (nvn_mtl.m), which makes them CPU-written (tex_mtl_ then drops the GPU-only texture and uploads it) unless their content is the GPU's. Tears of the Kingdom fills its 5120x5120 BC4
+// roughness atlas from the CPU after first binding it, as tiles stream in; Ocarina of Time rewrites its terrain tiles' maps as tile slots are reused. An uploaded texture, or one left to
+// the GPU for good, leaves the list. One whose storage the GPU wrote after the CPU's write (MTL_REWRITE_GPU_NOW) stays on it with a new stamp, so the CPU's next rewrite is asked about
+// again: its pages are stamped and protected before the question (nvn_dirty_now's rule), so a write during or after it is seen by a later poll. Entries stay in the list while the
+// question is asked outside g_ft_mu, and are found again by serial: one a finalize (ft_del) or a flush (ft_flush) removed meanwhile is not put back
 // Each poll looks at no more than FT_POLL_BYTES of registered textures, going on where the last one stopped; any guest write starts another pass over the whole list.
 // Checking every texture at every submission cost TOTK 0.4 ms of submit CPU per frame on the Mac; this way a texture is picked up a few submissions later at most
 enum { FT_POLL_BYTES = 128 << 20 };
 void nvn_ft_poll(void) {
     if (!DM_GAME_TEX_DIRTY_UPLOAD) return;
     static uint64_t gen; static size_t cur, left;
-    static tex_t *hit; static size_t chit; size_t nhit = 0;
+    static struct { tex_t t; size_t at; int how; } *hit; static size_t chit; size_t nhit = 0;
     uint64_t now = nvn_dirty_now(), scanned = 0;
     pthread_mutex_lock(&g_ft_mu);
     if (now != gen) { gen = now; left = g_nft; }   // guest memory changed: every entry gets one more look
     while (left && g_nft && scanned < FT_POLL_BYTES) {
         if (cur >= g_nft) cur = 0;
         scanned += g_ft[cur].size; left--;
-        if (nvn_dirty_since_span(g_ft[cur].span, g_ft[cur].mem, g_ft[cur].size, g_ft[cur].stamp)) {
+        if (ft_written(&g_ft[cur])) {   // writes beside it only (its edge pages, its bytes there unchanged) restamp it and are no hit
             if (nhit == chit && !(hit = realloc(hit, (chit = chit ? 2 * chit : 64) * sizeof *hit))) die("nvn_ft_poll allocation failed");
-            hit[nhit++] = g_ft[cur].t; g_ft[cur] = g_ft[--g_nft];
-        } else cur++;
+            hit[nhit].t = g_ft[cur].t; hit[nhit++].at = cur;
+        }
+        cur++;
     }
     pthread_mutex_unlock(&g_ft_mu);
-    for (size_t i = 0; i < nhit; i++) {   // outside g_ft_mu: the ownership check takes the replay's serial table lock
-        static uint64_t up, kept; unsigned gw = mtl_tex_gpu_writes(hit[i].serial);
-        if (!mtl_tex_gpu_owned(hit[i].serial)) { mtl_tex_cpu_written(&hit[i]); up++;
-            if (up <= 4) LOG("[nvn] registered texture written by the CPU after its first use: uploaded from its storage (ser=%llu %ux%ux%u format %#x levels %u, %llu bytes; GPU writes %#x)",
-                             (unsigned long long)hit[i].serial, hit[i].d.width, hit[i].d.height, hit[i].d.depth, hit[i].d.format, hit[i].d.levels, (unsigned long long)hit[i].L.size, gw);
-            continue; }
-        kept++;   // the first few left to the GPU, and every 100th: the GPU's writes (1 attachment, 2 image, 4 copy, 8 clear, 0x10 DLSS, 0x20 DrawTexture) say what its content is
-        if (kept <= 4 || kept % 100 == 0) LOG("[nvn] registered texture written by the CPU after its first use, kept as the GPU's (its GPU writes %#x): ser=%llu %ux%ux%u format %#x levels %u, %llu bytes (%llu kept, %llu uploaded so far)",
-                                              gw, (unsigned long long)hit[i].serial, hit[i].d.width, hit[i].d.height, hit[i].d.depth, hit[i].d.format, hit[i].d.levels, (unsigned long long)hit[i].L.size, (unsigned long long)kept, (unsigned long long)up);
+    if (!nhit) return;
+    uint64_t st = nvn_dirty_now();
+    for (size_t i = 0; i < nhit; i++) nvn_dirty_protect(hit[i].t.mem, hit[i].t.L.size);
+    static uint64_t up, kept;
+    for (size_t i = 0; i < nhit; i++) {   // outside g_ft_mu: the question takes the serial table's and the storage spans' locks
+        const tex_t *t = &hit[i].t;
+        hit[i].how = mtl_tex_cpu_rewritten(t);
+        if (hit[i].how == MTL_REWRITE_UPLOADED && ++up <= 4)
+            LOG("[nvn] registered texture written by the CPU after its first use: uploaded from its storage (ser=%llu %ux%ux%u format %#x levels %u, %llu bytes; %llu so far)",
+                (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.levels, (unsigned long long)t->L.size, (unsigned long long)up);
+        if (hit[i].how == MTL_REWRITE_GPU_NOW && ++kept <= 4)
+            LOG("[nvn] registered texture written by the CPU after its first use, left to the GPU until the CPU rewrites it (the GPU wrote its storage after the CPU): ser=%llu %ux%ux%u format %#x levels %u, %llu bytes (%llu so far, %llu uploaded)",
+                (unsigned long long)t->serial, t->d.width, t->d.height, t->d.depth, t->d.format, t->d.levels, (unsigned long long)t->L.size, (unsigned long long)kept, (unsigned long long)up);
     }
+    pthread_mutex_lock(&g_ft_mu);
+    for (size_t i = 0; i < nhit; i++) {   // where the scan saw it, unless an entry was removed meanwhile (a removal moves the last entry into its place)
+        size_t j = hit[i].at;
+        if (j >= g_nft || g_ft[j].t.serial != hit[i].t.serial)
+            for (j = 0; j < g_nft && g_ft[j].t.serial != hit[i].t.serial; j++) {}
+        if (j == g_nft) continue;
+        if (hit[i].how == MTL_REWRITE_GPU_NOW) { g_ft[j].stamp = st; ft_edges_take(&g_ft[j]); }   // its edges as they are now, read after st's protection
+        else g_ft[j] = g_ft[--g_nft];
+    }
+    pthread_mutex_unlock(&g_ft_mu);
 }
 static void ft_flush(const uint8_t *a, uint64_t n) {
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !a || !n) return;
@@ -703,11 +772,11 @@ void nvn_ctl_lens(const void *control, uint32_t *nctl, uint32_t *ncode) {
     *nctl = own >= 0x760 && own < 0x880 ? own : 0x880;
 }
 static int keys_hash(const NVNshaderData *sd, int mapped, uint8_t out[8]) {
-    uint32_t ncode = 0, nctl; void *mb; uint64_t mo;
+    uint32_t ncode = 0, nctl;
     if (!sd->control) return 0;
     nvn_ctl_lens(sd->control, &nctl, &ncode);
     int code = sd->data && ncode && ncode < (1u << 24);
-    if (mapped && !(code && mtl_addr(sd->data, ncode, &mb, &mo))) return 0;
+    if (mapped && !(code && mtl_addr_known(sd->data, ncode))) return 0;   // its code in a memory pool; the pool is not made resident for that (the GPU runs the translated shader)
     uint8_t md[CC_SHA256_DIGEST_LENGTH]; CC_SHA256_CTX hc; CC_SHA256_Init(&hc);
     // Profile key shader_key_skip: bytes of the control section hashed as zeros (shader_split.py key_ctl). Batman: Arkham Knight's engine shares one control section among shaders whose
     // sections differ only in GLSLC's compile information (+0x778..+0x791, +0x7d0..+0x7e7): it hands a program the section of an earlier shader with the same rest, so the bytes there name another shader
@@ -762,10 +831,19 @@ NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t
 NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 NVN(nvnSyncSetDebugLabel, void, NVNsync *s, const char *l) { (void)s; (void)l; }
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
-NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = mtl_last_fence(); }
+NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) {
+    (void)c;
+    (void)f;
+    qe_queue_fence((const queue_t *)q, (sync_t *)s);
+}
+
 // A sync object that was never fenced waits until timeout, as on a real device; a fenced one is released only after the GPU has actually completed up to that fence value
-// A GPU-side wait on a sync: the host has a single Metal queue that executes submissions in order, so commands before the fence are always done first and nothing needs waiting. A sync not fenced yet (fenced later by another thread) is not waited for here; logged once
-NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) { (void)q; static int once; if (!((const sync_t *)s)->fenced && !once++) LOG("[nvn] QueueWaitSync: the sync object has no fence yet, the host does not wait"); return 1; }
+// A GPU-side wait yields its guest queue until the fenced prefix has been ordered on the shared Metal queue.
+NVN(nvnQueueWaitSync, NVNboolean, NVNqueue *q, const NVNsync *s) {
+    qe_sync_wait((const queue_t *)q, (const sync_t *)s);
+    return 1;
+}
+
 // ZCull data: the host does no ZCull, so there is nothing to save / restore
 NVN(nvnCommandBufferRestoreZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
 NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a, size_t n) { (void)c; (void)a; (void)n; }
@@ -774,12 +852,37 @@ NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a
 NVN_NOPROTO(nvnCommandBufferSetStencilCullCriteria, void, NVNcommandBuffer *c, int func, int ref) { (void)c; (void)func; (void)ref; }
 static _Atomic uint64_t g_sync_ns;
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
-    const sync_t *o = (const sync_t *)s;
-    if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
-    int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
-    if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
-    uint64_t t0 = now_ns(); int ok = w(o->fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
-    return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    const sync_t *sync = (const sync_t *)s;
+    if (!sync->fenced) {
+        return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    }
+    if (sync->fenced == NVN_SYNC_FENCE_RECORDED_PENDING) {
+        if (qe_wait_recorded(sync, 0)) {
+            return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+        }
+        uint64_t started = now_ns();
+        int completed = qe_wait_recorded(sync, timeout);
+        atomic_fetch_add(&g_sync_ns, now_ns() - started);
+        return completed ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    }
+    if (sync->fenced == NVN_SYNC_FENCE_QUEUE_PREFIX) {
+        nvn_qs_ticket ticket = {sync->queue, sync->fence};
+        if (qe_wait(ticket, 0, 1)) {
+            return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+        }
+        uint64_t started = now_ns();
+        int completed = qe_wait(ticket, timeout, 1);
+        atomic_fetch_add(&g_sync_ns, now_ns() - started);
+        return completed ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
+    }
+    int (*wait_for_fence)(uint64_t, uint64_t) = sync->fenced == NVN_SYNC_FENCE_ACQUIRE ? mtl_wait_acq : mtl_wait;
+    if (wait_for_fence(sync->fence, 0)) {
+        return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
+    }
+    uint64_t started = now_ns();
+    int completed = wait_for_fence(sync->fence, timeout);
+    atomic_fetch_add(&g_sync_ns, now_ns() - started); // the frame's blocked SyncWait time (@sync_ms)
+    return completed ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }
@@ -794,7 +897,9 @@ NVN_NOPROTO(nvnEventGetMemoryOffset, int64_t, const NVNevent *e) { return ((cons
 NVN(nvnEventFinalize, void, NVNevent *e) { ((ev_t *)e)->magic = 0; }
 NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { return *((const ev_t *)e)->val; }
 static void ev_signal(const ev_t *e, int mode, uint32_t v) { if (mode == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v; else *e->val = v; }
-NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) { ev_signal((const ev_t *)e, m, v); }
+NVN(nvnEventSignal, void, NVNevent *event, NVNeventSignalMode mode, uint32_t value) {
+    qe_cpu_signal((const ev_t *)event, mode, value);
+}
 
 // ---------- Queue ----------
 #define QB(b) ((queue_builder_t *)(b))
@@ -824,13 +929,23 @@ NVN(nvnQueueInitialize, NVNboolean, NVNqueue *q, const NVNqueueBuilder *b) {
     OLOG("QueueInitialize %p", (void *)q); return 1;
 }
 NVN(nvnQueueFinalize, void, NVNqueue *q) {
-    pthread_mutex_lock(&g_sub_mu); mtl_queue_forget(((queue_t *)q)->serial); ((queue_t *)q)->magic = 0; pthread_mutex_unlock(&g_sub_mu);
+    qe_finish((const queue_t *)q);
+    pthread_mutex_lock(&g_sub_mu);
+    mtl_queue_forget(((queue_t *)q)->serial);
+    ((queue_t *)q)->magic = 0;
+    pthread_mutex_unlock(&g_sub_mu);
 }
+
 NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *info) {
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
-NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; mtl_finish(); }
+NVN(nvnQueueFlush, void, NVNqueue *q) {
+    (void)q;
+    qe_flush_queue();
+}
+NVN(nvnQueueFinish, void, NVNqueue *q) {
+    qe_finish((const queue_t *)q);
+}
 
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
 #define CB(c) ((cmd_t *)(c))
@@ -979,12 +1094,37 @@ NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return
 NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
     for (int i = 0; i < n; i++) { uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8); }
 }
-NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
-    (void)loc; (void)flags;
-    uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_SIGNAL_EVENT, 24);
-    const ev_t *ev = (const ev_t *)e; volatile uint32_t *val = ev->val; uint32_t mm = m;
-    memcpy(p + 8, &val, 8); memcpy(p + 16, &mm, 4); memcpy(p + 20, &v, 4);
+NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *command_buffer, const NVNevent *event, NVNeventSignalMode mode,
+    NVNeventSignalLocation loc, int flags, uint32_t value) {
+    uint8_t *record = cmd_alloc(CB(command_buffer), 32);
+    put_hdr(record, OP_SIGNAL_EVENT, 32);
+    const ev_t *event_state = (const ev_t *)event;
+    volatile uint32_t *event_value = event_state->val;
+    uint32_t signal_mode = mode;
+    memcpy(record + 8, &event_value, 8);
+    memcpy(record + 16, &signal_mode, 4);
+    memcpy(record + 20, &value, 4);
+    uint32_t location = loc;
+    memcpy(record + 24, &location, 4);
+    memcpy(record + 28, &flags, 4);
 }
+NVN(nvnCommandBufferWaitEvent, void, NVNcommandBuffer *command_buffer, const NVNevent *event, NVNeventWaitMode mode, uint32_t value) {
+    uint8_t *record = cmd_alloc(CB(command_buffer), 24);
+    put_hdr(record, OP_WAIT_EVENT, 24);
+    volatile uint32_t *event_value = ((const ev_t *)event)->val;
+    uint32_t wait_mode = mode;
+    memcpy(record + 8, &event_value, 8);
+    memcpy(record + 16, &wait_mode, 4);
+    memcpy(record + 20, &value, 4);
+    atomic_store(&g_event_waits, 1);
+}
+NVN(nvnCommandBufferWaitSync, void, NVNcommandBuffer *command_buffer, const NVNsync *sync) {
+    uint8_t *record = cmd_alloc(CB(command_buffer), 16);
+    put_hdr(record, OP_WAIT_SYNC, 16);
+    memcpy(record + 8, &sync, 8);
+    atomic_store(&g_event_waits, 1);
+}
+
 // A fence recorded in a command buffer: the replay fences the sync with the submission that reaches this point (OP_FENCE_SYNC). Unreal Engine's NVN RHI fences its command buffers this way (Octopath Traveler 0); Pokémon Legends: Z-A fences once a frame this way and waits on it
 NVN(nvnCommandBufferFenceSync, void, NVNcommandBuffer *c, NVNsync *s, NVNsyncCondition cond, int flags) {
     (void)cond; (void)flags;
@@ -1328,34 +1468,53 @@ void dm_gfx_suspend(int on) {
     pthread_mutex_unlock(&g_susp_mu);
     if (on) { dm_vk_drain(); dm_gl_drain(); mtl_drain(); LOG("[nvn] graphics suspended: in-flight GPU work drained"); } else LOG("[nvn] graphics resumed");   // the Vulkan and GL queues first: presents on the NVN queue wait for their frames
 }
+#include "nvn_queue_dispatch.inc"
+
 // One submission at a time: the Metal replay keeps one command buffer and one upload batch for the submission in progress (nvn_mtl.m g_cb). Fire Emblem: Three Houses initializes two queues and
-// submits on both from two threads; the second submission arrived while the first was replaying and the host stopped with "submit re-entered" at the ninth frame. NVN orders work on different queues only
-// through syncs, so replaying the two queues' submissions in lock order is one valid order.
+// submits on both from two threads; the second submission arrived while the first was replaying and the host stopped with "submit re-entered" at the ninth frame. Cross-queue events and syncs
+// additionally constrain replay order; the scheduler suspends blocked prefixes while other guest queues supply their producers.
 // The first submission's prepare step (mtl_prepare: the prewarm and the pipeline prebuild) loads shaders and builds pipelines and submits no GPU work, so it runs under the lock but outside the
 // graphics gate: inside it, going to the background meanwhile (dm_gfx_suspend, on the main thread) waited for it, minutes on a first start. It stays host work for the guest scheduler. The lock
 // comes before the gate: a second submission waiting for it must not count as in flight, or the suspend waits for it while the first waits to enter the closed gate holding the lock
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     dm_host_mutex_lock(&g_sub_mu);
-    dm_host_work++; mtl_prepare(); dm_host_work--;
+    dm_host_work++;
+    mtl_prepare();
+    dm_host_work--;
     gfx_enter();
-    uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns(); thr_counts(&i0, &y0);
+    uint64_t t0 = now_ns(), c0 = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID), i0, y0, s0 = thr_sys_ns();
+    thr_counts(&i0, &y0);
     ((queue_t *)q)->submits++;
-    mtl_queue_activate(((const queue_t *)q)->serial);
-    mtl_set_queue_origin_lower_left(((const queue_t *)q)->origin_ll);
-    nvn_cap_submit(n, (const uint64_t *)h);   // DM_NVN_CAPTURE (nvn_capture.inc)
-    mtl_sub_begin();
+    nvn_cap_submit(n, (const uint64_t *)h); // DM_NVN_CAPTURE (nvn_capture.inc)
     nvn_ft_poll();
-    mtl_sub_index((const uint64_t *)h, n);
-    for (int i = 0; i < n; i++) { mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1); mtl_exec((const uint8_t *)h[i]); }
-    mtl_exec_rest(NULL, 0);
-    mtl_sub_commit();
+    if (g_qs || atomic_load(&g_event_waits)) {
+        qe_submit((const queue_t *)q, n, (const uint64_t *)h);
+    } else {
+        mtl_queue_activate(((const queue_t *)q)->serial);
+        mtl_set_queue_origin_lower_left(((const queue_t *)q)->origin_ll);
+        mtl_sub_begin();
+        mtl_sub_index((const uint64_t *)h, n);
+        for (int i = 0; i < n; i++) {
+            mtl_exec_rest((const uint64_t *)h + i + 1, n - i - 1);
+            mtl_exec((const uint8_t *)h[i]);
+        }
+        mtl_exec_rest(NULL, 0);
+        mtl_sub_commit();
+    }
     pthread_mutex_unlock(&g_sub_mu);
     uint64_t dw = now_ns() - t0;
-    atomic_fetch_add(&g_nvn_ns, dw); atomic_fetch_add(&g_sub_wall_ns, dw);
-    uint64_t i1, y1; thr_counts(&i1, &y1); uint64_t dc = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0, di = i1 - i0;
-    atomic_fetch_add(&g_cum_sub_cyc, y1 - y0); atomic_fetch_add(&g_cum_sub_sys_ns, thr_sys_ns() - s0); atomic_fetch_add(&g_cum_sub_wall_ns, dw);
-    atomic_fetch_add(&g_sub_cpu_ns, dc); atomic_fetch_add(&g_cum_sub_cpu_ns, dc);
-    atomic_fetch_add(&g_sub_instr, di); atomic_fetch_add(&g_cum_sub_instr, di);
+    atomic_fetch_add(&g_nvn_ns, dw);
+    atomic_fetch_add(&g_sub_wall_ns, dw);
+    uint64_t i1, y1;
+    thr_counts(&i1, &y1);
+    uint64_t dc = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID) - c0, di = i1 - i0;
+    atomic_fetch_add(&g_cum_sub_cyc, y1 - y0);
+    atomic_fetch_add(&g_cum_sub_sys_ns, thr_sys_ns() - s0);
+    atomic_fetch_add(&g_cum_sub_wall_ns, dw);
+    atomic_fetch_add(&g_sub_cpu_ns, dc);
+    atomic_fetch_add(&g_cum_sub_cpu_ns, dc);
+    atomic_fetch_add(&g_sub_instr, di);
+    atomic_fetch_add(&g_cum_sub_instr, di);
     gfx_leave();
 }
 
@@ -1364,7 +1523,6 @@ static void nvn_nop(void) {}
 static const char *const g_nops[] = {
     "nvnCommandBufferSetPatchSize",
     "nvnCommandBufferSetDepthBounds",
-    "nvnCommandBufferWaitSync",
     "nvnCommandBufferSetShaderScratchMemory",
     "nvnCommandBufferPushDebugGroupDynamic",
     "nvnCommandBufferPopDebugGroup",
@@ -1374,7 +1532,6 @@ static const char *const g_nops[] = {
     "nvnCommandBufferPushDebugGroupStatic",
     "nvnCommandBufferPopDebugGroupId",
     "nvnCommandBufferInsertDebugMarkerStatic",
-    "nvnCommandBufferWaitEvent",
     "nvnWindowFinalize",
 };
 __attribute__((constructor)) static void nvn_nops_register(void) {
@@ -1487,9 +1644,12 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     pace_ns += mtl_snap_acquire_wait();   // ring capacity is waited for at acquire, where the game does not hold its present lock
     g_acq_wait_ns += wait; trow(g_frame, "@late_ms", wait ? (now_ns() - at) / 1e6 : 0);
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
+    if (*idx < 4 && o->submit_queue[*idx]) {
+        qe_wait((nvn_qs_ticket){o->submit_queue[*idx], o->submit_seq[*idx]}, UINT64_MAX, 0);
+    }
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
-    if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
+    if (s) { ((sync_t *)s)->fenced = NVN_SYNC_FENCE_ACQUIRE; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -2035,14 +2195,20 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         int lag = 0; for (int i = 0; i < lag_k; i++) if (o->presents % (uint64_t)lag_n[i] < (uint64_t)lag_run[i]) lag += lag_ms[i];
         if (lag) usleep((useconds_t)lag * 1000);
     }
+    dm_host_mutex_lock(&g_sub_mu);
     gfx_enter();
     uint64_t t0 = now_ns();
     if (idx >= 0 && idx < o->ntex && idx < 4) {   // enqueue only, return immediately
         const tex_t *t = CTX(o->tex[idx]); int lc[4]; const int *crop = present_crop(o->crop, (int)t->d.width, (int)t->d.height, lc);
         nvn_cap_present(t, crop);   // DM_NVN_CAPTURE (nvn_capture.inc)
-        o->ticket[idx] = mtl_present(t, present_period(o) / 1e9, crop);
+        if (g_qs) {
+            qe_present((const queue_t *)q, o, idx, t, present_period(o) / 1e9, crop);
+        } else {
+            o->ticket[idx] = mtl_present(t, present_period(o) / 1e9, crop);
+        }
     }
     gfx_leave();
+    pthread_mutex_unlock(&g_sub_mu);
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
     if (nvn_real[0] || nvn_real[1]) {   // DM_NVN_PROF: record phase = time of all implemented functions except submit; submit phase = QueueSubmitCommands
@@ -3047,6 +3213,6 @@ int nvn_host_write_texture(const void *nvntex, const void *src, int w, int h, si
 int nvn_host_signal_sync(void *nvnsync) {
     sync_t *o = nvnsync;
     if (!o || o->magic != MAGIC('S', 'Y', 'N', 'C')) return -1;
-    o->fence = 0; o->fenced = 1; return 0;
+    o->fence = 0; o->fenced = NVN_SYNC_FENCE_GPU; return 0;
 }
 NVN(nvnTextureFlushTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }   // unified memory + dirty page tracking: nothing to flush

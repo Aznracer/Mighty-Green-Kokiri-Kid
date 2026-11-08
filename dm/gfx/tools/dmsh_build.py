@@ -51,24 +51,49 @@ XC = ['--msl', '--msl-version', '20300', '--msl-argument-buffers', '--msl-textur
 # GX lighting takes max(0, NaN) from light directions left at zero, and the half of Mario its fill light faces came out white on the iPhone (GitHub issue 72; vk_shaders.py PRECISE)
 def precise(msl): return re.sub(r'\bfast::(min|max|clamp)\(', r'precise::\1(', msl)
 
-# Ampere HMMA.16816 with an f16 accumulator (agl's upscaler networks) reaches the MSL as a call of dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1, out D1) → D0, with
-# the subgroup's 256-word block of the scratch shared memory as the last argument (InstEmitAmpereTensor.AHmma, TensorPass, HelperFunctionManager.GenerateHmma16816F16). The
-# translator's body computes D lane by lane from the block; here it becomes simdgroup_matrix code over the same block: A row-major (halves 0..255, 16 a row), B transposed
-# (256..383, row n, 16 halves of k, loaded transposed), C / D row-major (384..511, 8 a row). Per HMMA on an M4 Pro: 1.08 ns a SIMD-group against 5.4 for the shuffle emulation
+# Ampere HMMA.16816 with an f16 accumulator (agl's upscaler networks, the NDVE video networks) reaches the MSL as calls of dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1,
+# flags, A's LDSM address, A0..A3's offsets, A's row stride, out D1) → D0, the subgroup's 256-word block of the scratch shared memory as the last argument (InstEmitAmpereTensor.AHmma,
+# TensorPass, HelperFunctionManager.GenerateHmma16816F16). The translator's body computes D lane by lane from the block; here it becomes simdgroup_matrix code over the same block:
+# A row-major (halves 0..255, 16 a row), B transposed (256..383, row n, 16 halves of k, loaded transposed), C / D row-major (384..511, 8 a row). Per HMMA on an M4 Pro: 1.08 ns
+# a SIMD-group against 5.4 for the shuffle emulation. TensorPass's flags (constants at each call) let a call skip the block where a matrix is already in the SIMD-group's
+# registers: each function that calls the helper holds 8 accumulator slots (acc, two matrices each) and A's four matrices (am) and passes them by reference, so the Metal
+# compiler, inlining the helper, keeps them in registers. A chain's accumulator stays in its slot from one call to the next (FlagCSlot / FlagDSlot), a call with the previous
+# call's A loads none (FlagAReuse), C = 0 is a multiply (FlagCZero), and A an LDSM read is loaded from shared memory where it read it (FlagADirect: row 0 of matrix i at lane 0's
+# row address + offset i, rows stride bytes apart, transposed for .MT88), which leaves the LDSM's own per-lane code unused. That needs the caller's shared memory array: the
+# one threadgroup array the calling functions declare besides the scratch, passed as one more argument; with no such array FlagADirect is ignored and A goes through the block.
+# On the NDVE networks of Ocarina of Time's movies (14 dispatches a frame) the frame's compute went from 26.7 to 18.9 ms on an M4 (8 GPU cores)
+# (shaders.md, HMMA chains keep their matrices in the SIMD-group)
 HMMA_BODY = '''{
     threadgroup uint* s = &%(scr)s[uint(%(blk)s)];
-    uint g = uint(%(lane)s) >> 2, t = uint(%(lane)s) & 3;
-    s[g * 8 + t] = uint(%(a0)s); s[(g + 8) * 8 + t] = uint(%(a1)s); s[g * 8 + 4 + t] = uint(%(a2)s); s[(g + 8) * 8 + 4 + t] = uint(%(a3)s);
-    s[128 + g * 8 + t] = uint(%(b0)s); s[128 + g * 8 + 4 + t] = uint(%(b1)s);
-    s[192 + g * 4 + t] = uint(%(acc0)s); s[192 + (g + 8) * 4 + t] = uint(%(acc1)s);
-    simdgroup_barrier(mem_flags::mem_threadgroup);
     threadgroup half* h = (threadgroup half*)s;
-    simdgroup_half8x8 a00, a01, a10, a11, b0, b1, c0, c1;
-    simdgroup_load(a00, h, 16, ulong2(0, 0)); simdgroup_load(a01, h, 16, ulong2(8, 0)); simdgroup_load(a10, h, 16, ulong2(0, 8)); simdgroup_load(a11, h, 16, ulong2(8, 8));
+    const int f = int(%(fl)s), k = (f >> 8) * 2;
+    const bool areuse = f & 1, cslot = f & 2, dslot = f & 4, czero = f & 8, adirect = %(adirect)s;
+    uint g = uint(%(lane)s) >> 2, t = uint(%(lane)s) & 3;
+    if (!areuse && !adirect) { s[g * 8 + t] = uint(%(a0)s); s[(g + 8) * 8 + t] = uint(%(a1)s); s[g * 8 + 4 + t] = uint(%(a2)s); s[(g + 8) * 8 + 4 + t] = uint(%(a3)s); }
+    s[128 + g * 8 + t] = uint(%(b0)s); s[128 + g * 8 + 4 + t] = uint(%(b1)s);
+    if (!cslot && !czero) { s[192 + g * 4 + t] = uint(%(acc0)s); s[192 + (g + 8) * 4 + t] = uint(%(acc1)s); }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+    if (!areuse && adirect) {
+        threadgroup half* x = %(shm_base)s + (int(simd_broadcast(uint(%(aaddr)s), ushort(0))) >> 1);
+        const ulong st = ulong(uint(%(astr)s) >> 1); const bool tr = f & 32;
+        simdgroup_load(am[0], x + (int(%(ao0)s) >> 1), st, ulong2(0, 0), tr); simdgroup_load(am[1], x + (int(%(ao2)s) >> 1), st, ulong2(0, 0), tr);
+        simdgroup_load(am[2], x + (int(%(ao1)s) >> 1), st, ulong2(0, 0), tr); simdgroup_load(am[3], x + (int(%(ao3)s) >> 1), st, ulong2(0, 0), tr);
+    } else if (!areuse) {
+        simdgroup_load(am[0], h, 16, ulong2(0, 0)); simdgroup_load(am[1], h, 16, ulong2(8, 0)); simdgroup_load(am[2], h, 16, ulong2(0, 8)); simdgroup_load(am[3], h, 16, ulong2(8, 8));
+    }
+    // C and D in the call's own matrices: a slot is read only for a chain's C (cslot) and written only for its D (dslot). A call outside every chain has slot 0 in its
+    // flags (no slot bits); working in acc[0..1] it overwrote the accumulator a chain held there between its two calls (Ocarina of Time's agl_ndsr_vr networks: 2,515 such
+    // calls in 30 shaders, dotted rows across fog and light, GitHub issue #1537). The flags are constants at each inlined call, so the copies cost nothing
+    simdgroup_half8x8 b0, b1, c0, c1;
     simdgroup_load(b0, h + 256, 16, ulong2(0, 0), true); simdgroup_load(b1, h + 256, 16, ulong2(8, 0), true);
-    simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8));
-    simdgroup_multiply_accumulate(c0, a00, b0, c0); simdgroup_multiply_accumulate(c0, a01, b1, c0);
-    simdgroup_multiply_accumulate(c1, a10, b0, c1); simdgroup_multiply_accumulate(c1, a11, b1, c1);
+    if (czero) { simdgroup_multiply(c0, am[0], b0); simdgroup_multiply(c1, am[2], b0); }
+    else {
+        if (cslot) { c0 = acc[k]; c1 = acc[k + 1]; }
+        else { simdgroup_load(c0, h + 384, 8, ulong2(0, 0)); simdgroup_load(c1, h + 384, 8, ulong2(0, 8)); }
+        simdgroup_multiply_accumulate(c0, am[0], b0, c0); simdgroup_multiply_accumulate(c1, am[2], b0, c1);
+    }
+    simdgroup_multiply_accumulate(c0, am[1], b1, c0); simdgroup_multiply_accumulate(c1, am[3], b1, c1);
+    if (dslot) { acc[k] = c0; acc[k + 1] = c1; simdgroup_barrier(mem_flags::mem_threadgroup); %(d1)s = 0; return 0; }
     simdgroup_store(c0, h + 384, 8, ulong2(0, 0)); simdgroup_store(c1, h + 384, 8, ulong2(0, 8));
     simdgroup_barrier(mem_flags::mem_threadgroup);
     uint d0 = s[192 + g * 4 + t], d1 = s[192 + (g + 8) * 4 + t];
@@ -76,6 +101,64 @@ HMMA_BODY = '''{
     %(d1)s = as_type<%(dt)s>(d1);
     return as_type<%(rt)s>(d0);
 }'''
+HMMA_ARGS = ['lane', 'blk', 'a0', 'a1', 'a2', 'a3', 'b0', 'b1', 'acc0', 'acc1', 'fl', 'aaddr', 'ao0', 'ao1', 'ao2', 'ao3', 'astr', 'd1']
+HMMA_CALL = re.compile(r'\bdmsh_hmma16816_f16\(([^()]*)\)')
+TG_ARRAY = re.compile(r'^[ \t]+threadgroup (spvUnsafeArray<uint, \d+>) (\w+);[ \t]*$', re.M)
+def split_params(text):   # commas inside template arguments (spvUnsafeArray<uint, N>) do not separate parameters
+    params, depth, cur = [], 0, ''
+    for ch in text + ',':
+        depth += {'<': 1, '>': -1}.get(ch, 0)
+        if ch == ',' and depth == 0: params.append(cur.strip()); cur = ''
+        else: cur += ch
+    return params
+BRACE = re.compile(r'[{}]')
+def block_end(src, start):   # the index of the brace closing the block opened at src[start] (start itself when it is no brace); the regular expression steps from brace to brace
+    if start < len(src) and src[start] not in '{}': return start
+    depth = 0
+    for b in BRACE.finditer(src, start):
+        depth += 1 if b.group() == '{' else -1
+        if depth == 0: return b.start()
+    raise ValueError('dmsh_hmma16816_f16: block not closed')
+def hmma_msl(msl):
+    m = re.search(r'\n(\w+) dmsh_hmma16816_f16\(([^)]*)\)\n\{', msl)
+    if not m: return msl
+    params = split_params(m.group(2))
+    scr = [x for x in params if x.startswith('threadgroup ')]
+    plain = [x for x in params if not x.startswith('threadgroup ')]
+    if len(scr) != 1 or len(plain) != len(HMMA_ARGS): raise ValueError('dmsh_hmma16816_f16: unexpected parameters ' + m.group(2)[:200])
+    def group1(pattern, text, how=re.search):   # the first group of a match the helper's signature must have
+        found = how(pattern, text)
+        if not found: raise ValueError('dmsh_hmma16816_f16: unexpected parameter ' + text[:100])
+        return found.group(1)
+    name = lambda x: group1(r'(\w+)$', x)
+    v = dict(zip(HMMA_ARGS, [name(x) for x in plain]), scr=name(scr[0]), dt=group1(r'thread (\w+)&', plain[-1], re.match), rt=m.group(1))
+    body_end = block_end(msl, m.end() - 1)
+    # The calls, and the functions they are in: where each opens its body (a brace at the start of a line), and the shared memory array it declares besides the scratch.
+    # A function's end is found once (ends): a network's function holds hundreds of calls in up to 1.8 MB of MSL, and a scan per call took Ocarina of Time's 71 HMMA shaders 578 s of one core
+    calls, callers, ends = [], {}, {}
+    for c in HMMA_CALL.finditer(msl):
+        if m.start() <= c.start() <= body_end: continue
+        open_at = msl.rfind('\n{\n', 0, c.start()) + 1
+        if open_at > 0 and open_at not in ends: ends[open_at] = block_end(msl, open_at)
+        if open_at <= 0 or ends[open_at] < c.start(): raise ValueError('dmsh_hmma16816_f16: a call outside a function body')
+        if open_at not in callers:
+            scratch = split_params(c.group(1))[-1]
+            arrays = [(t, n) for t, n in TG_ARRAY.findall(msl, open_at, ends[open_at]) if n != scratch]
+            callers[open_at] = arrays[0] if len(arrays) == 1 else None
+        calls.append((c, open_at))
+    if not calls: return msl
+    shared = set(callers.values())
+    direct = len(shared) == 1 and None not in shared
+    extra = ', thread simdgroup_half8x8 (&acc)[16], thread simdgroup_half8x8 (&am)[4]' + (', threadgroup %s& dm_shm' % next(iter(shared))[0] if direct else '')
+    v.update(adirect='(f & 16) != 0' if direct else 'false', shm_base='(threadgroup half*)&dm_shm[0]' if direct else '(threadgroup half*)nullptr')
+    # Edits of the original text, applied from its end: the helper itself, each call's added arguments (the caller's matrices and shared memory), each caller's matrices
+    edits = [(m.start(), body_end + 1, '\n%s dmsh_hmma16816_f16(%s%s)\n%s' % (m.group(1), m.group(2), extra, HMMA_BODY % v))]   # spirv-cross has it inlined (always_inline, the line before)
+    edits += [(c.end() - 1, c.end() - 1, ', dm_acc, dm_am' + (', ' + callers[open_at][1] if direct else '')) for c, open_at in calls]
+    edits += [(open_at + 2, open_at + 2, '    simdgroup_half8x8 dm_acc[16], dm_am[4];\n') for open_at in callers]
+    for a, b, text in sorted(edits, key=lambda e: e[0], reverse=True):
+        msl = msl[:a] + text + msl[b:]
+    return msl
+
 # A store only the very first invocation of a dispatch makes (a compute shader's preamble: `if (-local.x == workgroup.x << log2(local size)) buffer[k] = value`). Hoian_Proc in Splatoon Raiders resets its append counter
 # that way, with the other invocations adding to the counter at their end, hundreds of instructions later. On the Switch the first workgroup starts ahead of them. Apple's GPUs start workgroups in no order: a workgroup that had appended before
 # the reset lost its plants to the next one's, a different few each frame, and they flickered. So the store leaves the shader and the host makes it, in order, before the dispatch (the reflection's first_store, nvn_mtl.m). Only this exact
@@ -120,6 +203,38 @@ def first_store(msl, local):
     rest = msl[at:]
     if not stores or len(stores) > 4 or re.search(r'if \(%s\)' % guard, rest): return msl, []
     return out + rest, stores
+# Shared memory byte and half-word stores (STS.U8 / STS.U16, and the bytes a task or mesh shader writes to its stage memory: its primitive indices and count) reach the MSL as calls of
+# dmsh_shared_store8_<id> / dmsh_shared_store16_<id>(byte offset, value, the shared memory array) (HelperFunctionManager.GenerateSharedStore). The translator's body is upstream Ryujinx's
+# compare-and-swap loop on the word, as SPIR-V has no narrower store into a uint array; Metal's threadgroup memory takes byte stores, so the body becomes one store of the byte or half-word.
+# That is the console's store: no atomic, and two lanes writing the same byte leave one of their values. In the loop, the 32 lanes of a mesh shader writing neighbouring bytes contended four
+# to a word and retried; Ocarina of Time's foliage mesh shaders (ten such stores a lane) took 8.3-8.6 ms of GPU a frame on an M3 Pro (shaders.md, Stage memory byte stores through a
+# compare-and-swap loop). The narrow pointer aliases the uint array for the compiler's type-based alias analysis (uchar, and the may_alias ushort, are "omnipotent char"), so the word loads
+# around the store keep their order. tg_spill later turns the address space to device with the rest of the function
+SHARED_STORE = re.compile(r'\nvoid (dmsh_shared_store(8|16)_\d+)\(([^)]*)\)\n\{')
+SHARED_ALIAS = 'typedef ushort __attribute__((may_alias)) dm_ushort_alias;   // a half-word that may alias the shared memory\'s words (see shared_store_msl)\n'
+def shared_store_msl(msl):
+    if 'dmsh_shared_store' not in msl: return msl
+    found = list(SHARED_STORE.finditer(msl))
+    if not found: raise ValueError('dmsh_shared_store: no definition of the expected form')
+    out, at = [], 0
+    for m in found:
+        params = split_params(m.group(3))
+        scalar = [re.fullmatch(r'thread const u?int& (\w+)', p) for p in params[:2]]
+        arr = re.fullmatch(r'(threadgroup|device) spvUnsafeArray<uint, \d+>& (\w+)', params[2]) if len(params) == 3 else None
+        if not arr or not all(scalar): raise ValueError('dmsh_shared_store: unexpected parameters ' + m.group(3)[:160])
+        off, val = scalar[0].group(1), scalar[1].group(1)
+        space, mem = arr.groups()
+        store = (f'(({space} uchar*)&{mem}[0])[uint({off})] = uchar(uint({val}));' if m.group(2) == '8' else
+                 f'(({space} dm_ushort_alias*)&{mem}[0])[uint({off}) >> 1u] = ushort(uint({val}));')   # a half-word store is aligned (Maxwell faults on a misaligned one)
+        out.append(msl[at:m.end()] + '\n    ' + store + '\n')
+        at = block_end(msl, m.end() - 1)
+    out.append(msl[at:])
+    src = ''.join(out)
+    if any(m.group(2) == '16' for m in found):
+        u = src.find('using namespace metal;\n')
+        if u < 0: raise ValueError('dmsh_shared_store: no using namespace metal')
+        u += len('using namespace metal;\n'); src = src[:u] + SHARED_ALIAS + src[u:]
+    return src
 # Compute shared memory past Metal's limit: Apple's GPUs give a kernel 32 KB of threadgroup memory (maxThreadgroupMemoryLength), and Metal refuses a pipeline that declares more, while Ampere
 # gives up to 100 KB. Mario Kart World's DrivePassShaderDefault has 168 compute shaders of 48 KB (spvUnsafeArray<uint, 12288>), seven of them run on the way to the first race; refused, their
 # dispatches were skipped. Such a kernel takes its threadgroup arrays from a device buffer the host binds (abi.TG_SLOT): one slice of the arrays' total per workgroup, at the workgroup's index in
@@ -194,31 +309,6 @@ def gather_offsets(msl):
     msl = ''.join(out)
     k = msl.index('\n', msl.index('using namespace metal;')) + 1
     return msl[:k] + GATHER4 + msl[k:]
-def hmma_msl(msl):
-    m = re.search(r'\n(\w+) dmsh_hmma16816_f16\(([^)]*)\)\n\{', msl)
-    if not m: return msl
-    params, depth, cur = [], 0, ''   # commas inside template arguments (spvUnsafeArray<uint, N>) do not separate parameters
-    for ch in m.group(2) + ',':
-        depth += {'<': 1, '>': -1}.get(ch, 0)
-        if ch == ',' and depth == 0: params.append(cur.strip()); cur = ''
-        else: cur += ch
-    scr = [x for x in params if x.startswith('threadgroup ')]
-    plain = [x for x in params if not x.startswith('threadgroup ')]
-    if len(scr) != 1 or len(plain) != 11: raise ValueError('dmsh_hmma16816_f16: unexpected parameters ' + m.group(2)[:200])
-    def group1(pattern, text, how=re.search):   # the first group of a match the helper's signature must have
-        found = how(pattern, text)
-        if not found: raise ValueError('dmsh_hmma16816_f16: unexpected parameter ' + text[:100])
-        return found.group(1)
-    name = lambda x: group1(r'(\w+)$', x)
-    names = [name(x) for x in plain]
-    dt = group1(r'thread (\w+)&', plain[10], re.match)
-    v = dict(zip(['lane', 'blk', 'a0', 'a1', 'a2', 'a3', 'b0', 'b1', 'acc0', 'acc1', 'd1'], names), scr=name(scr[0]), dt=dt, rt=m.group(1))
-    start = m.end() - 1; depth = 0
-    for i in range(start, len(msl)):
-        depth += {'{': 1, '}': -1}.get(msl[i], 0)
-        if depth == 0: break
-    else: raise ValueError('dmsh_hmma16816_f16: body not closed')
-    return msl[:start] + HMMA_BODY % v + msl[i + 1:]
 # Border colours: Maxwell's sampler takes any RGBA border colour, Metal's only transparent black, opaque black or opaque white, and the host's sampler gets the nearest of them
 # (nvn_border.h). A filtered sample is linear in the border colour, r = Σ w·texel + w_border·B, so two samples through samplers that differ only in their border colour give the rest:
 # with Metal colours Bn (the sampler) and Bw (its twin), r = s_n + (s_w - s_n)·k, k = (B - Bn) / (Bw - Bn) per channel. Each sampler member a shader samples gets a twin member
@@ -273,7 +363,15 @@ PRE_STATS = collections.Counter()
 # -O1: the front end's -O2 (CorrelatedValuePropagation, then SimplifyCFG) folds the translated shaders' repeated tests of one value into switches whose cases jump past their own join.
 # Apple's GPU backend then exceeds its control-flow ID budget ("Max Unstruct ID 758 ... exceeds supported limit", a note, not an error) and falls back to a slower lowering:
 # Odyssey's alRenderMaterialUber took 25 minutes and 17.3 MB of GPU code, 31 s and 1.3 MB at -O1. Ordinary shaders come out within a few percent either way (the backend optimizes again)
+# Profile shader_math (fast by default, relaxed, safe): Metal's maths mode for this game's Mac libraries. Fast lets the compiler assume no NaN / infinity, so the translated
+# shaders' isnan selects (Maxwell's NaN semantics) can fold away, and it approximates and reorders. Ocarina of Time's grass showed single blades pure white for a frame with fast and
+# with relaxed (as ios_metal.py compiles), not with safe (-fno-fast-math, 1,520 of its mesh and pixel shaders swapped in loose). One mode for every library: [[invariant]] positions
+# only agree between shaders compiled alike
+SHADER_MATH = {'fast': [], 'relaxed': ['-fmetal-math-mode=relaxed'], 'safe': ['-fno-fast-math']}
+_math = GAME.get('shader_math', 'fast') if GAME else 'fast'
+if _math not in SHADER_MATH: sys.exit(f'[RED] game.tsv shader_math: {_math} (fast, relaxed or safe)')
 MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance']
+MAC_METAL += SHADER_MATH[_math]   # its own statement: tests that run the assignment above alone (test_dmsh_raw_last) compile as the default
 MAC_RECORD = ' '.join(MAC_METAL) + '; xcrun -sdk macosx metallib'
 # -fbracket-depth: the front end stops at 256 nested brackets ("bracket nesting level exceeded maximum of 256"). Ocarina of Time's compute shaders 1f78730053feb036 and e172bd7ec218ab8e
 # (3.5 MB of MSL each) nest 259 deep in one expression and were left out. A source within the default limit compiles to the same bytes with it (checked on macOS and iOS), so, like the
@@ -1070,6 +1168,23 @@ def build_keys(want, locations, pairs):
     """A partial vertex build needs its available paired pixel shaders before padding; a full build keeps every shader."""
     return sorted(set(want) | {ps for vs in want for ps in pairs.get(vs, ()) if ps in locations}) if want else sorted(locations)
 
+def partner_reads(key):
+    """{location: component mask} the pixel shaders paired with a mesh shader read (dmsh_meshstage.to_stage's reads), from their SPH input maps (dmsh_meshstage.pixel_reads), None without
+    pairs. A location a partner's MSL declares that its input map does not name (a record not found, a fixed-function input the translator moved to a user location) counts as all four."""
+    if not PAIRS.get(key): return None
+    reads = collections.defaultdict(int)
+    for ps in PAIRS[key]:
+        got = {}
+        if ps in loc:
+            rec = rec_of(ps)[1]; ci = rec.find(bytes.fromhex('34127698')); code = rec[0x38:ci]
+            got = dmsh_meshstage.pixel_reads(code[:0x80] if dmsh_ampere.is_nvn2(rec[ci:]) else code[0x30:0x80])   # an Ampere SPH leads the code, a Maxwell one follows its 0x30 header
+        fn = os.path.join(out, ps + '_b.metal')
+        if os.path.exists(fn):
+            with open(fn) as f: msl_locs = {int(x) for x in re.findall(r'\[\[user\(locn(\d+)\)', f.read())}
+            for n in msl_locs - got.keys(): got[n] = 0xf
+        for n, m in got.items(): reads[n] |= m
+    return dict(reads)
+
 def vs_pad(key, src):
     """Give a vertex or mesh shader the outputs its paired pixel shaders read but it does not write, with the value (0,0,0,1).
     Maxwell attributes are untyped 32-bit slots, and a pixel shader reading a location the vertex shader did not write only gets a default; Ryujinx also fills them with (0,0,0,1) when it links stages. Here every shader is translated
@@ -1451,10 +1566,12 @@ def finish(key, w, j, c1):
     try: src = dmsh_atomic.check_msl(src)
     except ValueError as e: return 'image atomic MSL failed', str(e), None
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
-    try: src = gather_offsets(src)   # four gathers (upstream b1d7c70)
+    try: src = gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)
     except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
     try: src = hmma_msl(src)   # Ampere HMMA through simdgroup_matrix (see hmma_msl)
     except ValueError as e: return 'HMMA rewrite failed', str(e)[:160], None
+    try: src = shared_store_msl(src)   # shared memory byte and half-word stores as Metal byte stores (see shared_store_msl)
+    except ValueError as e: return 'shared store rewrite failed', str(e)[:160], None
     try: src = pool_arrays(src)   # handles traced to no slot read the pools the replay keeps (see pool_arrays)
     except ValueError as e: return 'pool rewrite failed', str(e)[:160], None
     res = json.load(open(os.path.join(w, key + '.res.json')))
@@ -1470,7 +1587,8 @@ def finish(key, w, j, c1):
     mesh = j.get('mesh_stage')
     if mesh:   # the kernel as the Metal object or mesh function (dmsh_meshstage.py)
         if mesh.get('refused'): return 'mesh stage failed', mesh['refused'], None
-        try: src = dmsh_meshstage.to_stage(src, mesh); open(msl, 'w').write(src)
+        # outputs its paired pixel shaders read but its SPHs do not enable get (0,0,0,1), as vs_pad gives a vertex shader's (Ocarina of Time's foliage meshes); each output as wide as they read
+        try: src = dmsh_meshstage.to_stage(src, mesh, partner_reads(key)); open(msl, 'w').write(src)
         except ValueError as e: return 'mesh stage failed', str(e)[:160], None
     elif j['stage'] == 'cs':
         src, first = first_store(src, j.get('local')); open(msl, 'w').write(src)   # the first invocation's store, for the host (see first_store)
@@ -1480,7 +1598,7 @@ def finish(key, w, j, c1):
     pad = []
     if j['stage'] == 'vs':   # outputs start as (0,0,0,1) (see vs_init); no point size beside a layer output (see vs_layer); the base instance from Metal (see vs_base_instance)
         src = vs_base_instance(vs_layer(vs_init(src))); open(msl, 'w').write(src)
-    if (j['stage'] == 'vs' or (mesh and mesh['kind'] == 'ms')) and PAIRS.get(key):   # outputs the pixel shader reads but the vertex or mesh shader does not write get (0,0,0,1) (see vs_pad)
+    if j['stage'] == 'vs' and PAIRS.get(key):   # outputs the pixel shader reads but the vertex shader does not write get (0,0,0,1) (see vs_pad); a mesh shader's are padded by dmsh_meshstage.to_stage
         src, pad = vs_pad(key, src)
         if pad: open(msl, 'w').write(src)
     lay = None; discard = False
