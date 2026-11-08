@@ -8701,6 +8701,23 @@ static _Atomic int g_compact_periods, g_compact_closed, g_compact_bad;
 // Keep the crash-recovery guard if a compaction still fails in Metal. Markers name the OS build and capture method: a marker from the old archive-import path must not
 // disable the safer original-function capture. A failed flush of this method disables compaction on this OS build until it changes; ordinary archive reads remain available.
 static NSString *arch_compact_marker(void) { return [g_arch_dir stringByAppendingPathComponent:@"compacting"]; }
+// The files the last compaction wrote (arch_compact_finish), one name a line: they do not count toward PSO_ARCH_COMPACT. A compaction writes a file per ARCH_PERIOD_MAX bases, so
+// Ocarina of Time's 11,238 recaptured bases made 6 files; counted, three more starts' files passed the limit and every few starts compacted again, about 9 minutes of compiles at
+// the title (a headless walk of Castle Town never left it). The next compaction still takes them along with the newer files
+static NSString *arch_compacted_list(void) { return [g_arch_dir stringByAppendingPathComponent:@"compacted"]; }
+static NSSet<NSString *> *arch_compacted_names(void) {
+    NSString *s = [NSString stringWithContentsOfFile:arch_compacted_list() encoding:NSUTF8StringEncoding error:nil];
+    NSMutableSet<NSString *> *names = [NSMutableSet set];
+    for (NSString *l in [s componentsSeparatedByString:@"\n"]) if (l.length) [names addObject:l];
+    return names;
+}
+// Whether the plain files of an archive folder call for a compaction: more than PSO_ARCH_COMPACT of them, not counting what the last compaction wrote (the tests call it)
+static int arch_compact_wanted(NSArray<NSString *> *plain) {
+    NSSet<NSString *> *done = arch_compacted_names(); NSUInteger n = 0;
+    for (NSString *p in plain) n += ![done containsObject:p.lastPathComponent];
+    return n > PSO_ARCH_COMPACT;
+}
+static NSMutableArray<NSString *> *g_compact_written;   // the files the compacting periods wrote (arch_write_file, on g_arch_q)
 static NSString *arch_os_build(void) { char b[64] = ""; size_t n = sizeof b; sysctlbyname("kern.osversion", b, &n, NULL, 0); return [NSString stringWithFormat:@"os\t%s\n", b]; }
 // v2: recaptured bases in periods of ARCH_PERIOD_MAX. A v1 marker on this system build is most likely the period that filled Metal's archiver store (one of 8,693 bases on Ocarina
 // of Time, from Nov 6): it took compaction away for good and the files piled up (215 on an M4 Pro), so a v1 marker lets compaction be tried once more
@@ -8955,6 +8972,10 @@ static void pso4_init(void) {
             });
 #endif
             uint64_t t0 = bp_now(); unsigned long long bytes = 0;
+            // A write a stopped run left: Metal's own serialization file (<UUID>.metallib) or ours (.mtl4a.tmp). Nothing writes the folder yet; one was 286 MB
+            NSRegularExpression *uuid_lib = [NSRegularExpression regularExpressionWithPattern:@"^[0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{4}-[0-9A-F]{12}\\.metallib$" options:0 error:nil];
+            for (NSString *f in [NSFileManager.defaultManager contentsOfDirectoryAtPath:g_arch_dir error:nil])
+                if ([uuid_lib numberOfMatchesInString:f options:0 range:NSMakeRange(0, f.length)] || [f hasSuffix:@".mtl4a.tmp"]) { [NSFileManager.defaultManager removeItemAtPath:[g_arch_dir stringByAppendingPathComponent:f] error:nil]; MLOG("pipeline archive: %s removed (a write a stopped run left)", f.UTF8String); }
             NSMutableArray<NSString *> *runf = [NSMutableArray array];
             NSArray<NSString *> *names = [[[NSFileManager.defaultManager contentsOfDirectoryAtPath:g_arch_dir error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.mtl4a'"]]
                                           sortedArrayUsingSelector:@selector(compare:)];
@@ -8966,7 +8987,7 @@ static void pso4_init(void) {
                 else MLOG("[RED] pipeline archive file %s not usable (%s): its bases are built again", p.UTF8String, ae ? ae.localizedDescription.UTF8String : "not a pipeline archive");
                 g_arch_seq = MAX(g_arch_seq, [n substringFromIndex:pf].intValue + 1);
             }
-            if (runf.count > PSO_ARCH_COMPACT && arch_compact_allowed()) { g_compact_enabled = 1; g_compact_files = runf; }
+            if (arch_compact_wanted(runf) && arch_compact_allowed()) { g_compact_enabled = 1; g_compact_files = runf; }
             MLOG("pipeline archive %s: %lu files (%lu of bases without a vertex layout), %.1f MB, opened in %.1f ms", g_arch_dir.UTF8String, (unsigned long)(arch.count + archp.count - (g_arch_bundle != nil)),
                  (unsigned long)archp.count - (g_arch_bundle != nil), bytes / 1048576.0, (bp_now() - t0) / 1e6);
         }
@@ -9000,6 +9021,7 @@ static void arch_write_file(ArchEpoch *ep) {
     ok = ok && !rename(tmp.fileSystemRepresentation, path.fileSystemRepresentation);
     if (!ok) { MLOG("[RED] pipeline archive: writing %s failed%s%s", path.UTF8String, e ? ": " : "", e ? e.localizedDescription.UTF8String : ""); unlink(tmp.fileSystemRepresentation); if (ep->compacting) g_compact_bad = 1; }
     else {
+        if (ep->compacting) { if (!g_compact_written) g_compact_written = [NSMutableArray array]; [g_compact_written addObject:path.lastPathComponent]; }
         MLOG("pipeline archive: %d new pipeline bases written to %s (%.1f MB, %.0f ms)", n, path.lastPathComponent.UTF8String,
              [[NSFileManager.defaultManager attributesOfItemAtPath:path error:nil] fileSize] / 1048576.0, (bp_now() - t0) / 1e6);
     }
@@ -9039,6 +9061,7 @@ static void arch_compact_finish(void) {   // after every period that may hold re
     if (!g_compact_files || !g_compacted) return;
     if (g_compact_bad) { MLOG("[RED] pipeline archive: compaction left the old files (a flush failed, or a base was not captured again)"); return; }
     for (NSString *f in g_compact_files) unlink(f.fileSystemRepresentation);
+    [[[g_compact_written ?: @[] componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"] writeToFile:arch_compacted_list() atomically:YES encoding:NSUTF8StringEncoding error:nil];
     MLOG("pipeline archive compacted: %lu files of bases with a vertex layout gave %d bases to the files just written and were removed", (unsigned long)g_compact_files.count, (int)g_compacted);
     g_compact_files = nil;
 }

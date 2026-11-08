@@ -423,9 +423,17 @@ int main(int argc, char **argv) { @autoreleasepool {
         arch_flush_wait();
         EXPECT("compaction: the marker exists while the flush writes", 1, ms->calls == 1 && ms->marked == 1);
         EXPECT("compaction: the flush that returned removed the marker", 0, [NSFileManager.defaultManager fileExistsAtPath:arch_compact_marker()]);
-        names = [NSFileManager.defaultManager contentsOfDirectoryAtPath:@(cdir) error:nil];
+        names = [[NSFileManager.defaultManager contentsOfDirectoryAtPath:@(cdir) error:nil] filteredArrayUsingPredicate:[NSPredicate predicateWithFormat:@"self ENDSWITH '.mtl4a'"]];
         EXPECT("compaction: a file per period left", (descs.count + 3) / 4, names.count);
         EXPECT("compaction: done", 0, g_compact_periods + !g_compact_closed + g_compact_bad);
+        // the files it wrote are listed, and do not count toward the next compaction: a big archive of several periods would otherwise compact again after a few starts
+        EXPECT("compaction: its files listed", 1, [arch_compacted_names() isEqualToSet:[NSSet setWithArray:names]]);
+        { NSMutableArray<NSString *> *plain = [NSMutableArray array];
+          for (NSString *n in names) [plain addObject:[@(cdir) stringByAppendingPathComponent:n]];
+          for (int k = 0; k < PSO_ARCH_COMPACT; k++) [plain addObject:[@(cdir) stringByAppendingPathComponent:[NSString stringWithFormat:@"%05d.mtl4a", 90000 + k]]];
+          EXPECT("compaction: its files and PSO_ARCH_COMPACT new ones want none", 0, arch_compact_wanted(plain));
+          [plain addObject:[@(cdir) stringByAppendingPathComponent:@"99999.mtl4a"]];
+          EXPECT("compaction: one more new file wants one", 1, arch_compact_wanted(plain)); }
         g_arch_period_max = ARCH_PERIOD_MAX;
         // a marker left by a compaction that did not finish: the next start on this system build does not compact, one from another build is removed and compaction tried
         EXPECT("compaction: allowed without a marker", 1, arch_compact_allowed());
