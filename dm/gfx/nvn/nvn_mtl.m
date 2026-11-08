@@ -1673,9 +1673,12 @@ static inline void m4_end(id e) {
 // other than a draw pass ran in between (compute, copies and uploads keep their full barriers). Only vertex-stage accesses of the previous pass's results without a barrier change order
 // DM_NVN_BARRIER=ab... alternates game and full with the DM_AB phases (measurement)
 static int sw_mode(const char *name, int dflt); static inline int sw_on(int m);
-// DM_NVN_BARRIER_HEAPS=1 (test): game barriers stay on while placement heaps share image storage (g_image_heap_n). Off, as since c484b13c: any heap gives every pass the full barriers.
-// The relaxed end barrier keeps fragment work ordered and carries resource-alias visibility (resource_vis); only the next pass's vertex work starts early
-static int barrier_heaps(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_BARRIER_HEAPS"); v = e && atoi(e) != 0; if (v) MLOG("DM_NVN_BARRIER_HEAPS=1: game barriers stay on while image heaps exist (test)"); } return v; }
+// Game barriers stay on while placement heaps share image storage (g_image_heap_n); DM_NVN_BARRIER_HEAPS=0 gives every pass the full barriers again while a heap exists, as from
+// c484b13c on. The relaxed end barrier keeps fragment work ordered and carries resource-alias visibility (resource_vis), and only the next pass's vertex work starts early: two render
+// targets at one heap offset kept the second pass's colour in 48 runs of 48 across it, and lost it in 24 of 24 with no barrier (t_alias_barrier). Ocarina of Time makes all three kinds
+// of heap, so without this its game barriers were never used; with it, about a quarter of its passes open without a full barrier, the GPU's idle time a frame 2.55 -> 1.86 ms and its
+// span 15.56 -> 15.22 ms in Hyrule Castle Town (M4 Pro, two walks a side)
+static int barrier_heaps(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_BARRIER_HEAPS"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_BARRIER_HEAPS=0: full barriers while image heaps exist"); } return v; }
 static void image_heap_note(int kind) {   // which kinds of placement heap a run makes (the game-barrier gate): 0 an atomic alias of a raw texture, 1 an image family, 2 a GPU-only pool's
     static _Atomic int seen[3]; static const char *const what[3] = {"an atomic integer alias of a raw texture (tex_upgrade)", "an image resolution family (image_texture)", "a GPU-only pool's render targets (pool_heap_texture)"};
     if (!atomic_exchange(&seen[kind], 1)) MLOG("image heaps: the first heap of %s", what[kind]);
