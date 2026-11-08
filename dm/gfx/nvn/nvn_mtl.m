@@ -8541,7 +8541,9 @@ static id arch_read_mapped(id self, SEL cmd, NSString *path, NSUInteger options,
     return g_ns_read(self, cmd, path, options, max, err);
 }
 static Method arch_read_method(void) { return class_getInstanceMethod([NSData class], sel_registerName("initWithContentsOfFile:options:maxLength:error:")); }
-static void arch_open_begin(void) {
+static void arch_open_begin(void) {   // DM_PSO_MAPPED=0: read whole into memory as Foundation does on an external drive (a lookup then never waits on the drive; about the archive's size more memory)
+    static int mapped = -1; if (mapped < 0) { const char *e = getenv("DM_PSO_MAPPED"); mapped = !(e && !strcmp(e, "0")); if (!mapped) MLOG("pipeline archives: read into memory, not mapped (DM_PSO_MAPPED=0)"); }
+    if (!mapped) return;
     Method m = arch_read_method(); if (!m || g_ns_swapped) return;
     IMP prev = method_setImplementation(m, (IMP)arch_read_mapped); if (!g_ns_read) g_ns_read = (ns_read_fn)prev; g_ns_swapped = 1;
 }
