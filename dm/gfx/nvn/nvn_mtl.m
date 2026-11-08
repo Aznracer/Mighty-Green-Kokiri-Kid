@@ -13963,7 +13963,7 @@ static void dispatch(const p_dispatch *dp) {
         uint64_t cg; id<MTLBuffer> cb_; size_t co;
         if (dpc_clamp_enc(ce, ig, &cb_, &co, &cg)) { ib = (__bridge void *)cb_; io = co; ig = cg; }
         [(id<MTL4ComputeCommandEncoder>)ce setArgumentTable:g_ct]; if (!own) g_blit_ct = 1;
-        args_dirty_all();
+        g_args_dirty[5] = 1; g_args_ogen[5]++;   // the clamp bound a table of its own and g_ct is back unchanged: only this dispatch's arguments are encoded again, not every stage's
     }
     PD("X %llu dispatch %s groups %llux%llux%llu%s%s", g_stat_pass, cs->key, (unsigned long long)dp->x, (unsigned long long)dp->y, (unsigned long long)dp->z, dp->ind ? " indirect" : "", own ? " (own encoder)" : g_disp_last_beside ? " beside the one before" : " after a barrier");
     enc_c_pso(ce, ps);
