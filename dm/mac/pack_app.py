@@ -26,7 +26,6 @@ MSL_FILES = ('*.metallib', '*.json', '*.tsv')   # what the host reads from msl/ 
 TABLES = ('shader_map.tsv', 'pso_manifest.tsv', 'c1_full.tsv', 'cb_extent.tsv', 'shader_pairs.tsv', 'pso_pairs.tsv')
 PSO_FILES = ('*.mtl4a', 'prebuilt.tsv', 'rest_pairs.tsv', 'archive.tsv')   # what the app takes of pso_offline.py's output folder
 EXE = 'nxnative'   # the launcher's file name (Contents/MacOS/nxnative)
-GAME_APP = 'Game.app'   # the game as an app of its own (Contents/Helpers/Game.app), which the launcher starts (GameApp.swift)
 ICON_SIZES = (16, 32, 128, 256, 512)
 DETRITUS = ('.DS_Store',)   # Finder leftovers beside the AppleDouble "._name" files, see detritus() and strip_detritus()
 
@@ -89,7 +88,7 @@ def min_os(host):   # the host's deployment target (LC_BUILD_VERSION minos): the
 
 
 def swift_sources():   # the settings window, with the iOS launcher's model and rows
-    return [HERE / 'Launcher.swift', HERE / 'GameApp.swift', HERE.parent / 'ios/Sources/LauncherSettings.swift', HERE.parent / 'ios/Sources/LauncherRow.swift']
+    return [HERE / 'Launcher.swift', HERE.parent / 'ios/Sources/LauncherSettings.swift', HERE.parent / 'ios/Sources/LauncherRow.swift']
 
 
 def build_launcher(out, minos, clang, swiftc, sdk):   # launcher.c's main and the host's cloud-save code (its send after the host exits), linked by swiftc with the settings window (no Swift main: -parse-as-library)
@@ -156,8 +155,8 @@ def strip_detritus(app):   # the "._name" files a copy from or onto an exFAT vol
 
 def sign(app, identity, codesign):   # the inner host first, then the bundle (its resources and the launcher); no --options runtime (see the top)
     strip_detritus(app)   # before codesign reads the bundle, so that a build folder or an output folder on exFAT is not a signing failure
-    host, game = app / 'Contents/MacOS/dmhost', app / 'Contents/Helpers' / GAME_APP
-    for target in [host] + ([game / 'Contents/MacOS/dmhost', game] if game.is_dir() else []) + [app]:   # inside out
+    host = app / 'Contents/MacOS/dmhost'
+    for target in (host, app):
         try: run([codesign, '--force', '--sign', identity, target])
         except SystemExit as e:
             if not any(s in str(e) for s in ('detritus', '._', 'not signed at all')): raise
@@ -352,15 +351,6 @@ def pack(a):
     if msl_dst.name.startswith('b-'): info['DMChain'] = msl_dst.name[2:]   # the library chain the app carries (a Vulkan or GL game's vk / gl has none)
     (c / 'Info.plist').write_bytes(plistlib.dumps(info))
     (c / 'PkgInfo').write_text('APPL????')
-    # The game as an app of its own, which the launcher starts through LaunchServices (dm/mac/GameApp.swift): a host the launcher spawned was an anonymous process to macOS, so Game
-    # Mode never took it. Its own identity (the bundle's + .game), the same keys otherwise (DMCommit for the host's start line), Game Mode on: macOS keeps a per-game switch in
-    # the Game Overlay, for a Mac where Game Mode holds the GPU at its lowest clock (docs/reference/frame-rate.md)
-    g = c / 'Helpers' / GAME_APP / 'Contents'
-    (g / 'MacOS').mkdir(parents=True)
-    shutil.copy(a.host, g / 'MacOS' / 'dmhost')
-    if icon: (g / 'Resources').mkdir(); shutil.copyfile(res / 'AppIcon.icns', g / 'Resources' / 'AppIcon.icns')
-    (g / 'Info.plist').write_bytes(plistlib.dumps(dict(info, CFBundleExecutable='dmhost', CFBundleIdentifier=info['CFBundleIdentifier'] + '.game', LSSupportsGameMode=True)))
-    (g / 'PkgInfo').write_text('APPL????')
     if a.sign == 'none': step('not signed (--sign none): the launcher and the host keep their linker signatures')
     else: step(f'signing ({"ad-hoc" if a.sign == "-" else a.sign})'); sign(tmp, a.sign, codesign)
     had_old = out.exists()

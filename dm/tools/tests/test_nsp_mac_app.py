@@ -119,7 +119,7 @@ class PackReuse(unittest.TestCase):
             'pso/prebuilt.tsv': b'prebuilt', 'pso/rest_pairs.tsv': b'rest', 'pso/archive.tsv': b'index',
             'env.txt': b'DM_TEST=1', 'split.tsv': b'split', 'icon.jpg': b'jpeg', 'source/launcher.c': b'launcher',
             'host/romfs_image.h': b'validator', 'host/save_sync.c': b'sync', 'host/save_sync.h': b'sync api', 'tools/romfs.py': b'reader',
-            'source/Launcher.swift': b'window', 'source/GameApp.swift': b'game app', 'ios/Sources/LauncherSettings.swift': b'model', 'ios/Sources/LauncherRow.swift': b'rows',
+            'source/Launcher.swift': b'window', 'ios/Sources/LauncherSettings.swift': b'model', 'ios/Sources/LauncherRow.swift': b'rows',
         }
         for n in pack_app.TABLES: files['profile/' + n] = n.encode()
         for n, content in files.items(): (t / n).write_bytes(content)
@@ -198,7 +198,7 @@ class PackReuse(unittest.TestCase):
         names = ['dmhost', 'patched/main.patched.bin', 'patched/main.fixups.tsv', 'patched/main.gates.tsv', 'patched/main.cuts.tsv',
                  'patched/main.obs.tsv', 'patched/nro.tsv', 'msl/k.metallib', 'msl/k.json', 'msl/inputs.tsv', 'font/nintendo_ext.ttf',
                  'pso/gpu.mtl4a', 'pso/prebuilt.tsv', 'pso/rest_pairs.tsv', 'pso/archive.tsv', 'env.txt', 'icon.jpg', 'source/launcher.c',
-                 'source/Launcher.swift', 'source/GameApp.swift', 'ios/Sources/LauncherSettings.swift', 'ios/Sources/LauncherRow.swift',   # the settings window's sources, the game app's start
+                 'source/Launcher.swift', 'ios/Sources/LauncherSettings.swift', 'ios/Sources/LauncherRow.swift',   # the settings window's sources
                  'host/save_sync.c', 'host/save_sync.h']   # the cloud-save code the launcher links (its send after the host exits)
         names += ['profile/' + n for n in pack_app.TABLES]
         for name in names:
@@ -259,7 +259,7 @@ class PackReuse(unittest.TestCase):
         self.assertIn(c[c.index('-o') + 1], s)   # launcher.c's object, with its main
         sync = next(c for c in self.commands if Path(c[0]).name == 'clang' and '-o' in c and c[-1].endswith('save_sync.c'))
         self.assertIn(sync[sync.index('-o') + 1], s)   # save_sync.c's object: the launcher sends the save once the host has exited
-        self.assertEqual([Path(x).name for x in s if x.endswith('.swift')], ['Launcher.swift', 'GameApp.swift', 'LauncherSettings.swift', 'LauncherRow.swift'])
+        self.assertEqual([Path(x).name for x in s if x.endswith('.swift')], ['Launcher.swift', 'LauncherSettings.swift', 'LauncherRow.swift'])
 
     def test_selected_file_modes_and_file_additions_and_removals_invalidate(self):
         self.pack()
@@ -454,7 +454,7 @@ class App(unittest.TestCase):
 
     def launch(self, wait=False, app=None, args=(), **env):
         home = self.tmp / 'home'
-        e = dict(HOME=str(home), PATH=f'{self.tmp / "bin"}:/usr/bin:/bin', **{'DM_LAUNCHER': '0', 'DM_GAME_APP': '0', **env})   # never the settings window in a test; the host as the launcher's child, not an app LaunchServices starts into the desktop session
+        e = dict(HOME=str(home), PATH=f'{self.tmp / "bin"}:/usr/bin:/bin', **{'DM_LAUNCHER': '0', **env})   # never the settings window in a test
         if wait: e['STANDIN_WAIT'] = '1'
         return subprocess.Popen([(app or self.app) / 'Contents/MacOS/nxnative', *args], env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
@@ -495,23 +495,12 @@ class App(unittest.TestCase):
             a.out = str(self.tmp / 'Own.app'); a.tables = self.args.tables; pack_app.pack(a)
             self.assertEqual((self.tmp / 'Own.app/Contents/Resources/dm/pso_pairs.tsv').read_text(), 'other-vertex\tother-pixel\n')
 
-    def test_game_app(self):   # the game as an app of its own, which the launcher starts through LaunchServices (GameApp.swift): Game Mode takes an app, not a spawned child
-        g = self.app / 'Contents/Helpers/Game.app/Contents'
-        p = plistlib.loads((g / 'Info.plist').read_bytes())
-        self.assertEqual((p['CFBundleExecutable'], p['CFBundleIdentifier'], p['CFBundleName']), ('dmhost', 'org.nxnative.01008cf01baac000.game', 'Game: Test'))
-        self.assertIs(p['LSSupportsGameMode'], True)
-        self.assertEqual(p['LSApplicationCategoryType'], 'public.app-category.games')
-        self.assertRegex(p['DMCommit'], r'^[0-9a-f]{12}(\+dirty)?$')   # the host's start line reads it from the bundle it runs in
-        self.assertTrue(os.access(g / 'MacOS/dmhost', os.X_OK))
-        self.assertEqual((g / 'MacOS/dmhost').stat().st_size > 0, True)   # a copy of the host (signed inside its own bundle, so not the same bytes)
-        self.assertEqual((g / 'PkgInfo').read_text(), 'APPL????')
-
     def test_info_plist(self):
         p = plistlib.loads((self.app / 'Contents/Info.plist').read_bytes())
         self.assertTrue(p['NSMicrophoneUsageDescription'])
         self.assertEqual((p['CFBundleExecutable'], p['CFBundleName'], p['CFBundleIdentifier'], p['CFBundleShortVersionString']), ('nxnative', 'Game: Test', 'org.nxnative.01008cf01baac000', '1.0.1'))
         self.assertEqual((p['DMTitleID'], p['DMLanguage'], p['DMRomfsMarker'], p['CFBundleIconFile']), (TID, 'fr', 'region_common/audio/edward.bfsar', 'AppIcon'))
-        self.assertIs(p['LSSupportsGameMode'], False)   # the launcher's own bundle: the game runs as Contents/Helpers/Game.app (test_game_app)
+        self.assertIs(p['LSSupportsGameMode'], False)   # macOS's Game Mode holds the GPU at its lowest clock (frame-rate.md)
         self.assertEqual(p['DMSettings'], [])   # launcher.json's settings, as the saved choices they accept: none here
         self.assertRegex(p['DMCommit'], r'^[0-9a-f]{12}(\+dirty)?$')   # the packing checkout (scripts/bug_report.py, the host's start line)
         self.assertEqual(p['DMChain'], '0123456789ab')   # the chain of the libraries packed (msl/b-<chain>)
