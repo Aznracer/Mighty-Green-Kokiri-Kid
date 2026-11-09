@@ -17182,7 +17182,7 @@ static thread_act_t mach_thread_self_cached(void) { return g_tt_self; }
 #include <ptrauth.h>
 // Is this library the system's plumbing (thread pool, syscalls, locks), which every worker passes through whatever it works for?
 static int tt_plumbing(const char *lib) {
-    static const char *const P[] = {"libsystem_kernel.dylib", "libsystem_pthread.dylib", "libdispatch.dylib", "libsystem_c.dylib", "libsystem_platform.dylib", "libsystem_malloc.dylib"};
+    static const char *const P[] = {"libsystem_kernel.dylib", "IOKit", "libsystem_pthread.dylib", "libdispatch.dylib", "libsystem_c.dylib", "libsystem_platform.dylib", "libsystem_malloc.dylib"};
     for (unsigned k = 0; k < sizeof P / sizeof *P; k++) if (!strcmp(lib, P[k])) return 1;
     return 0;
 }

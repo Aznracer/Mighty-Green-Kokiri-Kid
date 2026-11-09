@@ -202,11 +202,13 @@ static void launcher_done(void) { [g_root startGame]; }
         CGFloat u = layout.separated ? MIN(MIN(s.size.height / 430.0, s.size.width / 700.0), 1.3) : MIN(b.size.height / 430.0, 1.3);
         // as wide as its lines, up to the − key (DmGamepad.m: its centre 52 units left of the midline, 50 wide); two lines (frame rate and thermal state, battery) centred on the row
         if (fps_wide()) {   // one line, centred across the top (fps_wide.py)
-            CGFloat room = s.size.width - 16; CGSize fit = [self.fps sizeThatFits:CGSizeMake(CGFLOAT_MAX, 40)];
+            // the top bar's left half (hud2.py): from the safe edge to the settings gear in the middle (about 30 points either side of it), two lines, centred in the bar above the picture
+            CGFloat x = CGRectGetMinX(s) + 8, room = CGRectGetMidX(s) - 34 - x;
+            CGSize fit = [self.fps sizeThatFits:CGSizeMake(room - 12, 60)];
             CGFloat w = MIN(MAX(ceil(fit.width) + 12, 64), room), h = ceil(fit.height) + 4;
-            CGFloat below = CGRectGetMaxY(b) - CGRectGetMaxY(layout.game);   // the black bar below the picture: clear of the settings gear at the top (ab_patch.py)
-            CGFloat y = !layout.separated && below >= h + 4 ? CGRectGetMaxY(layout.game) + floor((below - h) / 2) : CGRectGetMinY(s) + 2;
-            self.fps.frame = CGRectMake(floor(CGRectGetMidX(s) - w / 2), floor(y), w, h);
+            CGFloat above = CGRectGetMinY(layout.game) - CGRectGetMinY(b);
+            CGFloat y = !layout.separated && above >= h + 4 ? CGRectGetMinY(b) + floor((above - h) / 2) : CGRectGetMinY(s) + 2;
+            self.fps.frame = CGRectMake(floor(x), floor(y), w, h);
         } else {
             CGFloat x = floor(CGRectGetMinX(s) + 130 * u), room = CGRectGetMidX(s) - 77 * u - 8 - x;
             CGSize fit = [self.fps sizeThatFits:CGSizeMake(MAX(room - 12, 64), 110)];
@@ -398,6 +400,7 @@ static int sensors_init(void) {
             if (loc) CFRelease(loc);
             if (prod) CFRelease(prod);
             if (!key[0] || !sn_wanted(key, name)) continue;
+            { int dup = 0; for (int j = 0; j < g_nsn; j++) dup |= !strcmp(g_sn[j].key, key); if (dup) continue; }   // hud2.py: iOS 27's second copy of a key: one read is enough
             sn_t *s = &g_sn[g_nsn++]; s->ref = CFRetain(ref); memcpy(s->key, key, 5); strlcpy(s->name, name, sizeof s->name); s->type = type[i];
             [found appendFormat:@" %s(%s)", key, name];
         }
@@ -447,10 +450,10 @@ static void sensors_start(void) {
     dispatch_async(q, ^{
         if (!sensors_init()) { dispatch_async(dispatch_get_main_queue(), ^{ g_sensor_line = @"🌡 sensors not readable here"; }); return; }
         timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-        dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC, 200 * NSEC_PER_MSEC);
+        dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC, 500 * NSEC_PER_MSEC);   // hud2.py: every 5 s (each read is a call into the HID system)
         dispatch_source_set_event_handler(timer, ^{
             NSString *line = sensors_line();
-            static int logged; if (logged++ % 5 == 0) LOG("front end: sensors: %s", [line stringByReplacingOccurrencesOfString:@"\n" withString:@" | "].UTF8String);   // every 10 s
+            static int logged; if (logged++ % 2 == 0) LOG("front end: sensors: %s", [line stringByReplacingOccurrencesOfString:@"\n" withString:@" | "].UTF8String);   // every 10 s
             dispatch_async(dispatch_get_main_queue(), ^{ g_sensor_line = line; });
         });
         dispatch_resume(timer);
@@ -458,8 +461,8 @@ static void sensors_start(void) {
 }
 static UILabel *front_ios_fps_label(void) {
     UILabel *l = [UILabel new];
-    l.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = NSTextAlignmentCenter;
-    l.numberOfLines = fps_wide() ? 1 : 4; l.adjustsFontSizeToFitWidth = YES; l.minimumScaleFactor = 0.7;
+    l.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = fps_wide() ? NSTextAlignmentLeft : NSTextAlignmentCenter;
+    l.numberOfLines = fps_wide() ? 2 : 4; l.adjustsFontSizeToFitWidth = YES; l.minimumScaleFactor = 0.7;
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
     UIDevice.currentDevice.batteryMonitoringEnabled = YES;
     static NSString *const thermal[] = {@"Nominal", @"Fair", @"Serious", @"Critical"};
@@ -473,7 +476,10 @@ static UILabel *front_ios_fps_label(void) {
         static int last_th = -1; if (th != last_th) { LOG("front end: thermal state %d (%s)", th, thermal[th >= 0 && th <= 3 ? th : 0].UTF8String); last_th = th; }
         NSString *text = [NSString stringWithFormat:@"%@ fps · 🌡 %@\n%@", fps, thermal[th >= 0 && th <= 3 ? th : 0], battery_line(&bat, now)];
         if (g_sensor_line) text = [text stringByAppendingFormat:@"\n%@", g_sensor_line];   // sensors_hud.py
-        if (fps_wide()) text = [text stringByReplacingOccurrencesOfString:@"\n" withString:@"  │  "];   // fps_wide.py: one line
+        if (fps_wide()) {   // hud2.py: two lines, frame rate and battery, then temperatures and power
+            NSArray<NSString *> *p = [text componentsSeparatedByString:@"\n"];
+            text = p.count == 4 ? [NSString stringWithFormat:@"%@  │  %@\n%@  │  %@", p[0], p[1], p[2], p[3]] : [p componentsJoinedByString:@"  │  "];
+        }
         if (![text isEqualToString:l.text]) { BOOL grew = text.length != l.text.length; l.text = text; if (grew) [l.superview setNeedsLayout]; }
     };
     sensors_start();
