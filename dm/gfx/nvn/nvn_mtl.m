@@ -10607,6 +10607,10 @@ static int bm_overlaps(const bm_iv *v, int n, uint64_t lo, uint64_t hi) {   // a
 // range through them as 0 looped (0 - 1) >> 5 times, a GPU hang (docs/reference/shaders.md, More memory pools than the raw pool table had entries)
 enum { GMEM_MAP_MAX = 1 << 20 };   // entries at most (a 32 MB table, if ever a game had that many pools); pools past them are still left out, with a red line
 static id<MTLBuffer> g_gmem_buf; static uint64_t g_gmem_gen; static uint64_t g_gmem_only_mb;   // g_gmem_only_mb: pools first reached through the table (DM_NVN_GMEM_RES)
+static void res_commit(void);
+// DM_NVN_GMEM_COMMIT_MB (default 128; 0 = one commit for the whole table): the pools the table makes resident are committed in pieces of at most this many MB (gmem_chunk.py)
+static int gmem_piece_mb(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_GMEM_COMMIT_MB"); v = e ? atoi(e) : 128; if (v < 0) v = 0; } return v; }
+static int g_gmem_builds;   // table builds so far (the first ones log their pieces)
 static uint64_t gmem_map_gpu(void) {
     uint64_t gen = atomic_load(&g_pool_gen);
     if (g_gmem_buf && g_gmem_gen == gen) return g_gmem_buf.gpuAddress;
@@ -10625,7 +10629,17 @@ static uint64_t gmem_map_gpu(void) {
         if (p->noraw && !p->res) continue;   // DM_NVN_GMEM_SKIP / NOBIG: a marked pool (or chunk) is listed only once something else made it resident
         // DM_NVN_GMEM_RES=0 (diagnostic): the table lists every pool but makes none resident; a pool comes into the residency set when a binding addresses it (pool_res).
         // How many MB only the table made resident is logged once: PRAGMATA's 190 such shaders kept all of its ~4 GB of pools wired on an 8 GB Mac
-        if (!p->res && gres) { res_add(p->buf); p->res = 1; g_pool_res_n++; g_gmem_only_mb += (p->end - p->base) >> 20; }
+        if (!p->res && gres) {
+            res_add(p->buf); p->res = 1; g_pool_res_n++; g_gmem_only_mb += (p->end - p->base) >> 20;
+            static uint64_t piece; static int pieces; piece += (p->end - p->base) >> 20;   // gmem_chunk.py: commit every DM_NVN_GMEM_COMMIT_MB
+            if (gmem_piece_mb() && piece >= (uint64_t)gmem_piece_mb()) {
+                uint64_t c0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); int logp = g_gmem_builds < 3;
+                if (logp) MLOG("raw global memory: committing a piece of %llu MB of pools (piece %d, %llu MB so far)", (unsigned long long)piece, ++pieces, (unsigned long long)g_gmem_only_mb);
+                res_commit();
+                if (logp) MLOG("raw global memory: piece committed in %.1f ms", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - c0) / 1e6);
+                piece = 0;
+            }
+        }
         uint64_t lo = MAX((uint64_t)p->lo, end), hi = p->hi;
         if (lo >= hi) continue;
         if (n == GMEM_MAP_MAX) { if (!over++) over_lo = lo; over_bytes += hi - lo; continue; }
@@ -10656,7 +10670,7 @@ static uint64_t gmem_map_gpu(void) {
     static uint64_t tr_last_mb; static int tr_n; uint64_t tr_add = g_gmem_only_mb - tr_last_mb; tr_last_mb = g_gmem_only_mb;   // pool table trace
     int tr_log = tr_n++ < 8 || tr_add >= 64; uint64_t tr_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (tr_log) MLOG("raw global memory: pool table of %d ranges, %llu MB of pools newly made resident for it (%llu MB so far): committing the residency set", n - 1, (unsigned long long)tr_add, (unsigned long long)g_gmem_only_mb);
-    res_add(b); res_commit();
+    res_add(b); res_commit(); g_gmem_builds++;
     if (tr_log) MLOG("raw global memory: pool table residency commit done in %.1f ms", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tr_t0) / 1e6);
     unsigned old = g_gmem_buf ? (unsigned)(g_gmem_buf.length / DMSH_GMEM_MAP_ENTRY) : 0;
     if (g_gmem_buf) defer_obj_release(g_gmem_buf);
