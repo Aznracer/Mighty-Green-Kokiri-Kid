@@ -136,7 +136,7 @@ static const int k_btns[] = {B_ZL, B_L, B_ZR, B_R, B_MINUS, B_PLUS, B_LS, B_RS};
 static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap, 3 = Native (DM_GAME_PAD_LAYOUT's numbers)
 static NSString *const k_native_key = @"DmPadNativeOffered";   // a profile that starts in Native switches to it once, over a layout saved before Native existed
 // Native layout (in points of an 874 x 402 landscape screen, scaled by gu; x from the corner rectangle's edges, y from its top or bottom): centre, radius
-static const int k_nat[] = {B_B, B_A, B_R, B_ZL, B_X, B_Y, B_PLUS, B_MINUS};
+static const int k_nat[] = {B_B, B_A, B_R, B_ZL, B_X, B_Y, B_PLUS, B_MINUS, B_ZR, B_LEFT, B_UP, B_RIGHT, B_DOWN};   // native_oot.py: ZR and a D-pad added
 static const CGFloat N_RING_R = 62, N_KNOB_R = 27, N_STICK_X = 120, N_STICK_Y = 105, N_MENU_X = 80, N_TOP_Y = 32, N_TOP_R = 18;
 int dm_opmode(void);   // hle_oe.c: 0 = handheld
 
@@ -389,12 +389,17 @@ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPoint
     CGRect s = self.corner; CGFloat g = self.gu, R = CGRectGetMaxX(s), L = CGRectGetMinX(s), T = CGRectGetMinY(s), Bt = CGRectGetMaxY(s);
     CGFloat x = 0, y = 0, rr = 0;
     switch (b) {
-        case B_B: x = R - 92 * g; y = Bt - 88 * g; rr = 44; break;
+        case B_Y: x = R - 92 * g; y = Bt - 88 * g; rr = 44; break;   // native_oot.py: Ocarina of Time's sword is Y, so Y takes the big key and B (put away) the small one
         case B_A: x = R - 180 * g; y = Bt - 74 * g; rr = 30; break;
         case B_R: x = R - 164 * g; y = Bt - 154 * g; rr = 25; break;
         case B_ZL: x = R - 106 * g; y = Bt - 188 * g; rr = 25; break;
         case B_X: x = R - 40 * g; y = Bt - 172 * g; rr = 23; break;
-        case B_Y: x = R - 40 * g; y = Bt - 238 * g; rr = 21; break;
+        case B_B: x = R - 40 * g; y = Bt - 238 * g; rr = 21; break;
+        case B_ZR: x = R - 226 * g; y = Bt - 196 * g; rr = 25; break;   // the active item (bow, slingshot)
+        case B_UP: x = L + 118 * g; y = T + 96 * g; rr = 17; break;     // the D-pad, top left: up / down the context swaps (boots)
+        case B_DOWN: x = L + 118 * g; y = T + 164 * g; rr = 17; break;
+        case B_LEFT: x = L + 84 * g; y = T + 130 * g; rr = 17; break;    // the ocarina
+        case B_RIGHT: x = L + 152 * g; y = T + 130 * g; rr = 17; break;  // Navi
         case B_PLUS: x = L + 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;
         default: x = R - 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // −
     }
@@ -708,12 +713,13 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     CGFloat g = self.gu;
     _nring = glassDisc(N_RING_R * g, NULL); _nring.position = self.natStickHome; [_nat addSublayer:_nring];
     CAShapeLayer *kb = nil; _nknob = glassDisc(N_KNOB_R * g, &kb); _nknobBase = kb; _nknob.position = self.natStickHome; [_nat addSublayer:_nknob];
-    static NSString *const sym[B_N] = { [B_A] = @"hand.tap.fill", [B_X] = @"chevron.up.2", [B_Y] = @"square.grid.2x2", [B_R] = @"shield.lefthalf.filled", [B_ZL] = @"scope", [B_PLUS] = @"line.3.horizontal", [B_MINUS] = @"map" };
-    static NSString *const chip[B_N] = { [B_A] = @"A", [B_B] = @"B", [B_X] = @"X", [B_Y] = @"Y", [B_R] = @"R", [B_ZL] = @"ZL", [B_PLUS] = @"+", [B_MINUS] = @"\u2212" };
+    static NSString *const sym[B_N] = { [B_A] = @"figure.run", [B_B] = @"xmark", [B_X] = @"chevron.up.2", [B_R] = @"square.grid.2x2", [B_ZL] = @"scope", [B_ZR] = @"figure.archery", [B_PLUS] = @"line.3.horizontal", [B_MINUS] = @"map",
+                                        [B_LEFT] = @"music.note", [B_RIGHT] = @"sparkles", [B_UP] = @"chevron.up", [B_DOWN] = @"chevron.down" };   // native_oot.py: Ocarina of Time's actions
+    static NSString *const chip[B_N] = { [B_A] = @"A", [B_B] = @"B", [B_X] = @"X", [B_Y] = @"Y", [B_R] = @"R", [B_ZL] = @"ZL", [B_ZR] = @"ZR", [B_PLUS] = @"+", [B_MINUS] = @"\u2212" };
     for (int i = 0; i < (int)(sizeof k_nat / sizeof *k_nat); i++) { int b = k_nat[i]; CGPoint c; CGFloat r; [self nat:b centre:&c radius:&r];
         CAShapeLayer *base = nil; CALayer *d = glassDisc(r, &base); d.position = c;
-        if (b == B_B) glassSword(d, 24 * g); else glassSymbol(d, sym[b], (b == B_A ? 17 : b == B_PLUS || b == B_MINUS ? 11 : b == B_X ? 14 : b == B_Y ? 12 : 15) * g, scale);
-        glassChip(d, chip[b], b == B_R || b == B_ZL, scale);
+        if (b == B_Y) glassSword(d, 24 * g); else glassSymbol(d, sym[b], (b == B_A ? 17 : b == B_PLUS || b == B_MINUS || b >= B_LEFT ? 11 : b == B_X ? 14 : b == B_B ? 12 : 15) * g, scale);
+        if (b < B_LEFT) glassChip(d, chip[b], b == B_R || b == B_ZL || b == B_ZR, scale);   // the D-pad keys carry their icon alone
         [_nat addSublayer:d]; _nk[b] = d; _nbase[b] = base;
     }
 }

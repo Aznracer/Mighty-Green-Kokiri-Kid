@@ -205,7 +205,7 @@ static void launcher_done(void) { [g_root startGame]; }
         // as wide as its lines, up to the − key (DmGamepad.m: its centre 52 units left of the midline, 50 wide); two lines (frame rate and thermal state, battery) centred on the row
         if (fps_wide()) {   // one line, centred across the top (fps_wide.py)
             // the top bar's left half (hud2.py): from the safe edge to the settings gear in the middle (about 30 points either side of it), two lines, centred in the bar above the picture
-            CGFloat x = CGRectGetMinX(s) + 8, room = CGRectGetMidX(s) - 34 - x;
+            CGFloat x = CGRectGetMinX(s) + 8, room = CGRectGetMidX(s) - 24 - x;   // native_oot.py: up to just short of the gear
             CGSize fit = [self.fps sizeThatFits:CGSizeMake(room - 12, 60)];
             CGFloat w = MIN(MAX(ceil(fit.width) + 12, 64), room), h = ceil(fit.height) + 4;
             CGFloat above = CGRectGetMinY(layout.game) - CGRectGetMinY(b);
