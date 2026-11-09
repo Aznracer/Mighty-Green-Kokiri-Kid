@@ -17157,3 +17157,50 @@ void mtl_wait_state_dump(void) {
 void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_alloc_waits; *grown = g_alloc_grown; *n = g_alloc_n; }   // Main submit allocator pool: how many times it waited, how many times it grew, how many exist now
 #include "nvn_capture.inc"   // DM_NVN_CAPTURE (one frame for dm/gfx/tests/nvn_replay)
 #pragma clang attribute pop
+
+// DM_THREAD_TOP (on unless =0): every 5 s, the busiest threads of the process over those 5 s, host threads included (scripts/oot_iphone/thread_top.py)
+static void *thread_top_main(void *arg) {
+    (void)arg; pthread_setname_np("dm thread top");
+    enum { TT_MAX = 512, TT_TOP = 8 };
+    static uint64_t pid_[TT_MAX], pt_[TT_MAX]; static int np_;
+    uint64_t id[TT_MAX], t[TT_MAX]; static char name[TT_MAX][32];
+    for (;;) {
+        sleep(5);
+        const char *e = getenv("DM_THREAD_TOP"); if (e && !atoi(e)) continue;
+        thread_act_array_t th; mach_msg_type_number_t n = 0;
+        if (task_threads(mach_task_self(), &th, &n) != KERN_SUCCESS) continue;
+        int cnt = 0;
+        for (mach_msg_type_number_t i = 0; i < n; i++) {
+            thread_identifier_info_data_t ii; mach_msg_type_number_t c1 = THREAD_IDENTIFIER_INFO_COUNT;
+            thread_extended_info_data_t ei; mach_msg_type_number_t c2 = THREAD_EXTENDED_INFO_COUNT;
+            if (cnt < TT_MAX && thread_info(th[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ii, &c1) == KERN_SUCCESS &&
+                thread_info(th[i], THREAD_EXTENDED_INFO, (thread_info_t)&ei, &c2) == KERN_SUCCESS) {
+                id[cnt] = ii.thread_id; t[cnt] = ei.pth_user_time + ei.pth_system_time;   // ns
+                strlcpy(name[cnt], ei.pth_name[0] ? ei.pth_name : "(unnamed)", sizeof name[cnt]); cnt++;
+            }
+            mach_port_deallocate(mach_task_self(), th[i]);
+        }
+        vm_deallocate(mach_task_self(), (vm_address_t)th, n * sizeof *th);
+        uint64_t d[TT_MAX], total = 0;
+        for (int i = 0; i < cnt; i++) {
+            uint64_t before = 0; int seen = 0;
+            for (int j = 0; j < np_; j++) if (pid_[j] == id[i]) { before = pt_[j]; seen = 1; break; }
+            d[i] = seen && t[i] >= before ? t[i] - before : 0; total += d[i];
+        }
+        if (np_) {
+            int top[TT_TOP], nt = 0; char used[TT_MAX] = {0};
+            for (; nt < TT_TOP && nt < cnt; nt++) {   // the busiest first
+                int b = -1; for (int i = 0; i < cnt; i++) if (!used[i] && (b < 0 || d[i] > d[b])) b = i;
+                used[b] = 1; top[nt] = b;
+            }
+            char line[1024]; int len = snprintf(line, sizeof line, "thread top over 5 s: all threads %llu ms/s (%d threads); busiest:", (unsigned long long)(total / 5000000), cnt);
+            for (int k = 0; k < nt && len < (int)sizeof line - 64; k++)
+                len += snprintf(line + len, sizeof line - len, "%s '%s' %llu ms/s", k ? "," : "", name[top[k]], (unsigned long long)(d[top[k]] / 5000000));
+            MLOG("%s", line);
+        }
+        for (int i = 0; i < cnt; i++) { pid_[i] = id[i]; pt_[i] = t[i]; }
+        np_ = cnt;
+    }
+    return NULL;
+}
+__attribute__((constructor)) static void thread_top_start(void) { pthread_t p; if (!pthread_create(&p, NULL, thread_top_main, NULL)) pthread_detach(p); }
