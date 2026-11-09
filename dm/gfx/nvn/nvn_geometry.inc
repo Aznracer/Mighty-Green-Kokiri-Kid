@@ -631,12 +631,62 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
         [en drawMeshThreadgroups:MTLSizeMake(MIN(g_mtk.count - o, (uint32_t)IXC_MESH_GRID), 1, 1) threadsPerObjectThreadgroup:ot threadsPerMeshThreadgroup:mt];
     }
 }
+// Task isolation (seedds#1842; DM_NVN_ISOLATE_TASK: unset = the default list, 0 = off, 1 = the default list, <keys> = those task shaders). On Apple silicon the draws of Ocarina of Time's
+// Hi-Z task a5288d0a6c4971fd (with its mesh 3439aaa071d868ae: cliffs and giant trunks) hang the GPU now and then after an area change (the tiler) when they share a command buffer with
+// the rest of the pass. Each such draw is put in a command buffer of its own: the pass ends and the segment is committed right before and right after it
+static const char *isolate_keys(void) {
+    static const char *k; static int done;
+    if (!done) { done = 1; const char *e = getenv("DM_NVN_ISOLATE_TASK");
+        k = !e || !strcmp(e, "1") ? "a5288d0a6c4971fd" : !strcmp(e, "0") || !*e ? NULL : e;
+        if (k) MLOG("task isolation: draws of task %s go in command buffers of their own (DM_NVN_ISOLATE_TASK=0 turns it off)", k); else MLOG("task isolation off (DM_NVN_ISOLATE_TASK=0)"); }
+    return k;
+}
+static uint64_t g_iso_draws, g_iso_cuts;
+// DM_NVN_ISOLATE_WINDOW=<s> (default 20; 0 = always): isolate only for that long after the task's draws resume from a pause of more than 1 s
+static double iso_now(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return t.tv_sec + t.tv_nsec * 1e-9; }
+// the longest gap between any two task / mesh draws since the isolated task's last draw (DM_NVN_ISOLATE_STALL: a load, not a camera turn)
+static double iso_any_last, iso_any_gap;
+// DM_NVN_MESH_REARM=<n> (default 1, 0 = never): after a load the breaker below counts command buffer errors from here, n times in a run
+static int g_brk_base, g_brk_rearms = -1;
+static void brk_rearm(double gap) {
+    if (g_brk_rearms < 0) { const char *e = getenv("DM_NVN_MESH_REARM"); g_brk_rearms = e && *e ? atoi(e) : 1; if (g_brk_rearms < 0) g_brk_rearms = 0;
+        MLOG("indirect task / mesh breaker: re-armed after a load up to %d time(s) a run (DM_NVN_MESH_REARM)", g_brk_rearms); }
+    int n = atomic_load(&g_cb_err_sticky);
+    if (n <= g_brk_base || g_brk_rearms <= 0) return;
+    g_brk_base = n; g_brk_rearms--;
+    if (gap > 1e8) MLOG("[RED] indirect task / mesh breaker re-armed at the run's first task / mesh draw: %d command buffer error(s) came before any grass was drawn; grass and foliage draw (%d re-arm(s) left)", n, g_brk_rearms);
+    else MLOG("[RED] indirect task / mesh breaker re-armed after a %.1f s stop of the task / mesh draws (a load): grass and foliage draw again after %d command buffer error(s) (%d re-arm(s) left)", gap, n, g_brk_rearms);
+}
+static void iso_seen(void) {
+    double n = iso_now();
+    if (iso_any_last <= 0) brk_rearm(1e9);
+    else { double g = n - iso_any_last; if (g > iso_any_gap) iso_any_gap = g; if (g >= 1.0) brk_rearm(g); }
+    iso_any_last = n;
+}
+static int iso_window_open(void) {
+    static double win = -1, last, until; static uint64_t opened;
+    if (win < 0) { const char *e = getenv("DM_NVN_ISOLATE_WINDOW"); win = e && *e ? atof(e) : 20.0; if (win < 0) win = 0;
+        MLOG("task isolation window: %s", win > 0 ? "the isolated task's draws are cut out for a while after each pause of more than 1 s (DM_NVN_ISOLATE_WINDOW)" : "always (DM_NVN_ISOLATE_WINDOW=0)"); }
+    if (win <= 0) return 1;
+    double now = iso_now();
+    static double stall = -1; static uint64_t kept;
+    if (stall < 0) { const char *e = getenv("DM_NVN_ISOLATE_STALL"); stall = e && *e ? atof(e) : 0.25; if (stall < 0) stall = 0;
+        MLOG("task isolation window: reopens after a pause only if all task / mesh draws stopped for %.2f s in it (DM_NVN_ISOLATE_STALL)", stall); }
+    if (now - last > 1.0) {
+        if (!last || iso_any_gap >= stall) { until = now + win; if (!(opened++ % 50)) MLOG("task isolation window: open for %.0f s (%llu so far; longest stall in the pause %.2f s)", win, (unsigned long long)opened, iso_any_gap); }
+        else if (!(kept++ % 50)) MLOG("task isolation window: kept shut after a %.1f s pause with no stall (camera turn; %llu so far)", now - last, (unsigned long long)kept);
+    }
+    last = now; iso_any_gap = 0;
+    return now < until;
+}
+static void isolate_cut(void) { if (defer_has_active()) defer_fallback(); lc_land(); rp_flush(); rp_end(); ubd_land(); uint32_t s0 = g_seg; g_cut_copy = 1; sub_cut(); g_iso_cuts += g_seg != s0; }
 static void mesh_tasks_draw(const p_draw *dw) {
+    iso_seen();
     // The breaker (DM_NVN_MESH_GUARD=0 turns it off; Peak8D's oot-full-build): Ocarina of Time's foliage task shaders loop over a {start, end} range they read through the raw
     // global memory table, unsigned, so a range read wrong loops 2^27 times and the GPU hangs. Once any command buffer of the run failed, indirect task / mesh draws are skipped for
     // the rest of it: one hang, not a series (repeated GPU hangs have taken macOS down with them)
     static int guard = -1; if (guard < 0) { const char *e = getenv("DM_NVN_MESH_GUARD"); guard = !(e && !strcmp(e, "0")); MLOG("indirect task / mesh breaker %s (DM_NVN_MESH_GUARD)", guard ? "on" : "off"); }
-    if (dw->ind && guard && atomic_load(&g_cb_err_sticky)) { RED_ONCE(154, "indirect task / mesh draws: a command buffer failed, so they are skipped for the rest of the run (breaker, DM_NVN_MESH_GUARD)"); return; }
+    if (dw->ind && guard && atomic_load(&g_cb_err_sticky) > g_brk_base) { RED_ONCE(154, "indirect task / mesh draws: a command buffer failed, so they are skipped for the rest of the run (breaker, DM_NVN_MESH_GUARD)"); return; }
     if (!S.prog || (!dw->ind && dw->count <= 0)) return;
     // Diagnostic DM_NVN_SKIP_MESH=1 (off by default): drops every task / mesh draw, as DM_NVN_SKIP_FS drops draws by fragment shader, to measure what they cost in all (the picture is wrong)
     { static int skip = -1; if (skip < 0) { const char *e = getenv("DM_NVN_SKIP_MESH"); skip = e && atoi(e); if (skip) MLOG("DM_NVN_SKIP_MESH: task / mesh draws dropped (diagnostic; the picture is wrong)"); } if (skip) return; }   // diagnostic: what the task / mesh draws cost in all
@@ -659,12 +709,16 @@ static void mesh_tasks_draw(const p_draw *dw) {
     }
     NvProg *raster = pr->geo_lean_raster;   // the pixel stage alone
     if (!raster || raster->sh[1] != pr->sh[1] || raster->sh[0]) { raster = [NvProg new]; raster->sh[1] = pr->sh[1]; pr->geo_lean_raster = raster; }
+    const char *iso_k = isolate_keys(); char k16[17] = {0}; if (ts && iso_k && strlen(ts->key) >= 16) memcpy(k16, ts->key, 16);
+    int iso = k16[0] && strstr(iso_k, k16) != NULL && iso_window_open();
+    if (iso) { isolate_cut(); if (!(g_iso_draws++ % 20000)) MLOG("task isolation: %llu draws isolated, %llu cuts taken before them", (unsigned long long)g_iso_draws, (unsigned long long)g_iso_cuts); }
     g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
     g_mtk.ind = indirect;
     g_geo_program = raster;
     p_draw triangle = {.prim = 4, .count = 3, .instances = 1};
     draw_(&triangle, NULL);
     g_geo_program = nil; g_mtk.on = 0; args_dirty_all();
+    if (iso) isolate_cut();
     if (g_mtk.miss) return;
     swrite_note(pr);
     if (prog_swrites(pr)) { int keep = g_ixc_epoch == g_wr_epoch && g_ixc_sub == g_sub_serial && ixc_writes_spare(pr); g_wr_epoch++; if (keep) g_ixc_epoch = g_wr_epoch; }   // see ixc_writes_spare
