@@ -110,7 +110,9 @@ static id<MTL4CommandQueue> g_q4;
 static int g_classic_ok, g_classic;   // mtl_device_classic was asked / the device has no Metal 4 and only the classic part started (mtl_init)
 static dispatch_queue_t g_feedback_q;
 static _Atomic uint32_t g_present_qos;
-#define ALLOC_MAX 8
+#define ALLOC_MAX 32
+// Ocarina submits about 20 small batches a frame in Hyrule Field: with 8 allocators the submit thread blocked on the oldest about 17 times a frame while the GPU sat idle for half of it. DM_NVN_ALLOC_CAP lowers the cap (and the visibility ring's, which is one per submission) to compare. (seedds #2090)
+static int alloc_cap(void) { static int v; if (!v) { const char *e = getenv("DM_NVN_ALLOC_CAP"); int n = e ? atoi(e) : ALLOC_MAX; v = n < 3 ? 3 : n > ALLOC_MAX ? ALLOC_MAX : n; } return v; }
 static id<MTL4CommandAllocator> g_alloc4[ALLOC_MAX]; static int g_alloc_n, g_alloc_cur;   // Bounded pool: logical event chunks append through a lease; reset only after every committed use completes
 static id<MTL4CommandAllocator> g_up_alloc4[3];
 static id<MTL4CommandAllocator> g_present_alloc4[3];
@@ -1422,7 +1424,7 @@ static int alloc_acquire(mtl_submit_alloc *owner) {
             break;
         }
     }
-    if (slot < 0 && g_alloc_n < ALLOC_MAX) {
+    if (slot < 0 && g_alloc_n < alloc_cap()) {
         NSError *error = nil;
         MTL4CommandAllocatorDescriptor *descriptor = [MTL4CommandAllocatorDescriptor new];
         g_alloc4[g_alloc_n] = [g_dev newCommandAllocatorWithDescriptor:descriptor error:&error];
@@ -1603,7 +1605,7 @@ static void sub_begin(int resume, mtl_submit_alloc *owner) {
             break;
         }
     }
-    if (pick < 0 && g_vis_ring_n < VIS_RING) {
+    if (pick < 0 && g_vis_ring_n < alloc_cap()) {
         pick = g_vis_ring_n++;
     }
     if (pick < 0) {
