@@ -5,7 +5,7 @@ The screen before the game starts shows the settings the game supports. A settin
 - [Tested defaults](#tested-defaults)
 - [Game](#game): [Frame rate](#frame-rate), [Render scale](#render-scale), [Console mode](#console-mode), [Upscaling](#upscaling), [Game's upscaler](#games-upscaler), [Game language](#game-language), [Picture](#picture), [Frame-rate counter](#frame-rate-counter)
 - [Controls](#controls): [Touch feedback](#touch-feedback), [Game rumble](#game-rumble), [Rumble strength](#rumble-strength), [Rumble cutoff](#rumble-cutoff)
-- [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Archive on an external drive](#archive-on-an-external-drive-mac), [Encode thread](#encode-thread), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
+- [Performance](#performance): [Frame buffering](#frame-buffering), [Metal 4 pipelines](#metal-4-pipelines), [Pipeline prebuild](#pipeline-prebuild), [Archive on an external drive](#archive-on-an-external-drive-mac), [Encode thread](#encode-thread), [Experimental: small performance improvement](#experimental-small-performance-improvement-mac), [Hold frames when late](#hold-frames-when-late), [Performance HUD](#performance-hud), [Reset to tested defaults](#reset-to-tested-defaults)
 - [Cheemu](#cheemu): [Softer textures](#softer-textures), [Lossy render targets](#lossy-render-targets), [Skip unused pools](#skip-unused-pools), [Large pools by chunk](#large-pools-by-chunk), [Guest memory in files](#guest-memory-in-files-mac)
 - [The Mac settings window](#the-mac-settings-window): [Display mode](#display-mode)
 - [In-game menu](#in-game-menu)
@@ -190,6 +190,13 @@ The app turns the game's graphics commands into Metal commands on a thread of it
 
 - **When to change it:** leave it on unless a game misbehaves with it; turning it off is a diagnostic step.
 
+### Experimental: small performance improvement (Mac)
+
+Lets each render pass of the game start its vertex work while the previous pass is still drawing, instead of waiting for it to finish completely. The game's own barriers still order what it reads back. In Ocarina of Time's Hyrule Castle Town on an M4 Pro it took about 0.7 ms of idle GPU time out of each frame, though the passes then run a little slower side by side, so the gain is small. It is off by default because it is new.
+
+- **When to change it:** try it on if a game runs close to its frame rate; turn it off if the picture flashes for single frames.
+- **Cost:** none measured; a wrong ordering would show as single-frame flashes.
+
 ### Hold frames when late
 
 For games whose frame rate the app controls ([Frame rate](#frame-rate)). With 60 fps chosen, each frame is meant to stay on screen for one refresh. When a frame comes late, the app can either slow the game down to 30 fps for a while, or keep 60 and show late frames as they come.
@@ -316,6 +323,7 @@ A line like `DM_PRESENT_SNAP=0` in `Documents/env.txt` (in the Files app, under 
 | Pipeline prebuild | `DM_PSO_PREBUILD` | `1`, `0` |
 | Archive on an external drive (Mac) | `DM_PSO_MAPPED` | `copy` copy to the boot drive, `0` load into memory, `1` read from the drive |
 | Encode thread | `DM_NVN_ENC_THREAD` | `1`, `0` |
+| Experimental: small performance improvement (Mac) | `DM_NVN_BARRIER` | `game` on, `full` off |
 | Hold frames when late | `DM_FPS_HOLD` | `on`, `off` |
 | Performance HUD | `DM_METAL_HUD` | `1`, `0` |
 

@@ -515,3 +515,11 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Fix:** the fast event wait is bounded to 100 ms before rechecking completion and using the feedback condition variable. Finite waits retain their original total timeout budget.
 - **Found on:** Ocarina of Time (Switch 2, #1299), after a gameplay GPU memory fault. The GPU fault itself remains open.
 - **Check:** `make -C dm/gfx/tests GAME=0400C3F00006E000 perf-order-cpu` checks a completion callback with an unsignaled event, finite timeout budgets, and both fast-wait and feedback paths.
+
+### Repeated archive misses while hybrid pipeline demand is saturated
+
+- **Symptom:** a busy scene runs far below its GPU throughput: CPU submission dominates frame time, the bounded demand-build table is full, and repeated failed archive searches dominate the presentation thread.
+- **Cause:** when `pso_pend_try` finds no slot, `pso_get_` probes the archive before using its pulling stand-in. A full demand table cannot admit that key, so its later draws repeat the same failed archive scan. Successful bases were cached, absent ones were not.
+- **Fix:** `g_pbase_miss`, protected by the existing base lock and keyed like the positive cache, suppresses repeated non-compiling probes. The archive arrays are opened once and remain unchanged for the process lifetime. Demand compilation still queries/builds normally, and a completed positive base takes precedence over an earlier miss. No result is persisted across launches.
+- **Check:** `t_pso_archive` probes one absent layout 100 times, checks that only one archive lookup occurs, probes a distinct layout independently, then compiles the previously absent base and verifies that non-compiling probes can use it. The archive suite and fresh-process compaction test pass with Metal validation. The game's note records the live before/after measurements and their limits.
+- **Found on:** [The Legend of Zelda: Ocarina of Time](../../dm/games/0400486024DEC000/README.md#local-city-pipeline-lookup-validation), Apple M5 / macOS 27.0.1.

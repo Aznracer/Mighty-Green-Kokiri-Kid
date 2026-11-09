@@ -75,21 +75,17 @@ def frag_z(msl):
         else: return m.group(0)
         return f'bool {m.group(1)} = {a} {op} {b};'
     return re.sub(r'bool (_\d+) = (_\d+) (>=|<=|>|<) (_\d+);', one, msl)
-# Keep SPIRV-Cross's mulhi workaround, but allow constant folding for scalar uint products with a non-power-of-two literal multiplier.
-# Power-of-two high-word products have a separate shift identity; vector, signed and dynamic products retain the original helper.
-def extended_multiply_msl(msl):
-    if 'spvMulExtended<' not in msl or 'using namespace metal;\n' not in msl: return msl
-    helper = r'template<typename T, typename U, typename V>\s*\[\[clang::optnone\]\] T spvMulExtended\(V l, V r\)\s*\{\s*return T\{U\(l \* r\), U\(mulhi\(l, r\)\)\};\s*\}'
-    if len(re.findall(helper, msl)) != 1 or len(re.findall(r'\bT spvMulExtended\(', msl)) != 1: return msl
-    call = r'\bspvMulExtended<(\w+), uint>\(((?:uint|as_type<uint>)\([^()]*\)), ([0-9]+)u\)'
-    def replace(m):
-        n = int(m[3])
-        if n <= 1 or n > 0xffffffff or n & (n - 1) == 0: return m[0]
-        return f'dmsh_mul_extended_uint<{m[1]}>({m[2]}, {m[3]}u)'
-    changed = re.sub(call, replace, msl)
-    if changed == msl: return msl
-    body = 'template<typename T> static inline __attribute__((always_inline)) T dmsh_mul_extended_uint(uint l, uint r) { ulong p = ulong(l) * ulong(r); return T{uint(p), uint(p >> 32)}; }\n'
-    return changed.replace('using namespace metal;\n', 'using namespace metal;\n' + body, 1)
+# spirv-cross writes OpUMulExtended / OpSMulExtended as calls of an optnone template, spvMulExtended, as Metal's compiler may fail on an inlined mulhi (spirv_msl.cpp,
+# SPVFuncImplMulExtended). The barrier keeps every product a call that is never folded: Switch 2 shaders divide by constants through the high word of a product (Ocarina of Time
+# has 348,587 such calls, all scalar uint by a literal, 98% by a power of two), and its NDVE title movie ran 6.9% faster on an M1 Pro with its 5,679 others inline (PR #1741).
+# Scalar operands get overloads that take the halves of the 64-bit product, with no mulhi; overload resolution prefers them to the template, and vectors keep the template.
+def mul_extended(msl):
+    helper = re.compile(r'template<typename T, typename U, typename V>\s*\[\[clang::optnone\]\] T spvMulExtended\(V l, V r\)\s*\{\s*return T\{U\(l \* r\), U\(mulhi\(l, r\)\)\};\s*\}\n')
+    found = list(helper.finditer(msl)) if 'spvMulExtended' in msl else []
+    if len(found) != 1 or 'spvMulExtended(uint l, uint r)' in msl: return msl
+    scalar = ''.join(f'template<typename T, typename U> static inline __attribute__((always_inline)) T spvMulExtended({t} l, {t} r) {{ {w} p = {w}(l) * {w}(r); return T{{U(p), U(p >> 32)}}; }}\n'
+                     for t, w in (('uint', 'ulong'), ('int', 'long')))
+    return msl[:found[0].end()] + scalar + msl[found[0].end():]
 
 # Ampere HMMA.16816 with an f16 accumulator (agl's upscaler networks, the NDVE video networks) reaches the MSL as calls of dmsh_hmma16816_f16(lane, block, A0..A3, B0, B1, C0, C1,
 # flags, A's LDSM address, A0..A3's offsets, A's row stride, out D1) → D0, the subgroup's 256-word block of the scratch shared memory as the last argument (InstEmitAmpereTensor.AHmma,
@@ -410,7 +406,10 @@ PRE_STATS = collections.Counter()
 SHADER_MATH = {'fast': [], 'relaxed': ['-fmetal-math-mode=relaxed'], 'safe': ['-fno-fast-math']}
 _math = GAME.get('shader_math', 'fast') if GAME else 'fast'
 if _math not in SHADER_MATH: sys.exit(f'[RED] game.tsv shader_math: {_math} (fast, relaxed or safe)')
-MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance']
+# -fwrapv: signed integer arithmetic wraps, as on Maxwell / Ampere and in SPIR-V (OpIMul, OpIAdd, OpShiftLeftLogical are modular), which spirv-cross writes as MSL int arithmetic, whose
+# overflow the front end takes as impossible. Ocarina of Time's mesh shaders take the low half of a packed word sign-extended as (w * 65536) >> 16: without the flag that became w's
+# high half shifted into place (the lightmap UV 65536 times too large: a bright band on a Deku Tree wall, a pale patch at the Kokiri exit; 64 of its 42,848 shaders hold the form)
+MAC_METAL = ['xcrun', '-sdk', 'macosx', 'metal', '-c', '-O1', '-fpreserve-invariance', '-fwrapv']
 MAC_METAL += SHADER_MATH[_math]   # its own statement: tests that run the assignment above alone (test_dmsh_raw_last) compile as the default
 MAC_RECORD = ' '.join(MAC_METAL) + '; xcrun -sdk macosx metallib'
 # -fbracket-depth: the front end stops at 256 nested brackets ("bracket nesting level exceeded maximum of 256"). Ocarina of Time's compute shaders 1f78730053feb036 and e172bd7ec218ab8e
@@ -752,8 +751,10 @@ def early_fragment_tests(ctl, code):
     the sdk of all 21 games here; Ryujinx gets it as the 3D engine's EarlyZForce). On the Switch such a shader is tested against depth before it runs; Metal otherwise tests a shader that
     stores to memory after it, and the late depth differs by an ulp from a prepass's along contours, so an EQUAL pass fails there (MacNativeGames ae8f4f4: Tears of the Kingdom's dotted
     lattice on the Great Sky Island; 1,677 of its 13,646 pixel shaders set it, none writes depth). A shader whose SPH (code, after the 0x30 header) writes depth (word 19 bit 1, OmapDepth)
-    is left as it is: tested early, the depth it computes would not be the one tested"""
-    return len(ctl) > 0x718 and ctl[0x718] != 0 and len(code) >= 0x50 and not struct.unpack_from('<I', code, 19 * 4)[0] & 2
+    is left as it is: tested early, the depth it computes would not be the one tested. NVN2 (Switch 2) keeps the flag at control +0x5b (dmsh_ampere.early_fragment_tests), its
+    0x80-byte SPH starting the code as here, with word 19 where Maxwell's has it"""
+    flag = dmsh_ampere.early_fragment_tests(ctl) if dmsh_ampere.is_nvn2(ctl) else len(ctl) > 0x718 and ctl[0x718] != 0
+    return flag and len(code) >= 0x50 and not struct.unpack_from('<I', code, 19 * 4)[0] & 2
 
 def ps_omap(code):
     """A pixel shader's output map: SPH word 18 (Maxwell's 0x50-byte SPH and NVN2's 0x80-byte one alike, at the start of the job's code; Ryujinx ShaderHeader OmapTargets),
@@ -767,8 +768,8 @@ def job_for(key, name, rec, w):
     extra = {}
     if dmsh_ampere.is_nvn2(rec[ci:]):
         # NVN2 (Switch 2): Ampere code (a 0x80-byte SPH for the graphics stages, then the instructions, control +0x38 long), which the translator's Ampere
-        # frontend reads (job arch sm86); its c1 segment lies between control +0x40 and +0x44. The NVN control fields the steps below read (VertexA / B,
-        # transform feedback, early fragment tests) are not in an NVN2 section
+        # frontend reads (job arch sm86); its c1 segment lies between control +0x40 and +0x44. The NVN control fields the NVN1 branch reads (VertexA / B,
+        # transform feedback) are not in an NVN2 section; early fragment tests are, at +0x5b (early_fragment_tests, after both branches)
         c1 = dmsh_ampere.c1_segment(rec[ci:], code)
         code = code[:dmsh_ampere.inst_len(rec[ci:])]
         extra['arch'] = 'sm86'
@@ -796,7 +797,7 @@ def job_for(key, name, rec, w):
             code = code[0x100:]
         tf = tf_layout(key, rec[ci:]) if stage in ('vs', 'gs') else None
         if tf: extra['tf'] = tf
-        if stage == 'ps' and early_fragment_tests(rec[ci:], code): extra['early_fragment_tests'] = True
+    if stage == 'ps' and early_fragment_tests(rec[ci:], code): extra['early_fragment_tests'] = True
     cp = os.path.join(w, key + '.bin'); open(cp, 'wb').write(code)
     j = {'key': key, 'stage': stage, 'code': cp, 'tex': {}, 'img': {}, 'attr': {}, 'fout': {}, 'c1': c1.hex(), **extra,
          'debug': os.environ.get('XLATE_DEBUG', '1') != '0', 'reduced': os.environ.get('XLATE_REDUCED', '1') == '1'}   # translation options (see dmsh_xlate/Program.cs); relaxed precision is on by default (GPU float last-bit error does not enter game state, whole frame −26% on the second Mac)   # c1: used by the translator to read indirect jump tables
@@ -1614,7 +1615,7 @@ def finish(key, w, j, c1):
     except ValueError as e: return 'image atomic MSL failed', str(e), None
     src = precise(src)   # min / max / clamp with Maxwell's NaN results (see precise)
     if j['stage'] == 'ps': src = frag_z(src)   # position.z against the depth the same surface stored (see frag_z)
-    src = extended_multiply_msl(src)   # exact scalar products without the unoptimized mulhi wrapper
+    src = mul_extended(src)   # scalar extended products without the optnone wrapper (see mul_extended)
     try: src = gather_offsets(src)   # four gathers instead of a wrapper's loop over their offsets (see gather_offsets)
     except ValueError as e: return 'gather offsets rewrite failed', str(e)[:160], None
     try: src = hmma_msl(src)   # Ampere HMMA through simdgroup_matrix (see hmma_msl)
