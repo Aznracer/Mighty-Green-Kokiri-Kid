@@ -17179,18 +17179,54 @@ static thread_act_t mach_thread_self_cached(void) { return g_tt_self; }
 #include <mach/thread_status.h>
 // Where an unnamed busy thread was running: suspend it for a moment, read its pc, resume it, and only then (with it running again, so no lock it holds is
 // waited for) name the pc's library and nearest symbol: " @AGXMetalG18P:symbol+0x40". Not for the calling thread.
+#include <ptrauth.h>
+// Is this library the system's plumbing (thread pool, syscalls, locks), which every worker passes through whatever it works for?
+static int tt_plumbing(const char *lib) {
+    static const char *const P[] = {"libsystem_kernel.dylib", "libsystem_pthread.dylib", "libdispatch.dylib", "libsystem_c.dylib", "libsystem_platform.dylib", "libsystem_malloc.dylib"};
+    for (unsigned k = 0; k < sizeof P / sizeof *P; k++) if (!strcmp(lib, P[k])) return 1;
+    return 0;
+}
+// One sample: the thread's pc, lr and up to 14 return addresses from its frame-pointer chain, read while it is suspended (no lock taken: vm_read_overwrite only)
+static int tt_walk(thread_act_t th, uintptr_t *ret, int max) {
+    arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT; int n = 0;
+    if (thread_suspend(th) != KERN_SUCCESS) return 0;
+    if (thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &c) == KERN_SUCCESS) {
+        ret[n++] = (uintptr_t)arm_thread_state64_get_pc(st);
+        if (n < max) ret[n++] = (uintptr_t)arm_thread_state64_get_lr(st);
+        uintptr_t fp = (uintptr_t)arm_thread_state64_get_fp(st);
+        for (int d = 0; d < 14 && n < max && fp && !(fp & 7); d++) {
+            uintptr_t fr[2]; vm_size_t got = 0;   // [saved fp, return address]
+            if (vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof fr, (vm_address_t)fr, &got) != KERN_SUCCESS || got != sizeof fr) break;
+            uintptr_t ra = (uintptr_t)ptrauth_strip((void *)fr[1], ptrauth_key_return_address);
+            if (!ra) break;
+            ret[n++] = ra;
+            if (fr[0] <= fp) break;   // the chain goes up the stack
+            fp = fr[0];
+        }
+    }
+    thread_resume(th);
+    return n;
+}
 static void tt_sample_pc(thread_act_t th, char *out, size_t n) {
     if (th == mach_thread_self_cached()) return;
-    arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
-    if (thread_suspend(th) != KERN_SUCCESS) return;
-    kern_return_t r = thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &c);
-    thread_resume(th);
-    if (r != KERN_SUCCESS) return;
-    uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(st);
-    Dl_info di; if (!pc || !dladdr((void *)pc, &di) || !di.dli_fname) { snprintf(out, n, " @0x%lx", (unsigned long)pc); return; }
-    const char *lib = strrchr(di.dli_fname, '/'); lib = lib ? lib + 1 : di.dli_fname;
-    if (di.dli_sname) snprintf(out, n, " @%s:%s+0x%lx", lib, di.dli_sname, (unsigned long)(pc - (uintptr_t)di.dli_saddr));
-    else snprintf(out, n, " @%s+0x%lx", lib, (unsigned long)(pc - (uintptr_t)di.dli_fbase));
+    enum { S = 8 }; char got[S][112]; int ng = 0, idle = 0;
+    for (int k = 0; k < S; k++) {
+        if (k) usleep(2000);
+        uintptr_t ret[16]; int nr = tt_walk(th, ret, 16);
+        if (!nr) continue;
+        char *g = got[ng]; g[0] = 0;
+        for (int f = 0; f < nr && !g[0]; f++) {   // the first frame outside the plumbing
+            Dl_info di; if (!dladdr((void *)ret[f], &di) || !di.dli_fname) continue;
+            const char *lib = strrchr(di.dli_fname, '/'); lib = lib ? lib + 1 : di.dli_fname;
+            if (tt_plumbing(lib)) continue;
+            if (di.dli_sname) snprintf(g, sizeof got[0], "%s:%.60s", lib, di.dli_sname); else snprintf(g, sizeof got[0], "%s+0x%lx", lib, (unsigned long)(ret[f] - (uintptr_t)di.dli_fbase));
+        }
+        if (g[0]) ng++; else idle++;
+    }
+    if (!ng) { if (idle) snprintf(out, n, " @idle (%d/%d)", idle, S); return; }
+    int best = 0, bc = 0;
+    for (int a = 0; a < ng; a++) { int cnt = 0; for (int b = 0; b < ng; b++) cnt += !strcmp(got[a], got[b]); if (cnt > bc) { bc = cnt; best = a; } }
+    snprintf(out, n, " @%s (%d/%d)", got[best], bc, S);
 }
 static void *thread_top_main(void *arg) {
     (void)arg; pthread_setname_np("dm thread top"); g_tt_self = mach_thread_self();
@@ -17229,7 +17265,7 @@ static void *thread_top_main(void *arg) {
             }
             char line[1024]; int len = snprintf(line, sizeof line, "thread top over 5 s: all threads %llu ms/s (%d threads); busiest:", (unsigned long long)(total / 5000000), cnt);
             for (int k = 0; k < nt && len < (int)sizeof line - 64; k++) {
-                char where[96] = "";
+                char where[160] = "";
                 if (!strcmp(name[top[k]], "(unnamed)") && d[top[k]] >= 50 * 5000000ull) tt_sample_pc(port[top[k]], where, sizeof where);   // 50 ms/s or more
                 len += snprintf(line + len, sizeof line - len, "%s '%s'%s %llu ms/s", k ? "," : "", name[top[k]], where, (unsigned long long)(d[top[k]] / 5000000));
             }
