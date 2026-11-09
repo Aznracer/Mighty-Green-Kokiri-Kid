@@ -151,6 +151,8 @@ HLE_FORCE("_ZN2nn3mii8Database9IsUpdatedEi", "mii:u service; true once after App
 HLE_FORCE("_ZNK2nn3mii8Database14IsFullDatabaseEv", "mii:u service; full at 100 Miis", int, h_mii_Full, const void *self) { (void)self; return g_mii_n >= MII_DB_MAX; }
 // Source flags: 1 the console's database, 2 the six default Miis every console has; the database's come first, as the mii service lists them. Mario Kart 8 Deluxe asks for the defaults with room for 6 and never reads the count
 // (main+0x81e954): its boot-time list of Mii icons (main+0x419dc8) builds a head for each of the six, and zeroed entries failed the model's CharInfo check
+// The owner of the host's virtual amiibo (hle_sdk16.c GetRegisterInfo, DM_AMIIBO): the first default Mii, valid for CharInfoAccessor::IsValid as the others
+void dm_mii_default_charinfo(void *out) { mii_default((mii_charinfo *)out, 0, 0); }
 enum { MII_SRC_DATABASE = 1, MII_SRC_DEFAULT = 2, MII_DEFAULTS = 6 };
 static int mii_get(void *buf, int n, int src, size_t stride) {
     int k = 0; pthread_mutex_lock(&g_mii_mu);
