@@ -896,6 +896,12 @@ static void poll_wait_end(int64_t ns, int64_t r) {
 // sleeps the back-off's length when that is longer (one nanosleep). A loop that does work between its sleeps starts a new run each time, and the first 2 ms of a wait keep the guest's own sleep
 #define POLL_SLEEP_NS 250000
 void dm_guest_sleep_ns(int64_t ns);
+// DM_POLL_SLEEP (on unless =0): #1975's short-sleep back-off, switchable for an A/B (ab_patch.py)
+static int poll_sleep_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_POLL_SLEEP"); v = !e || atoi(e); LOG("short guest sleeps (20-250 us): %s (DM_POLL_SLEEP)", v ? "back off like other polls (#1975)" : "slept as the guest asks"); }
+    return v;
+}
 static void poll_sleep(int64_t ns) {
     thr_t *me = pthread_getspecific(g_keythr); if (!me) { dm_guest_sleep_ns(ns); return; }
     uint64_t now = now_ns();
@@ -1042,7 +1048,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         // A sleep, and YieldToAnyThread (-2), which takes the thread off its core so that lower-priority threads run there, end its part in a handoff;
         // the other yields (0, -1) pass the core only to threads of its own priority or higher
         if (ns > 0 || ns == -2) { thr_t *me = pthread_getspecific(g_keythr); if (me && me->nhand) { pthread_mutex_lock(&G); hand_leave(me); g_unlock(); } }
-        if (ns >= 20000 && ns < POLL_SLEEP_NS && !dm_detclock_enabled()) poll_sleep(ns);   // #1975
+        if (ns >= 20000 && ns < POLL_SLEEP_NS && !dm_detclock_enabled() && poll_sleep_on()) poll_sleep(ns);   // #1975 (DM_POLL_SLEEP=0: off)
         else if ((ns > 0 && dm_detclock_enabled()) || ns >= 20000) dm_guest_sleep_ns(ns);
         // Yield (0 / -1 / -2), and sleeps shorter than 20 µs, which sleep_precise would return from at once: Super Mario Galaxy's Hagi polls with SleepThread(100 ns) (main+0x517c),
         // which kept a core at 100% (1.4 billion calls in 200 s); as yields they get the back-off below.

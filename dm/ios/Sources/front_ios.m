@@ -204,7 +204,9 @@ static void launcher_done(void) { [g_root startGame]; }
         if (fps_wide()) {   // one line, centred across the top (fps_wide.py)
             CGFloat room = s.size.width - 16; CGSize fit = [self.fps sizeThatFits:CGSizeMake(CGFLOAT_MAX, 40)];
             CGFloat w = MIN(MAX(ceil(fit.width) + 12, 64), room), h = ceil(fit.height) + 4;
-            self.fps.frame = CGRectMake(floor(CGRectGetMidX(s) - w / 2), floor(CGRectGetMinY(s) + 2), w, h);
+            CGFloat below = CGRectGetMaxY(b) - CGRectGetMaxY(layout.game);   // the black bar below the picture: clear of the settings gear at the top (ab_patch.py)
+            CGFloat y = !layout.separated && below >= h + 4 ? CGRectGetMaxY(layout.game) + floor((below - h) / 2) : CGRectGetMinY(s) + 2;
+            self.fps.frame = CGRectMake(floor(CGRectGetMidX(s) - w / 2), floor(y), w, h);
         } else {
             CGFloat x = floor(CGRectGetMinX(s) + 130 * u), room = CGRectGetMidX(s) - 77 * u - 8 - x;
             CGSize fit = [self.fps sizeThatFits:CGSizeMake(MAX(room - 12, 64), 110)];
@@ -435,7 +437,7 @@ static NSString *sensors_line(void) {
     else if (isfinite(vw) && vw > 5) power = @"⚡ in (wireless)";
     else power = @"⚡ no input";
     if (isfinite(vb) && isfinite(ib) && ib > 0.02) power = [power stringByAppendingFormat:@" · batt +%.1f W", vb * ib];
-    else if ([power isEqualToString:@"⚡ no input"]) power = @"⚡ on battery (drain not readable)";
+    else if ([power isEqualToString:@"⚡ no input"]) power = @"⚡ on battery";   // iOS has no readable discharge sensor
     return [NSString stringWithFormat:@"%@\n%@", temps, power];
 }
 static void sensors_start(void) {
@@ -448,7 +450,7 @@ static void sensors_start(void) {
         dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC, 200 * NSEC_PER_MSEC);
         dispatch_source_set_event_handler(timer, ^{
             NSString *line = sensors_line();
-            static int logged; if (logged++ % 30 == 0) LOG("front end: sensors: %s", [line stringByReplacingOccurrencesOfString:@"\n" withString:@" | "].UTF8String);   // once a minute
+            static int logged; if (logged++ % 5 == 0) LOG("front end: sensors: %s", [line stringByReplacingOccurrencesOfString:@"\n" withString:@" | "].UTF8String);   // every 10 s
             dispatch_async(dispatch_get_main_queue(), ^{ g_sensor_line = line; });
         });
         dispatch_resume(timer);
