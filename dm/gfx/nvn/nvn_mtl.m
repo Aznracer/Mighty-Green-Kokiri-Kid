@@ -17159,11 +17159,30 @@ void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_allo
 #pragma clang attribute pop
 
 // DM_THREAD_TOP (on unless =0): every 5 s, the busiest threads of the process over those 5 s, host threads included (scripts/oot_iphone/thread_top.py)
+static thread_act_t g_tt_self;
+static thread_act_t mach_thread_self_cached(void) { return g_tt_self; }
+#include <dlfcn.h>
+#include <mach/thread_status.h>
+// Where an unnamed busy thread was running: suspend it for a moment, read its pc, resume it, and only then (with it running again, so no lock it holds is
+// waited for) name the pc's library and nearest symbol: " @AGXMetalG18P:symbol+0x40". Not for the calling thread.
+static void tt_sample_pc(thread_act_t th, char *out, size_t n) {
+    if (th == mach_thread_self_cached()) return;
+    arm_thread_state64_t st; mach_msg_type_number_t c = ARM_THREAD_STATE64_COUNT;
+    if (thread_suspend(th) != KERN_SUCCESS) return;
+    kern_return_t r = thread_get_state(th, ARM_THREAD_STATE64, (thread_state_t)&st, &c);
+    thread_resume(th);
+    if (r != KERN_SUCCESS) return;
+    uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(st);
+    Dl_info di; if (!pc || !dladdr((void *)pc, &di) || !di.dli_fname) { snprintf(out, n, " @0x%lx", (unsigned long)pc); return; }
+    const char *lib = strrchr(di.dli_fname, '/'); lib = lib ? lib + 1 : di.dli_fname;
+    if (di.dli_sname) snprintf(out, n, " @%s:%s+0x%lx", lib, di.dli_sname, (unsigned long)(pc - (uintptr_t)di.dli_saddr));
+    else snprintf(out, n, " @%s+0x%lx", lib, (unsigned long)(pc - (uintptr_t)di.dli_fbase));
+}
 static void *thread_top_main(void *arg) {
-    (void)arg; pthread_setname_np("dm thread top");
+    (void)arg; pthread_setname_np("dm thread top"); g_tt_self = mach_thread_self();
     enum { TT_MAX = 512, TT_TOP = 8 };
     static uint64_t pid_[TT_MAX], pt_[TT_MAX]; static int np_;
-    uint64_t id[TT_MAX], t[TT_MAX]; static char name[TT_MAX][32];
+    uint64_t id[TT_MAX], t[TT_MAX]; static char name[TT_MAX][32]; thread_act_t port[TT_MAX];
     for (;;) {
         sleep(5);
         const char *e = getenv("DM_THREAD_TOP"); if (e && !atoi(e)) continue;
@@ -17176,7 +17195,8 @@ static void *thread_top_main(void *arg) {
             if (cnt < TT_MAX && thread_info(th[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ii, &c1) == KERN_SUCCESS &&
                 thread_info(th[i], THREAD_EXTENDED_INFO, (thread_info_t)&ei, &c2) == KERN_SUCCESS) {
                 id[cnt] = ii.thread_id; t[cnt] = ei.pth_user_time + ei.pth_system_time;   // ns
-                strlcpy(name[cnt], ei.pth_name[0] ? ei.pth_name : "(unnamed)", sizeof name[cnt]); cnt++;
+                strlcpy(name[cnt], ei.pth_name[0] ? ei.pth_name : "(unnamed)", sizeof name[cnt]); port[cnt] = th[i]; cnt++;
+                continue;   // its port is released after the report (the busiest unnamed ones are sampled first)
             }
             mach_port_deallocate(mach_task_self(), th[i]);
         }
@@ -17194,11 +17214,14 @@ static void *thread_top_main(void *arg) {
                 used[b] = 1; top[nt] = b;
             }
             char line[1024]; int len = snprintf(line, sizeof line, "thread top over 5 s: all threads %llu ms/s (%d threads); busiest:", (unsigned long long)(total / 5000000), cnt);
-            for (int k = 0; k < nt && len < (int)sizeof line - 64; k++)
-                len += snprintf(line + len, sizeof line - len, "%s '%s' %llu ms/s", k ? "," : "", name[top[k]], (unsigned long long)(d[top[k]] / 5000000));
+            for (int k = 0; k < nt && len < (int)sizeof line - 64; k++) {
+                char where[96] = "";
+                if (!strcmp(name[top[k]], "(unnamed)") && d[top[k]] >= 50 * 5000000ull) tt_sample_pc(port[top[k]], where, sizeof where);   // 50 ms/s or more
+                len += snprintf(line + len, sizeof line - len, "%s '%s'%s %llu ms/s", k ? "," : "", name[top[k]], where, (unsigned long long)(d[top[k]] / 5000000));
+            }
             MLOG("%s", line);
         }
-        for (int i = 0; i < cnt; i++) { pid_[i] = id[i]; pt_[i] = t[i]; }
+        for (int i = 0; i < cnt; i++) { pid_[i] = id[i]; pt_[i] = t[i]; mach_port_deallocate(mach_task_self(), port[i]); }
         np_ = cnt;
     }
     return NULL;
