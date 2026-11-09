@@ -58,3 +58,6 @@ dispatch_clamp	off
 # tiles kept what they held before, flat blue and grey holes in the ground with the grass drawn over them (Kokiri Forest, the Lost Woods)
 tex_flush_upload	on
 tex_dirty_upload	on
+# Touch controls from cheemu21/kid-with-sword-remake: the Native layout (a mobile game's layout in very transparent glass) in the Forest colours; DM_PAD_THEME=0 in env.txt gives the Classic colours
+pad_layout	native
+pad_theme	forest
