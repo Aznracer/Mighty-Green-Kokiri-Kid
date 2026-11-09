@@ -17159,20 +17159,11 @@ void mtl_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = g_allo
 #pragma clang attribute pop
 
 // DM_THREAD_TOP (on unless =0): every 5 s, the busiest threads of the process over those 5 s, host threads included (scripts/oot_iphone/thread_top.py)
-#include <dispatch/dispatch.h>
-// The label of the dispatch queue a thread is running (THREAD_IDENTIFIER_INFO's dispatch_qaddr holds the address of the queue pointer), or NULL
-static const char *tt_queue_label(uint64_t qaddr) {
-    if (!qaddr) return NULL;
-    dispatch_queue_t q = NULL; vm_size_t got = 0;
-    if (vm_read_overwrite(mach_task_self(), (vm_address_t)qaddr, sizeof q, (vm_address_t)&q, &got) != KERN_SUCCESS || got != sizeof q || !q) return NULL;   // a safe read: the thread may have left the queue
-    const char *l = dispatch_queue_get_label(q);
-    return l && l[0] ? l : NULL;
-}
 static void *thread_top_main(void *arg) {
     (void)arg; pthread_setname_np("dm thread top");
     enum { TT_MAX = 512, TT_TOP = 8 };
     static uint64_t pid_[TT_MAX], pt_[TT_MAX]; static int np_;
-    uint64_t id[TT_MAX], t[TT_MAX]; static char name[TT_MAX][64];
+    uint64_t id[TT_MAX], t[TT_MAX]; static char name[TT_MAX][32];
     for (;;) {
         sleep(5);
         const char *e = getenv("DM_THREAD_TOP"); if (e && !atoi(e)) continue;
@@ -17185,8 +17176,7 @@ static void *thread_top_main(void *arg) {
             if (cnt < TT_MAX && thread_info(th[i], THREAD_IDENTIFIER_INFO, (thread_info_t)&ii, &c1) == KERN_SUCCESS &&
                 thread_info(th[i], THREAD_EXTENDED_INFO, (thread_info_t)&ei, &c2) == KERN_SUCCESS) {
                 id[cnt] = ii.thread_id; t[cnt] = ei.pth_user_time + ei.pth_system_time;   // ns
-                const char *ql = ei.pth_name[0] ? NULL : tt_queue_label(ii.dispatch_qaddr);
-                snprintf(name[cnt], sizeof name[cnt], "%s%s pri %d", ei.pth_name[0] ? "" : "q:", ei.pth_name[0] ? ei.pth_name : ql ? ql : "(unnamed)", ei.pth_curpri); cnt++;
+                strlcpy(name[cnt], ei.pth_name[0] ? ei.pth_name : "(unnamed)", sizeof name[cnt]); cnt++;
             }
             mach_port_deallocate(mach_task_self(), th[i]);
         }
