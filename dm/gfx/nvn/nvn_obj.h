@@ -286,6 +286,7 @@ int mtl_tex_cpu_rewritten(const tex_t *t);                               // nvn_
 int nvn_ft_tracked(uint64_t serial);
 int mtl_tex_first_use_reads(const tex_t *t);   // nvn_mtl.m: the first use takes the content from the storage (ft_add protects it only then)
 int nvn_tex_dirty_on(void);   // the profile's tex_dirty_upload, or DM_NVN_TEX_DIRTY (hle_nvn.c)
+void nvn_ft_hold(void); void nvn_ft_release(void); void nvn_ft_restamp_held(uint64_t serial);   // the host writes GPU content into a registered texture's storage: not a CPU write (mirror_rb_own)
 int nvn_tex_mirror_b2t(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, const uint8_t *src, size_t row, size_t img);
 int nvn_tex_mirror_t2t(const tex_t *s, unsigned sl, unsigned ss, const NVNcopyRegion *sr, const tex_t *d, unsigned dl, unsigned ds, const NVNcopyRegion *dr);
 // A program's per-stage shader key (hle_nvn.c): the first 8 bytes of sha256(first 0x880 bytes of the control section (its own length when shorter) + code area). Computed at SetShaders (NVN lets the caller free the control section once it returns, and Unity does);

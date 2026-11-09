@@ -21,7 +21,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/event.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -40,15 +39,6 @@ static void add_key(char **list, const char *k) {   // a space-separated list of
 }
 
 static void forward(int sig) { if (g_child > 0) kill(g_child, sig); }
-int32_t dm_launch_game_app(const char *app, const char *arg);   // GameApp.swift: Contents/Helpers/Game.app through LaunchServices, its pid or -1
-// The game app's exit: it is not this process's child, so no waitpid and no exit status; a kqueue on its pid (gone before the watch: it has exited)
-static void wait_exit(pid_t pid) {
-    int kq = kqueue(); struct kevent ev, out;
-    EV_SET(&ev, pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
-    if (kq < 0 || kevent(kq, &ev, 1, NULL, 0, NULL) < 0) { if (kq >= 0) close(kq); while (!kill(pid, 0)) usleep(200000); return; }
-    while (kevent(kq, NULL, 0, &out, 1, NULL) < 0 && errno == EINTR) {}
-    close(kq);
-}
 
 static int info_string(const char *key, char *out, size_t n) {   // a string key of the bundle's Info.plist
     CFBundleRef b = CFBundleGetMainBundle(); if (!b) return 0;
@@ -199,7 +189,7 @@ int main(int argc, char **argv) {
     snprintf(log, sizeof log, "%s/%s.log", logs, id); snprintf(prev, sizeof prev, "%s/%s.prev.log", logs, id);
     mkdirs(save); mkdirs(temp); mkdirs(logs);
     rename(log, prev);
-    int fd = open(log, O_WRONLY | O_CREAT | O_TRUNC | O_APPEND, 0644);   // appended to: the game app writes the same file (DM_LOG_FILE)
+    int fd = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); close(fd); setvbuf(stdout, NULL, _IOLBF, 0); }
     fprintf(stderr, "launcher: %s (%s), host %s\n", name, id, host);
     CFArrayRef rules = setting_rules();   // the settings the launch environment already set: the window shows them, fixed
@@ -229,25 +219,6 @@ int main(int argc, char **argv) {
     sigemptyset(&sa.sa_mask);
     sigaction(SIGTERM, &sa, NULL); sigaction(SIGINT, &sa, NULL); sigaction(SIGHUP, &sa, NULL);
     char *host_argv[] = {host, dm, NULL};
-    // The game as an app of its own, started through LaunchServices (GameApp.swift): macOS's Game Mode and its process accounting take an app, and a child started here is an
-    // anonymous process to them. It writes the log itself (DM_LOG_FILE). DM_GAME_APP=0, an app packed without it, or a failed start: the host as this process's child, as before
-    char game_app[PATH_MAX]; snprintf(game_app, sizeof game_app, "%s/Helpers/Game.app", contents);
-    const char *ga = getenv("DM_GAME_APP");
-    if (!(ga && !strcmp(ga, "0")) && !access(game_app, F_OK)) {
-        setenv("DM_LOG_FILE", log, 1);
-        fflush(stdout); fflush(stderr);
-        pid_t gpid = dm_launch_game_app(game_app, dm);
-        if (gpid > 0) {
-            g_child = gpid;
-            fprintf(stderr, "launcher: the game runs as its own app (Contents/Helpers/Game.app, pid %d)\n", (int)gpid);
-            wait_exit(gpid);
-            if (!save_sync_after_exit(getenv("DM_SAVE"), id)) fprintf(stderr, "launcher: the save did not reach the cloud; it goes at the next start\n");
-            fprintf(stderr, "launcher: the game app exited\n");
-            return 0;
-        }
-        unsetenv("DM_LOG_FILE");
-        fprintf(stderr, "launcher: the game app did not start: the host runs as this launcher's child\n");
-    }
     int err = posix_spawn(&g_child, host, NULL, NULL, host_argv, environ);
     if (err) { fprintf(stderr, "[RED] launcher: cannot start %s: %s\n", host, strerror(err)); return 1; }
     int status;
