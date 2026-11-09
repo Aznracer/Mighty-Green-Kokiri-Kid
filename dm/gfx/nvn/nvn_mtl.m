@@ -3482,16 +3482,22 @@ static NSMutableArray *g_up_keep;
 typedef struct { uintptr_t lo, hi, pool; uint64_t bid; int tracked; } rel_ent;
 static rel_ent *g_rel; static int g_nrel, g_caprel; static uint64_t g_rel_bid; static pthread_mutex_t g_rel_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_rel_pushed, g_rel_done, g_rel_bytes, g_rel_wired, g_rel_gone, g_rel_tr_bytes, g_rel_na_bytes;
-static int rel_mode(void) { static int m = -2; if (m == -2) { const char *e = getenv("DM_TEX_RELEASE"); m = !e ? 0 : !strcmp(e, "probe") ? -1 : atoi(e); if (m) MLOG("guest copy release of uploaded textures: %s", m < 0 ? "probe (logs only)" : m == 1 ? "CPU_NO_ACCESS pools" : "CPU_NO_ACCESS and CPU-visible pools"); } return m; }
+static int rel_mode(void) { static int m = -2; if (m == -2) { const char *e = getenv("DM_TEX_RELEASE"); m = !e ? 0 : !strcmp(e, "probe") ? -1 : atoi(e); if (m) MLOG("guest copy release of uploaded textures: %s", m < 0 ? "probe (logs only)" : m == 1 ? "CPU_NO_ACCESS pools" : m == 3 ? "CPU_NO_ACCESS pools, and in CPU-visible pools block-compressed textures the CPU does not write (DM_TEX_RELEASE=3)" : "CPU_NO_ACCESS and CPU-visible pools"); } return m; }
 static int rel_method(void) { static int m = -1; if (m < 0) { const char *e = getenv("DM_TEX_RELEASE_METHOD"); m = e && !strcmp(e, "free"); } return m; }
 // g_reldon: storage address → the last tracked texture whose guest copy was queued for release there (serial and description), under g_rel_mu. Ocarina of Time registers new texture objects
 // over the storage of ones it made at boot (Link's hat embroidery masks: BC4 512x512, ser 7629 at boot, ser 12519 at gameplay entry), without writing the storage again; see rel_donor
 typedef struct { uint64_t ser, size; uint32_t fmt, w, h, dep, lv, tgt; } rel_don;
 static nvn_hmap g_reldon = {.klen = 8};
+static int tex_cpu_written(uint64_t serial);   // below (the CPU-written set)
 static void rel_push(const tex_t *t, int stamped) {   // submit thread, at the upload; t->pool is the game's object (caller checked its magic)
     int mode = rel_mode(); if (!mode || !t->mem || !t->pool || !t->L.size || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_VIRTUAL) || t->d.samples > 1) return;
     int noacc = (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) != 0;
     if (!noacc && (!stamped || mode == 1)) return;   // CPU-visible pool: a tracked upload (its pages are protected), only with DM_TEX_RELEASE>=2 (or probe)
+    // DM_TEX_RELEASE=3: in a CPU-visible pool only a block-compressed texture the CPU does not write (game code may read uncompressed texture data, such as
+    // Ocarina of Time's terrain height tiles; level 2 froze its field load there)
+    if (!noacc && mode == 3 && (!fmt_compressed(t->d.format) || tex_cpu_written(t->serial))) { static _Atomic uint64_t kept; uint64_t n = atomic_fetch_add(&kept, 1) + 1;
+        if (n == 1 || n % 2000 == 0) MLOG("guest copy release level 3: kept the copy of %llu texture(s) in CPU-visible pools (uncompressed or CPU-written; first ser=%llu %ux%u format %#x)", (unsigned long long)n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format);
+        return; }
     uintptr_t lo = (uintptr_t)t->mem, hi = lo + t->L.size, pg = (uintptr_t)getpagesize(); if (((lo + pg - 1) & ~(pg - 1)) >= (hi & ~(pg - 1))) return;
     pthread_mutex_lock(&g_rel_mu);
     if (g_nrel == g_caprel) { g_caprel = g_caprel ? g_caprel * 2 : 1024; g_rel = realloc_or_die(g_rel, g_caprel * sizeof *g_rel, "release list"); }
@@ -3560,12 +3566,16 @@ static id<MTLTexture> rel_donor(const tex_t *t, id<MTLTexture> mt) {
              (unsigned long long)(t->L.size >> 10), how, (unsigned long long)atomic_load(&g_reldon_used), (unsigned long long)atomic_load(&g_reldon_miss)); }
     return dt;
 }
+static int bm_has(uint64_t lo);   // below: the game took a buffer address in the pool at lo (it goes into the raw-memory pool table, which wires it)
 static void rel_run(uint64_t bid, int failed) {   // GPU completion of the upload batch (a Metal thread)
     int mode = rel_mode(), method = rel_method();
     pthread_mutex_lock(&g_rel_mu);
     int w = 0; for (int i = 0; i < g_nrel; i++) {
         rel_ent e = g_rel[i]; if (e.bid != bid) { g_rel[w++] = e; continue; }
         if (failed) continue;
+        if (mode == 3 && e.tracked && bm_has(e.pool)) { static _Atomic uint64_t left; uint64_t n = atomic_fetch_add(&left, 1) + 1;   // DM_TEX_RELEASE=3: a CPU-visible pool the pool table wires
+            if (n == 1 || n % 2000 == 0) MLOG("guest copy release level 3: left alone %llu texture(s) in CPU-visible pools with a buffer address (the pool table wires them)", (unsigned long long)n);
+            continue; }
         uintptr_t pg = (uintptr_t)getpagesize(), a = (e.lo + pg - 1) & ~(pg - 1), b = e.hi & ~(pg - 1);
         if (rel_wired(a, b)) { atomic_fetch_add(&g_rel_wired, 1); continue; }
         if (mode < 0) { atomic_fetch_add(&g_rel_bytes, b - a); continue; }   // probe: counted, not released
@@ -10581,7 +10591,11 @@ static uint64_t gmem_map_gpu(void) {
     free(rng);
     if (over) RED_ONCE(140, "raw global memory: %d more pool ranges than the %d entries the pool table may have; addresses in them are not reached (the first at %#llx, %llu KB in all)",
                        over, GMEM_MAP_MAX - 1, (unsigned long long)over_lo, (unsigned long long)(over_bytes >> 10));
+    static uint64_t tr_last_mb; static int tr_n; uint64_t tr_add = g_gmem_only_mb - tr_last_mb; tr_last_mb = g_gmem_only_mb;   // pool table trace
+    int tr_log = tr_n++ < 8 || tr_add >= 64; uint64_t tr_t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    if (tr_log) MLOG("raw global memory: pool table of %d ranges, %llu MB of pools newly made resident for it (%llu MB so far): committing the residency set", n - 1, (unsigned long long)tr_add, (unsigned long long)g_gmem_only_mb);
     res_add(b); res_commit();
+    if (tr_log) MLOG("raw global memory: pool table residency commit done in %.1f ms", (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - tr_t0) / 1e6);
     unsigned old = g_gmem_buf ? (unsigned)(g_gmem_buf.length / DMSH_GMEM_MAP_ENTRY) : 0;
     if (g_gmem_buf) defer_obj_release(g_gmem_buf);
     g_gmem_buf = b; g_gmem_gen = gen;
