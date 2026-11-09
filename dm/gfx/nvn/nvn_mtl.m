@@ -4599,10 +4599,22 @@ static int gpuw_add(uint64_t lo, uint64_t hi, int track) {   // 1 when a texture
     pthread_mutex_unlock(&g_gws_mu);
     return r;
 }
+// A span whose overlap with [lo, hi) holds no whole page of it, and which does not cover it, is a sliver of something beside it, and does not decide: textures are 512-byte aligned,
+// so a GPU-drawn one may end in the page a CPU-filled one begins in; a span outlives the texture it was recorded for, so the game may hand part of that storage to a new texture; and
+// a GPU write over part of a span leaves the parts outside, which can be smaller than a page (gws_set). gws_cpu_since cannot answer for a sliver (no whole page to ask the dirty
+// tracker about), and taking its silence as the GPU's made the texture behind it a GPU texture: Ocarina of Time's CPU-filled 260x260 height (R32F) and hole (RGBA8) maps came up as
+// zeros when the span of a 260x260 RG8 normal map (laid out at 214,528 bytes) reached 1,536 or 13,824 bytes into them, or a 2,560-byte remnant of an old span lay inside them, and
+// whole terrain tiles vanished or showed another tile's surface (GitHub issue #1566). A span that covers the whole texture keeps the GPU's: a texture smaller than a page inside storage
+// the GPU wrote, whose neighbours' CPU writes in the same page do not count for it either
+static int gws_sliver(const gws_span *s, uint64_t lo, uint64_t hi) {
+    if (s->lo <= lo && s->hi >= hi) return 0;
+    uint64_t a, e; whole_pages(MAX(lo, s->lo), MIN(hi, s->hi), &a, &e);
+    return e <= a;
+}
 static int gpuw_overlaps(uint64_t lo, uint64_t hi) {   // the GPU wrote some of [lo, hi) and the CPU has not rewritten it since: the storage is not the content
     int owned = 0;
     pthread_mutex_lock(&g_gws_mu);
-    for (uint32_t i = gws_find(lo); i < g_ngws && g_gws[i].lo < hi && !owned; i++) owned = !gws_cpu_since(&g_gws[i], lo, hi);
+    for (uint32_t i = gws_find(lo); i < g_ngws && g_gws[i].lo < hi && !owned; i++) owned = !gws_sliver(&g_gws[i], lo, hi) && !gws_cpu_since(&g_gws[i], lo, hi);
     pthread_mutex_unlock(&g_gws_mu);
     return owned;
 }
