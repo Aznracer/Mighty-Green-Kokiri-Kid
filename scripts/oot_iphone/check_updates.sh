@@ -40,14 +40,7 @@ if git rev-parse -q --verify refs/oot_watch/oot2-up >/dev/null; then
   echo; echo "=== wanted pull requests already in oot2?"
   has() { git grep -q "$2" refs/oot_watch/oot2-up -- dm && echo "  #$1 $3: yes" || echo "  #$1 $3: no"; }
   has 1473 tex_mtl_raw            "submit thread unretained (CPU; ported in v3)"
-  has 1644 pkg_hand_over          "long-session GPU page faults"
-  has 1708 MDX_MESH_GRID          "mesh draws split at 1024 workgroups (page faults)"
-  has 1721 g_treg_sparse_synced   "texture bindings after sparse mapping changes"
-  has 1730 GMEM_RUN_MAX           "contiguous memory-pool runs merged"
-  has 1731 DM_NVN_COPY_ABSORB     "texture upgrades, BC targets, retired descriptors"
-  has 1752 RawResolveRange        "raw loads resolve their pool once (mesh shaders faster)"
-  has 04419bc2 GenerateRawVectorLoad "upstream: vector raw loads, occlusion, dynamic resolution (GPU 16.3 -> 12.6 ms)"
-  has 1833 shader_raw_direct      "raw memory at Metal GPU addresses (Ocarina)"
+  has 04419bc2 GenerateRawVectorLoad "upstream vector raw loads: adjacent raw loads grouped (cliff mesh pass); oot2 has the occlusion part"
 fi
 
 echo; echo "=== seedds/nxnative pull requests"
