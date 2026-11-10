@@ -444,9 +444,9 @@ static NSString *sensors_line(void) {
     NSString *temps = [NSString stringWithFormat:@"🔋 %@ · chg %@ · PMU %@", deg(bat), deg(chg), deg(pmu)];
     NSString *power;
     if (isfinite(vin) && isfinite(iin) && iin > 0.02 && vin > 1) power = [NSString stringWithFormat:@"⚡ in %.1f W", vin * iin];
-    else if (isfinite(vw) && vw > 5) power = @"⚡ in (wireless)";
+    else if (isfinite(vw) && vw > 5) power = [NSString stringWithFormat:@"⚡ wireless %.1f V", vw];   // native_oot2.py: no readable wireless input current, so its voltage
     else power = @"⚡ no input";
-    if (isfinite(vb) && isfinite(ib) && ib > 0.02) power = [power stringByAppendingFormat:@" · batt +%.1f W", vb * ib];
+    if (isfinite(vb) && isfinite(ib) && (ib > 0.02 || ![power isEqualToString:@"⚡ no input"])) power = [power stringByAppendingFormat:@" · into battery %.1f W", vb * MAX(ib, 0)];   // plugged in: shown even at 0
     else if ([power isEqualToString:@"⚡ no input"]) power = @"⚡ on battery";   // iOS has no readable discharge sensor
     return [NSString stringWithFormat:@"%@\n%@", temps, power];
 }

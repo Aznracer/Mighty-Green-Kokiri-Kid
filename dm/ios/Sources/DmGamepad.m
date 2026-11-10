@@ -396,10 +396,10 @@ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPoint
         case B_X: x = R - 40 * g; y = Bt - 172 * g; rr = 23; break;
         case B_B: x = R - 40 * g; y = Bt - 238 * g; rr = 21; break;
         case B_ZR: x = R - 226 * g; y = Bt - 196 * g; rr = 25; break;   // the active item (bow, slingshot)
-        case B_UP: x = L + 118 * g; y = T + 96 * g; rr = 17; break;     // the D-pad, top left: up / down the context swaps (boots)
-        case B_DOWN: x = L + 118 * g; y = T + 164 * g; rr = 17; break;
-        case B_LEFT: x = L + 84 * g; y = T + 130 * g; rr = 17; break;    // the ocarina
-        case B_RIGHT: x = L + 152 * g; y = T + 130 * g; rr = 17; break;  // Navi
+        case B_UP: x = L + 120 * g; y = Bt - 270 * g; rr = 17; break;    // native_oot2.py: the D-pad above the left stick's ring (its top at Bt - 167), in line with it,
+        case B_DOWN: x = L + 120 * g; y = Bt - 202 * g; rr = 17; break;   // clear of the game's hearts and item icons at the top left; up / down the context swaps (boots)
+        case B_LEFT: x = L + 86 * g; y = Bt - 236 * g; rr = 17; break;    // the ocarina
+        case B_RIGHT: x = L + 154 * g; y = Bt - 236 * g; rr = 17; break;  // Navi
         case B_PLUS: x = L + 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;
         default: x = R - 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // −
     }
