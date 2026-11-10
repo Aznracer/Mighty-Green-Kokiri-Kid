@@ -1585,6 +1585,65 @@ def geometry_finish(key, w, j, c1):
     return 'ok', '', base
 
 
+
+import dmsh_abi as _bz_abi   # for blend_zero (from upstream dmsh_rewrite.py)
+# NVIDIA's float blender with "zero times anything is zero" on. The 3D engine has a method for it (SET_BLEND_FLOAT_OPTION, 0x670, bit ZERO_TIMES_ANYTHING_IS_ZERO in NVIDIA's published class
+# headers), and NVN's driver sets it in its start-up command list: the word 0x80010670 (an immediate write of 1) is in the sdk module of Ocarina of Time and of 12 of 14 other games looked at.
+# So a blend term whose weight is 0 is 0 whatever the colour, where IEEE (and Direct3D 11, which wants the NaN kept "including 0.0 blend weights") gives 0 x NaN = 0 x Inf = NaN: a pixel
+# shader may leave NaN in the colour of a pixel it adds nothing to and say so with alpha 0, and under SRC_ALPHA blending the target keeps its value. Apple's blender multiplies as IEEE does,
+# stores the NaN (0 x Inf too; only a factor of ZERO itself leaves its term out: dm/gfx/tests/t_blend_zero.m, on an M6), and every later pass that reads the target spreads it.
+# Ocarina of Time's half-resolution mist shader 5ad65c0eefd09c7f averages hit positions over a layer whose density is 0 there (a positive hit count, a weight sum of 0: 1/0 x 0; its FMULs
+# carry no .FMZ, so the translation is exact) and writes them with alpha 0 into an RGBA16F target blended SRC_ALPHA / ONE_MINUS_SRC_ALPHA. The mist composite carried the NaN into the scene
+# and bloom turned each into a white cloud.
+# The rule belongs to the blender, so it depends on the draw's blend state, which a shader does not know: the host gives it (nvn_mtl.m bz_bind) as a word at fragment buffer
+# DMSH_BLEND_BUFFER, DMSH_BLEND_ZERO_BITS bits per colour output: where the output's source colour weight is zero (dmsh_abi.h has the cases), a non-finite rgb is returned as 0, which is
+# what the zero weight makes of it. With blending off, on a target that is not floating point, or with a weight the alpha does not make zero, the output's bits are 0 and it is returned as
+# it is: NVIDIA stores that NaN or Inf too. A finite colour is never changed, nor the alpha.
+# Not covered, as a shader cannot see it: a NaN or Inf already in the target under a zero destination weight, and a non-finite weight on a colour of 0.
+# The guard goes into main0 before the build makes its other entry points, so each of them has it: they call main0's body (dmsh_side.shared_body: main0_u / main0_m, main0_d, main0_f and
+# the side library's) and take main0's parameters, the word's among them. It is written as a call, not as stores to out, which dmsh_entry.fs_uint reads to tell what a shader writes
+def _bz_entry(msl, name):   # upstream dmsh_side.entry, from our dmsh_side.entries
+    return next((e for e in dmsh_side.entries(msl) if e['name'] == name), None)
+
+
+def _bz_body(msl):   # upstream dmsh_side.body: main0's body already shared as dm_body_main0
+    return re.search(r'main0_out dm_body_main0\(', msl)
+
+
+BLEND_ZERO = '''struct dm_blend_state { uint zero; };   // see dmsh_rewrite.py blend_zero
+static inline __attribute__((always_inline)) float4 dm_bz(float4 c, uint m)
+{
+    m &= %du;
+    if (!((m == 1u && c.w == 0.0f) || (m == 2u && c.w == 1.0f))) return c;
+    return float4(select(c.xyz, float3(0.0f), (as_type<uint3>(c.xyz) & uint3(0x7f800000u)) == uint3(0x7f800000u)), c.w);   // NaN or Inf by its bits: fast math may assume there is none
+}
+static inline __attribute__((always_inline)) void dm_blend0(thread main0_out& dm_o, constant dm_blend_state& dm_s)
+{
+    uint m = dm_s.zero;
+    if (m == 0u) return;
+%s}
+'''
+BLEND_ZERO_PARAM = f'constant dm_blend_state& dm_blend [[buffer({_bz_abi.BLEND_BUFFER})]]'
+
+
+def blend_zero(msl):
+    """→ (msl with dm_blend0(out, dm_blend); before each `return out;` line of main0, the word as main0's last parameter and the helpers before main0, the number of returns guarded).
+    Unchanged (0) when main0 has no float4 colour output, is not of a shape dmsh_side.entry knows, has its body shared already, or returns other than on a line of its own"""
+    st = re.search(r'struct main0_out\s*\{(.*?)\};', msl, re.S)
+    cols = [(nm, int(c)) for ty, nm, c in re.findall(r'^\s*(\w+)\s+(\w+)\s*\[\[color\((\d+)\)\]\];', st.group(1), re.M) if ty == 'float4'] if st else []   # not index(1): a second blend source
+    if not cols or 'dm_blend0(' in msl or f'[[buffer({_bz_abi.BLEND_BUFFER})]]' in msl or _bz_body(msl): return msl, 0
+    try: e = _bz_entry(msl, 'main0')
+    except ValueError: return msl, 0
+    if not e or e['ret'] != 'main0_out': return msl, 0
+    body = msl[e['head']:e['end']]
+    n = len(re.findall(r'\breturn\b', body))
+    body, k = re.subn(r'^([ \t]*)return out;$', lambda m: f'{m.group(1)}dm_blend0(out, dm_blend);\n{m.group(1)}return out;', body, flags=re.M)
+    if not k or k != n: return msl, 0
+    bits = _bz_abi.BLEND_ZERO_BITS
+    helper = BLEND_ZERO % ((1 << bits) - 1, ''.join(f'    dm_o.{nm} = dm_bz(dm_o.{nm}, m >> {bits * c}u);\n' for nm, c in cols))
+    return msl[:e['start']] + helper + '\n' + msl[e['start']:e['head'] - 1] + (', ' if e['params'] else '') + BLEND_ZERO_PARAM + ')' + body + msl[e['end']:], k
+
+
 def finish(key, w, j, c1):
     name, k = loc[key]
     msl = os.path.join(w, key + '.metal'); lib = os.path.join(out, key + '_b.metallib')
@@ -1632,7 +1691,10 @@ def finish(key, w, j, c1):
         if len(raw) == 1 and raw[0][1]['cb_offset'] == 0 and not raw[0][1].get('flags', 0) & 1: src = dmsh_wide.raw_load_quads(src, raw[0][0])
     src = dmsh_wide.wide_loads(src)   # storage words the translator split, read whole again (see dmsh_wide.py)
     if not j.get('mesh_stage'): src = dmsh_wide.raw_fours(src)[0]   # raw reads against the kept entry in 64 bits, four adjacent words in one (see dmsh_wide.raw_fours)
-    src = border_emu(src); open(msl, 'w').write(src)   # border colours Metal lacks (see border_emu)
+    src = border_emu(src)   # border colours Metal lacks (see border_emu)
+    blend0 = 0
+    if j['stage'] == 'ps': src, blend0 = blend_zero(src)   # a zero blend weight makes 0 of a NaN colour, as NVIDIA's blender does (PR 0662f9d8, see blend_zero)
+    open(msl, 'w').write(src)
     first, spill = [], 0
     mesh = j.get('mesh_stage')
     if mesh:   # the kernel as the Metal object or mesh function (dmsh_meshstage.py)
@@ -1687,7 +1749,7 @@ def finish(key, w, j, c1):
             'entry': entry.group(2) if entry else 'main0', 'msl_entry_kind': entry.group(1) if entry else None, **({'entry_z': 'main0_z', 'entry_geometry_capture': 'main0_gs'} if j['stage'] == 'vs' else {}),
             **({'entry_discard': 'main0_discard'} if discard else {}),
             **({'entry_tf': 'main0_tf', 'tf_strides': [e['stride'] if e else 0 for e in j['tf']]} if j.get('tf') else {}),
-            **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}), **({'entries_lost': lost} if lost else {}),
+            **({'entry_layer': 'main0_l', 'entry_layer_z': 'main0_lz', 'layer_from': lay} if lay else {}), **({'entry_u': 'main0_u'} if fu else {}), **({'entry_m': 'main0_m', 'uint_mask_m': fmask} if fu and fmask else {}), **({'entry_d': 'main0_d'} if fd else {}), **({'blend_zero': True} if blend0 else {}), **({'entries_lost': lost} if lost else {}),
             **({'first_store': [{'reg': next(b['reg'] for b in binds if b['msl_name'] == n), 'word': w, 'value': v} for n, w, v in first]} if first else {}),
             **({'tg_spill': spill} if spill else {}),
             'threadgroup_size': j.get('local'), 'c1': c1.hex(), 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []), 'drv_reads': dr, 'drv_unfillable': unfillable(dr, mesh['kind'] if mesh else j['stage']),
