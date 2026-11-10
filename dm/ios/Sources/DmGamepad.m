@@ -274,6 +274,16 @@ static void glassSword(CALayer *g, CGFloat s) {
     CGPathRelease(p); [g addSublayer:l];
 }
 // The button's letter: a small round glass chip at the lower right (face keys, + and −), or a rounded rectangle for a shoulder (R, ZL), so it never reads as a face key
+// Words in a key instead of an icon, centred, in lines (native_oot3.py: B's "Put Away", as the N64's B button showed it)
+static void glassWords(CALayer *g, NSString *s, CGFloat size, CGFloat scale) {
+    CATextLayer *t = [CATextLayer layer]; UIFont *f = rounded(size); NSUInteger lines = [s componentsSeparatedByString:@"\n"].count;
+    t.string = s; t.font = (__bridge CFTypeRef)f; t.fontSize = size; t.alignmentMode = kCAAlignmentCenter; t.contentsScale = scale; t.wrapped = YES;
+    t.foregroundColor = [UIColor colorWithWhite:1 alpha:0.95].CGColor;
+    CGFloat r = g.bounds.size.width / 2, h = f.lineHeight * lines;
+    t.frame = CGRectMake(0, r - h / 2, 2 * r, h);
+    t.shadowColor = UIColor.blackColor.CGColor; t.shadowOpacity = 0.5; t.shadowRadius = 1.5; t.shadowOffset = CGSizeMake(0, 1);
+    [g addSublayer:t];
+}
 static void glassChip(CALayer *g, NSString *t, BOOL square, CGFloat scale) {
     CGFloat r = g.bounds.size.width / 2;
     if (square) {
@@ -396,10 +406,10 @@ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPoint
         case B_X: x = R - 40 * g; y = Bt - 172 * g; rr = 23; break;
         case B_B: x = R - 40 * g; y = Bt - 238 * g; rr = 21; break;
         case B_ZR: x = R - 226 * g; y = Bt - 196 * g; rr = 25; break;   // the active item (bow, slingshot)
-        case B_UP: x = L + 120 * g; y = Bt - 270 * g; rr = 17; break;    // native_oot2.py: the D-pad above the left stick's ring (its top at Bt - 167), in line with it,
-        case B_DOWN: x = L + 120 * g; y = Bt - 202 * g; rr = 17; break;   // clear of the game's hearts and item icons at the top left; up / down the context swaps (boots)
-        case B_LEFT: x = L + 86 * g; y = Bt - 236 * g; rr = 17; break;    // the ocarina
-        case B_RIGHT: x = L + 154 * g; y = Bt - 236 * g; rr = 17; break;  // Navi
+        case B_UP: x = L + 100 * g; y = Bt - 340 * g; rr = 17; break;   // native_oot3.py: higher, just below the game's item icons    // native_oot2.py: the D-pad above the left stick's ring (its top at Bt - 167), in line with it,
+        case B_DOWN: x = L + 100 * g; y = Bt - 272 * g; rr = 17; break;   // clear of the game's hearts and item icons at the top left; up / down the context swaps (boots)
+        case B_LEFT: x = L + 66 * g; y = Bt - 306 * g; rr = 17; break;    // the ocarina
+        case B_RIGHT: x = L + 134 * g; y = Bt - 306 * g; rr = 17; break;  // Navi
         case B_PLUS: x = L + 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;
         default: x = R - 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // −
     }
@@ -718,7 +728,7 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     static NSString *const chip[B_N] = { [B_A] = @"A", [B_B] = @"B", [B_X] = @"X", [B_Y] = @"Y", [B_R] = @"R", [B_ZL] = @"ZL", [B_ZR] = @"ZR", [B_PLUS] = @"+", [B_MINUS] = @"\u2212" };
     for (int i = 0; i < (int)(sizeof k_nat / sizeof *k_nat); i++) { int b = k_nat[i]; CGPoint c; CGFloat r; [self nat:b centre:&c radius:&r];
         CAShapeLayer *base = nil; CALayer *d = glassDisc(r, &base); d.position = c;
-        if (b == B_Y) glassSword(d, 24 * g); else glassSymbol(d, sym[b], (b == B_A ? 17 : b == B_PLUS || b == B_MINUS || b >= B_LEFT ? 11 : b == B_X ? 14 : b == B_B ? 12 : 15) * g, scale);
+        if (b == B_Y) glassSword(d, 24 * g); else if (b == B_B) glassWords(d, @"Put\nAway", 9.5 * g, scale); else glassSymbol(d, sym[b], (b == B_A ? 17 : b == B_PLUS || b == B_MINUS || b >= B_LEFT ? 11 : b == B_X ? 14 : b == B_B ? 12 : 15) * g, scale);
         if (b < B_LEFT) glassChip(d, chip[b], b == B_R || b == B_ZL || b == B_ZR, scale);   // the D-pad keys carry their icon alone
         [_nat addSublayer:d]; _nk[b] = d; _nbase[b] = base;
     }

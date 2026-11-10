@@ -34,6 +34,8 @@ static void front_ios_audio_watch(void);
 static UILabel *front_ios_fps_label(void);
 // DM_FPS_WIDE (on unless =0): the counter is one line across the top of the screen (fps_wide.py)
 // DM_FPS_POS=top: the one-line counter at the top left of the gear; otherwise below the picture, clear of the touch controls (hud3.py)
+int dm_pad_layout(void);   // DmGamepad.m: 0 2D, 1 3D, 2 Tap, 3 Native
+static int fps_bottom(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FPS_POS"); v = e && !strcmp(e, "bottom"); } return v; }   // native_oot3.py
 static int fps_top(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FPS_POS"); v = e && !strcmp(e, "top"); } return v; }
 static int fps_wide(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FPS_WIDE"); v = !e || atoi(e); } return v; }
 
@@ -215,6 +217,12 @@ static void launcher_done(void) { [g_root startGame]; }
             if (!fps_top()) {   // hud3.py: centred in the black bar below the picture
                 CGFloat below = CGRectGetMaxY(b) - CGRectGetMaxY(layout.game);
                 if (!layout.separated && below >= h + 4) { self.fps.frame = CGRectMake(floor(CGRectGetMidX(s) - w / 2), floor(CGRectGetMaxY(layout.game) + (below - h) / 2), w, h); self.fps.textAlignment = NSTextAlignmentCenter; }
+            }
+            if (dm_pad_layout() == 3 && !fps_bottom()) {   // native_oot3.py: Native's top bar has + at the left and … / − at the right, nothing in the middle: the counter goes there
+                CGFloat r2 = s.size.width - 280; CGSize f2 = [self.fps sizeThatFits:CGSizeMake(r2 - 12, 60)];
+                CGFloat w2 = MIN(MAX(ceil(f2.width) + 12, 64), r2), h2 = ceil(f2.height) + 4;
+                CGFloat y2 = !layout.separated && above >= h2 + 4 ? CGRectGetMinY(b) + floor((above - h2) / 2) : CGRectGetMinY(s) + 2;
+                self.fps.frame = CGRectMake(floor(CGRectGetMidX(s) - w2 / 2), floor(y2), w2, h2); self.fps.textAlignment = NSTextAlignmentCenter;
             }
         } else {
             CGFloat x = floor(CGRectGetMinX(s) + 130 * u), room = CGRectGetMidX(s) - 77 * u - 8 - x;
@@ -488,6 +496,7 @@ static UILabel *front_ios_fps_label(void) {
             text = p.count == 4 ? [NSString stringWithFormat:@"%@  │  %@\n%@  │  %@", p[0], p[1], p[2], p[3]] : [p componentsJoinedByString:@"  │  "];
         }
         if (![text isEqualToString:l.text]) { BOOL grew = text.length != l.text.length; l.text = text; if (grew) [l.superview setNeedsLayout]; }
+        { static int lastpl = -2; int pl = dm_pad_layout(); if (pl != lastpl) { lastpl = pl; [l.superview setNeedsLayout]; } }   // native_oot3.py: the layout switched in the menu moves the counter
     };
     sensors_start();
     update();
