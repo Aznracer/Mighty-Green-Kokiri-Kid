@@ -1744,6 +1744,7 @@ __attribute__((weak)) double dm_brightness_now(void) { return -1; }
 __attribute__((weak)) void dm_perf_present(double iv_ms) { (void)iv_ms; }   // Default (unit tests); strong definition in the host's diag.c: always-on performance record perf.txt
 uint64_t dm_nvn_sub_cpu_ns(void) { return atomic_load(&g_cum_sub_cpu_ns); }   // Cumulative CPU nanoseconds of submit (excluding present)
 __attribute__((weak)) int dm_thermal_now(void) { return -1; }   // Default (Mac); overridden by iOS front_ios.m   // default (Mac); the strong definition in the iOS front end front_ios.m overrides it
+__attribute__((weak)) int dm_thermal_cap_now(void) { return dm_thermal_now(); }   // thermal_pmu.py: the state the thermal cap acts on; front_ios.m adds the PMU die temperature (DM_THERMAL_PMU)
 __attribute__((weak)) int dm_low_power_now(void) { return 0; }   // Low Power Mode (iOS front_ios.m); off on the Mac
 // Per-frame ring for the long-frame log (GPU time only arrives 8 frames late, so store first and judge later)
 #define LFN 16
@@ -1968,7 +1969,7 @@ static int thermal_capped(void) {
         uint64_t now = now_ns();
         if (now - last >= 1000000000ull) {   // the thermal state is read once a second
             last = now;
-            int th = dm_thermal_now();
+            int th = dm_thermal_cap_now();   // thermal_pmu.py
             if (th >= 2) { calm_since = 0; if (!capped) { capped = 1; LOG("[nvn] thermal state %d: the frame step holds 30 fps until the device is fair again for %llu s (DM_THERMAL_CAP=0 turns this off)", th, THERMAL_CALM_NS / 1000000000ull); } }
             else if (capped) { if (!calm_since) calm_since = now; else if (now - calm_since >= THERMAL_CALM_NS) { capped = 0; LOG("[nvn] thermal state %d for %llu s: back to the frame rate cap", th, THERMAL_CALM_NS / 1000000000ull); } }
         }

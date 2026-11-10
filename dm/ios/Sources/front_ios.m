@@ -328,6 +328,23 @@ bool dm_setting_live(const char *env, const char *value) {
 // Thermal state and screen brightness for the power and present rows every 300 frames (hle_nvn.c; its weak defaults return -1 on the Mac). thermalState: 0 nominal, 1 fair, 2 serious, 3 critical.
 // Brightness is read on the main thread at start and on each change; every change of the thermal state and of Low Power Mode (which lowers the CPU clock) is logged with the time since launch
 static _Atomic double g_brightness = -1;
+static _Atomic double g_pmu_c = -1;   // thermal_pmu.py: the hottest PMU die's last reading (sensors_line, every 5 s), -1 until read
+int dm_thermal_now(void);
+// thermal_pmu.py: the state the host's thermal cap acts on. DM_THERMAL_PMU=<degrees>: "serious" (2) from the moment the hottest PMU die reaches it until it is back at
+// DM_THERMAL_PMU_COOL (default 15 degrees lower); iOS's own state when that is higher. The counter keeps showing iOS's state
+int dm_thermal_cap_now(void) {
+    int th = dm_thermal_now();
+    static int hot = -1, cool; static _Atomic int pmu_hot;
+    if (hot < 0) { const char *e = getenv("DM_THERMAL_PMU"), *c = getenv("DM_THERMAL_PMU_COOL"); int h = e ? atoi(e) : 0; cool = c ? atoi(c) : h - 15;
+        if (h > 0) LOG("front end: the thermal cap also starts at a PMU die of %d° and its PMU part ends at %d° (DM_THERMAL_PMU)", h, cool); hot = h; }
+    if (hot > 0) {
+        double p = g_pmu_c;
+        if (p > 0 && p >= hot && !pmu_hot) { pmu_hot = 1; LOG("front end: PMU %.1f° reached %d°: thermal cap on (%.0f s after launch)", p, hot, (now_ns() - g_t0_ns) / 1e9); }
+        else if (p > 0 && p <= cool && pmu_hot) { pmu_hot = 0; LOG("front end: PMU %.1f° back at %d°: the thermal cap ends after its calm time (%.0f s after launch)", p, cool, (now_ns() - g_t0_ns) / 1e9); }
+        if (pmu_hot && th < 2) th = 2;
+    }
+    return th;
+}
 int dm_thermal_now(void) { return (int)NSProcessInfo.processInfo.thermalState; }
 int dm_low_power_now(void) { return NSProcessInfo.processInfo.lowPowerModeEnabled; }   // the frame step does not probe in it (hle_nvn.c fstep_cpu_slowed)
 double dm_brightness_now(void) { return g_brightness; }
@@ -447,6 +464,7 @@ static NSString *sensors_line(void) {
         if (strncmp(g_sn[i].name, "PMU tdie", 8)) continue;
         double v = sn_value(g_sn[i].key, 1); if (isfinite(v) && (!isfinite(pmu) || v > pmu)) pmu = v;
     }
+    if (isfinite(pmu)) g_pmu_c = pmu;   // thermal_pmu.py
     double vin = sn_value("VQ0u", 1), iin = sn_value("IQ0u", 4), vb = sn_value("VQ0l", 1), ib = sn_value("IQ0B", 4), vw = sn_value("VQ1u", 1);
     NSString *(^deg)(double) = ^NSString *(double v) { return isfinite(v) ? [NSString stringWithFormat:@"%.1f°", v] : @"--"; };
     NSString *temps = [NSString stringWithFormat:@"🔋 %@ · chg %@ · PMU %@", deg(bat), deg(chg), deg(pmu)];
