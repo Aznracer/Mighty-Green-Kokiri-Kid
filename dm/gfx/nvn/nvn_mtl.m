@@ -1182,9 +1182,12 @@ static uint64_t *g_rc_pend; static uint32_t g_rc_npend, g_rc_pcap;   // timestam
 // draws, 42% of them false on its Kokiri Forest route, which the host drew all the same). Other counter kinds only get a placeholder from the host and keep drawing for good
 // (sticky). The table is shared with the completion thread (rc_landed), under g_rc_lk; the result is written before the count is lowered, so a read after seeing 0 sees it.
 // DM_NVN_RC_LANDED=0: every condition on such an address keeps drawing, as before
-typedef struct { uint64_t addr; uint32_t pending; uint8_t sticky; } rc_occ_ent;
+typedef struct { uint64_t addr; uint32_t pending; uint8_t sticky, landed; } rc_occ_ent;   // landed: a result was written here at least once (rc_stale.py)
 static rc_occ_ent *g_rc_occ; static uint32_t g_rc_ocap, g_rc_on; static os_unfair_lock g_rc_lk = OS_UNFAIR_LOCK_INIT;
 static uint64_t g_rc_stat[3];   // conditions evaluated since the last report: drawn, not drawn, drawn as unknown (rc_report_line)
+static uint64_t g_rc_stale_n;   // reads that used a query's previous result while its newest was pending (rc_stale.py)
+// rc_stale.py: DM_NVN_RC_STALE=0 draws every condition whose newest samples-passed result is pending, as before; by default one whose address has landed a result reads that one
+static int rc_stale_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RC_STALE"); v = !(e && !strcmp(e, "0")); MLOG("[nvn] occlusion conditions: %s (DM_NVN_RC_STALE)", v ? "a pending result reads the query's previous one" : "a pending result draws"); } return v; }
 static int rc_landed_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RC_LANDED"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_RC_LANDED=0: conditions on samples-passed reports always draw"); } return v; }
 static rc_occ_ent *rc_occ_find(uint64_t a) {   // g_rc_lk held
     if (!g_rc_ocap) return NULL;
@@ -1205,19 +1208,21 @@ static void rc_note(uint64_t a, int kind) {   // kind 1: a timestamp report; 2: 
     g_rc_pend[g_rc_npend++] = a;
 }
 static void rc_landed(uint64_t a) {   // post_run: a samples-passed result was written to a
-    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); if (e && e->pending) e->pending--; os_unfair_lock_unlock(&g_rc_lk);
+    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); if (e && e->pending) e->pending--; if (e) e->landed = 1; os_unfair_lock_unlock(&g_rc_lk);
 }
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at encode time
-    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); int unknown = e && (e->sticky || e->pending); os_unfair_lock_unlock(&g_rc_lk);
+    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); int stale = e && !e->sticky && e->pending && e->landed && rc_stale_on();
+    int unknown = e && (e->sticky || e->pending) && !stale; os_unfair_lock_unlock(&g_rc_lk);
     if (unknown) return 0;
+    if (stale) { g_rc_stale_n++; *v = *(const volatile uint64_t *)a; return 1; }   // rc_stale.py: the last result that landed here
     for (uint32_t i = g_rc_npend; i-- > 0;) if (g_rc_pend[i] == a) { *v = 0; return 1; }
     *v = *(const volatile uint64_t *)a; return 1;
 }
 static void rc_report_line(uint64_t frame) {
     uint64_t n = g_rc_stat[0] + g_rc_stat[1] + g_rc_stat[2]; if (!n) return;
-    MLOG("[nvn] conditional rendering up to frame %llu: %llu conditions, %llu drawn, %llu not drawn, %llu drawn with their result not landed yet", (unsigned long long)frame, (unsigned long long)n,
-         (unsigned long long)g_rc_stat[0], (unsigned long long)g_rc_stat[1], (unsigned long long)g_rc_stat[2]);
-    g_rc_stat[0] = g_rc_stat[1] = g_rc_stat[2] = 0;
+    MLOG("[nvn] conditional rendering up to frame %llu: %llu conditions, %llu drawn, %llu not drawn, %llu drawn with their result not landed yet; %llu reads used the previous result", (unsigned long long)frame, (unsigned long long)n,
+         (unsigned long long)g_rc_stat[0], (unsigned long long)g_rc_stat[1], (unsigned long long)g_rc_stat[2], (unsigned long long)g_rc_stale_n);
+    g_rc_stat[0] = g_rc_stat[1] = g_rc_stat[2] = 0; g_rc_stale_n = 0;
 }
 // ---------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------
 // NVN semantics: samples passed is a cumulative counter on the queue - ResetCounter zeroes it, every draw afterwards adds to it, and ReportCounter writes out the cumulative value at that moment (+ timestamp) when the GPU completes.
