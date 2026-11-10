@@ -401,15 +401,15 @@ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPoint
     switch (b) {
         case B_Y: x = R - 92 * g; y = Bt - 88 * g; rr = 44; break;   // native_oot.py: Ocarina of Time's sword is Y, so Y takes the big key and B (put away) the small one
         case B_A: x = R - 180 * g; y = Bt - 74 * g; rr = 30; break;
-        case B_R: x = R - 164 * g; y = Bt - 154 * g; rr = 25; break;
+        case B_R: x = R - 226 * g; y = Bt - 196 * g; rr = 25; break;   // native_oot4.py: R (quick select) and ZR (the active item) swapped
         case B_ZL: x = R - 106 * g; y = Bt - 188 * g; rr = 25; break;
         case B_X: x = R - 40 * g; y = Bt - 172 * g; rr = 23; break;
         case B_B: x = R - 40 * g; y = Bt - 238 * g; rr = 21; break;
-        case B_ZR: x = R - 226 * g; y = Bt - 196 * g; rr = 25; break;   // the active item (bow, slingshot)
-        case B_UP: x = L + 100 * g; y = Bt - 340 * g; rr = 17; break;   // native_oot3.py: higher, just below the game's item icons    // native_oot2.py: the D-pad above the left stick's ring (its top at Bt - 167), in line with it,
-        case B_DOWN: x = L + 100 * g; y = Bt - 272 * g; rr = 17; break;   // clear of the game's hearts and item icons at the top left; up / down the context swaps (boots)
-        case B_LEFT: x = L + 66 * g; y = Bt - 306 * g; rr = 17; break;    // the ocarina
-        case B_RIGHT: x = L + 134 * g; y = Bt - 306 * g; rr = 17; break;  // Navi
+        case B_ZR: x = R - 164 * g; y = Bt - 154 * g; rr = 25; break;   // the active item (bow, slingshot)
+        case B_UP: x = L + 120 * g; y = Bt - 340 * g; rr = 17; break;   // native_oot4.py: the D-pad's middle in line with the stick's ring   // native_oot3.py: higher, just below the game's item icons    // native_oot2.py: the D-pad above the left stick's ring (its top at Bt - 167), in line with it,
+        case B_DOWN: x = L + 120 * g; y = Bt - 272 * g; rr = 17; break;   // clear of the game's hearts and item icons at the top left; up / down the context swaps (boots)
+        case B_LEFT: x = L + 86 * g; y = Bt - 306 * g; rr = 17; break;    // the ocarina
+        case B_RIGHT: x = L + 154 * g; y = Bt - 306 * g; rr = 17; break;  // Navi
         case B_PLUS: x = L + 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;
         default: x = R - 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // −
     }
