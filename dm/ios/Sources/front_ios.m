@@ -471,13 +471,14 @@ static void batt_open(void) {
 }
 static int batt_num(CFStringRef k, long long *out) {
     CFTypeRef v = g_io_prop(g_bat_svc, k, kCFAllocatorDefault, 0); if (!v) return 0;
-    int ok = CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberLongLongType, out); CFRelease(v);
+    int ok = CFGetTypeID(v) == CFNumberGetTypeID(); if (ok) { *out = 0; (void)CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, out); } CFRelease(v);   // counter_power2.py: a lossy conversion still gives the bits
     if (ok && (*out > INT32_MAX || *out < INT32_MIN)) *out = (int32_t)*out;   // a negative current published as an unsigned 64-bit number
     return ok;
 }
 static void batt_sample(void) {   // once a second: mV × mA
     batt_open(); if (!g_bat_svc) return;
     long long mv, ma; if (!batt_num(CFSTR("Voltage"), &mv) || !batt_num(CFSTR("InstantAmperage"), &ma) || mv <= 0) return;
+    static int shown; if (!shown++) LOG("front end: battery: Voltage %lld mV, InstantAmperage %lld mA (%.2f W; negative = draining)", mv, ma, (double)mv * (double)ma / 1e6);   // counter_power2.py
     g_bat_w_sum += (double)mv * (double)ma / 1e6; g_bat_w_n++;
 }
 static NSString *sensors_line(void) {
