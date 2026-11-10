@@ -3,6 +3,7 @@
 // dm/env.txt; main.m lists them in DM_ENV_FILE_KEYS) is shown but kept. All settings share one screen, grouped by section (rows: LauncherRow.swift). Choices that differ from the game's default are kept
 // in UserDefaults; Reset to tested defaults shows the defaults, and Play then forgets them. DM_LAUNCHER=0 in Documents/env.txt starts the game at once with the saved choices; DM_SAVED_CHOICES=0 ignores them (and keeps them)
 import SwiftUI
+import GameController
 import UIKit
 import UniformTypeIdentifiers
 import os
@@ -110,7 +111,7 @@ private struct LauncherView: View {
                         .font(.title.weight(.bold)).multilineTextAlignment(.center)
                     Text("Version \((info("CFBundleShortVersionString") as? String) ?? "")")
                         .font(.callout).foregroundStyle(.secondary)
-                    playButton
+                    playButton.background(PadPlayKey(play: play))   // a controller's ✕ / A presses Play too (PadPlayKey)
                 }
                 .padding(16)
                 .frame(width: geometry.size.width / 3, height: geometry.size.height)
@@ -189,4 +190,54 @@ public func dmShowLauncher(_ viewController: UnsafeMutableRawPointer, _ done: @c
     parent.present(h, animated: false)
     fputs("launcher: \(file.settings.count) settings shown\n", stderr)
     return true
+}
+
+// A controller's south face button (✕ on a DualSense, A on an Xbox pad) presses Play while the launcher shows, once (Mighty Green Kokiri Kid).
+// It takes the button's own pressed handler, not the gamepad's value handler DmGamepad.m sets for the game, and lets go of it when Play is
+// pressed or the launcher goes away, so the button does nothing more here once the game starts. Controllers connected while the launcher shows count too.
+private struct PadPlayKey: View {
+    let play: () -> Void
+    var body: some View {
+        Color.clear.frame(width: 0, height: 0).accessibilityHidden(true)
+            .onAppear { PadPlayKeys.shared.arm(play) }
+            .onDisappear { PadPlayKeys.shared.disarm() }
+    }
+}
+
+@MainActor private final class PadPlayKeys {
+    static let shared = PadPlayKeys()
+    private var play: (() -> Void)?
+    private var observer: NSObjectProtocol?
+
+    func arm(_ p: @escaping () -> Void) {
+        play = p
+        hookAll()
+        if observer == nil {
+            observer = NotificationCenter.default.addObserver(forName: .GCControllerDidConnect, object: nil, queue: .main) { _ in
+                Task { @MainActor in PadPlayKeys.shared.hookAll() }
+            }
+        }
+    }
+
+    func disarm() {
+        play = nil
+        for c in GCController.controllers() { c.extendedGamepad?.buttonA.pressedChangedHandler = nil }
+        if let o = observer { NotificationCenter.default.removeObserver(o); observer = nil }
+    }
+
+    private func hookAll() {
+        guard play != nil else { return }
+        for c in GCController.controllers() {
+            c.extendedGamepad?.buttonA.pressedChangedHandler = { _, _, pressed in
+                guard pressed else { return }
+                Task { @MainActor in PadPlayKeys.shared.fire() }
+            }
+        }
+    }
+
+    private func fire() {
+        guard let p = play else { return }
+        disarm()
+        p()
+    }
 }
