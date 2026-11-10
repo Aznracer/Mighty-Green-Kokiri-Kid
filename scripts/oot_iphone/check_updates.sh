@@ -33,7 +33,7 @@ branch_news() {   # name, url, remote branch, local branch
 }
 
 branch_news oot2 https://git.eden-emu.dev/penis6/nxnative-penis6 oot2 oot2-up
-branch_news cheemu21 https://github.com/cheemu21/kid-with-sword-remake kid-with-sword-remake cheemu21-up
+branch_news cheemu21 https://github.com/cheemu21/kid-with-sword-remake x1 cheemu21-up
 
 # seedds pull requests this port wants, and whether oot2 has taken them in yet (they do not patch cleanly onto oot2)
 if git rev-parse -q --verify refs/oot_watch/oot2-up >/dev/null; then
