@@ -2110,6 +2110,12 @@ static int fstep_cpu_slowed(uint64_t presents) {
 // Whether late frames may raise the hold above the cap's vsyncs (profile fps_hold, DM_FPS_HOLD=on / off). Off for a game whose updates do not wait for the presents and step
 // by the cap whatever the hold (Age of Calamity): holding frames there only paces the screen, and an iPhone lowers the GPU clock to the longer hold, so frames got slower and
 // the hold never came back (battle GPU 10 → 41 ms at the same draws, 20 fps at thermal state 0); off, each frame is shown as soon as it is ready
+static int fstep_hold_max(void) {   // hold_max.py: DM_FPS_HOLD_MAX (1-3, default FSTEP_MAX): the longest hold late frames may step to
+    static int m = -1;
+    if (m < 0) { const char *e = getenv("DM_FPS_HOLD_MAX"); m = e ? atoi(e) : FSTEP_MAX; if (m < 1) m = 1; if (m > FSTEP_MAX) m = FSTEP_MAX;
+        if (e) LOG("[nvn] frame step: frames are held at most %d vsyncs (DM_FPS_HOLD_MAX)", m); }
+    return m;
+}
 static int fstep_hold(void) {
     static int h = -1;
     if (h < 0) {
@@ -2127,7 +2133,7 @@ static void fstep_tick(const win_t *o, int c) {
     double shown = prev ? (st - prev) / v : 0, gpu = 0; prev = st; int gpu_on = 0;
     for (uint64_t f = g_frame; f-- > 0 && g_frame - f <= 8;) { double g = mtl_gpu_ms(f); if (g >= 0) { gpu = g * 1e6 / v; gpu_on = 1; break; } }
     double cpu = shown - pw / v, cost = cpu > gpu ? cpu : gpu;
-    int kmin = fstep_hz() / c, kmax = fps_high() ? 2 : !fstep_hold() ? kmin : kmin >= 2 ? 2 : FSTEP_MAX, k0 = g_fs.k,   // at 120 fps a late frame must step down whatever fps_hold says: the game steps by the target
+    int kmin = fstep_hz() / c, kmax = fps_high() ? 2 : !fstep_hold() ? kmin : kmin >= 2 ? 2 : fstep_hold_max() > kmin ? fstep_hold_max() : kmin, k0 = g_fs.k,   // at 120 fps a late frame must step down whatever fps_hold says: the game steps by the target
          kmin0 = g_fs.kmin, probe0 = g_fs.probe;
     int fixed = dm_fps_state ? (int)__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED) : 0;
     uint64_t probes0 = g_fs.probes, failed0 = g_fs.failed, oneoffs0 = g_fs.oneoffs;
