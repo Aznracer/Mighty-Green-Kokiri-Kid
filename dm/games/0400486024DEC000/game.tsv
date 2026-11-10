@@ -65,4 +65,3 @@ pad_theme	forest
 # and no payback step (a late frame's lost time is let go instead of a step of 3 vsyncs shown for 2, a half-frame jump)
 present_snap	on
 link_latency30	2
-fps_payback	off
