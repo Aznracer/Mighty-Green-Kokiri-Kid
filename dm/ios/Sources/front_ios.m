@@ -477,7 +477,8 @@ static int batt_num(CFStringRef k, long long *out) {
 }
 static void batt_sample(void) {   // once a second: mV × mA
     batt_open(); if (!g_bat_svc) return;
-    long long mv, ma; if (!batt_num(CFSTR("Voltage"), &mv) || !batt_num(CFSTR("InstantAmperage"), &ma) || mv <= 0) return;
+    long long mv, ma; if (!batt_num(CFSTR("Voltage"), &mv) || !batt_num(CFSTR("InstantAmperage"), &ma) || mv <= 0) {   // counter_power3.py: not published to apps
+        LOG("front end: battery voltage and current are not published to this app (iOS filters the IOPMPowerSource entry): no draw on battery"); g_bat_svc = 0; return; }
     static int shown; if (!shown++) LOG("front end: battery: Voltage %lld mV, InstantAmperage %lld mA (%.2f W; negative = draining)", mv, ma, (double)mv * (double)ma / 1e6);   // counter_power2.py
     g_bat_w_sum += (double)mv * (double)ma / 1e6; g_bat_w_n++;
 }
