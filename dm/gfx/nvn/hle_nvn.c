@@ -1978,6 +1978,7 @@ static int thermal_capped(void) {
     pthread_mutex_unlock(&mu);
     return result;
 }
+int dm_thermal_capped(void) { return thermal_capped(); }   // counter_power.py: for the counter (iOS front end)
 // 120 fps (profile fps_max 120, DM_FPS_TARGET=120): an engine limiter the host writes (hle_fpslock.c) follows the frame step, counted here in ticks of 1/120 s: hold 1 is 120 fps, hold 2 is 60.
 // A game may step by its target whatever the frames really take (Fire Emblem Fortune's Weave: 60.0 / target a frame), so a target of 120 at 70 frames a second is a game at 58% speed, and
 // on a 60 Hz screen at half speed: late frames step the hold up (nvn_fstep.h), the target follows the hold, and the game's step stays what the screen shows. The cap is 60 on a screen

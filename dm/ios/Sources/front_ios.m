@@ -330,6 +330,7 @@ bool dm_setting_live(const char *env, const char *value) {
 static _Atomic double g_brightness = -1;
 static _Atomic double g_pmu_c = -1;   // thermal_pmu.py: the hottest PMU die's last reading (sensors_line, every 5 s), -1 until read
 int dm_thermal_now(void);
+int dm_thermal_capped(void);   // hle_nvn.c: the thermal cap holds 30 fps now (counter_power.py)
 // thermal_pmu.py: the state the host's thermal cap acts on. DM_THERMAL_PMU=<degrees>: "serious" (2) from the moment the hottest PMU die reaches it until it is back at
 // DM_THERMAL_PMU_COOL (default 15 degrees lower); iOS's own state when that is higher. The counter keeps showing iOS's state
 int dm_thermal_cap_now(void) {
@@ -455,6 +456,30 @@ static double sn_value(const char *key, int n) {
     return cnt ? sum / cnt : NAN;
 }
 static int dbl_cmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
+// counter_power.py: the battery's power from its IOPMPowerSource registry entry (IOKit is reached through dlsym, as ChargeSpeed does)
+static uint32_t g_bat_svc; static CFTypeRef (*g_io_prop)(uint32_t, CFStringRef, CFAllocatorRef, uint32_t);
+static double g_bat_w_sum; static int g_bat_w_n;   // watts (negative = draining) summed since the last full read, on the sensors queue
+static int g_pmu_hot_i = -1;   // the hottest PMU die's sensor at the last full read
+static void batt_open(void) {
+    static int tried; if (tried++) return;
+    void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    CFMutableDictionaryRef (*match)(const char *) = h ? (CFMutableDictionaryRef (*)(const char *))dlsym(h, "IOServiceMatching") : NULL;
+    uint32_t (*get)(mach_port_t, CFDictionaryRef) = h ? (uint32_t (*)(mach_port_t, CFDictionaryRef))dlsym(h, "IOServiceGetMatchingService") : NULL;
+    g_io_prop = h ? (CFTypeRef (*)(uint32_t, CFStringRef, CFAllocatorRef, uint32_t))dlsym(h, "IORegistryEntryCreateCFProperty") : NULL;
+    if (match && get && g_io_prop) { CFMutableDictionaryRef m = match("IOPMPowerSource"); if (m) g_bat_svc = get(0, m); }   // IOServiceGetMatchingService consumes m
+    LOG("front end: battery power %s", g_bat_svc ? "read from the IOPMPowerSource registry entry every second" : "not readable here");
+}
+static int batt_num(CFStringRef k, long long *out) {
+    CFTypeRef v = g_io_prop(g_bat_svc, k, kCFAllocatorDefault, 0); if (!v) return 0;
+    int ok = CFGetTypeID(v) == CFNumberGetTypeID() && CFNumberGetValue((CFNumberRef)v, kCFNumberLongLongType, out); CFRelease(v);
+    if (ok && (*out > INT32_MAX || *out < INT32_MIN)) *out = (int32_t)*out;   // a negative current published as an unsigned 64-bit number
+    return ok;
+}
+static void batt_sample(void) {   // once a second: mV × mA
+    batt_open(); if (!g_bat_svc) return;
+    long long mv, ma; if (!batt_num(CFSTR("Voltage"), &mv) || !batt_num(CFSTR("InstantAmperage"), &ma) || mv <= 0) return;
+    g_bat_w_sum += (double)mv * (double)ma / 1e6; g_bat_w_n++;
+}
 static NSString *sensors_line(void) {
     double g[4]; int ng = 0; static const char *const G[] = {"TG0B", "TG0C", "TG0H", "TG0V"};
     for (int i = 0; i < 4; i++) { double v = sn_value(G[i], 1); if (isfinite(v)) g[ng++] = v; }
@@ -462,7 +487,7 @@ static NSString *sensors_line(void) {
     double bat = ng ? (ng & 1 ? g[ng / 2] : (g[ng / 2 - 1] + g[ng / 2]) / 2) : NAN, chg = sn_value("TQ0j", 1), pmu = NAN;
     for (int i = 0; i < g_nsn; i++) {   // the hottest PMU die key
         if (strncmp(g_sn[i].name, "PMU tdie", 8)) continue;
-        double v = sn_value(g_sn[i].key, 1); if (isfinite(v) && (!isfinite(pmu) || v > pmu)) pmu = v;
+        double v = sn_value(g_sn[i].key, 1); if (isfinite(v) && (!isfinite(pmu) || v > pmu)) { pmu = v; g_pmu_hot_i = i; }
     }
     if (isfinite(pmu)) g_pmu_c = pmu;   // thermal_pmu.py
     double vin = sn_value("VQ0u", 1), iin = sn_value("IQ0u", 4), vb = sn_value("VQ0l", 1), ib = sn_value("IQ0B", 4), vw = sn_value("VQ1u", 1);
@@ -473,8 +498,15 @@ static NSString *sensors_line(void) {
     else if (isfinite(vw) && vw > 5) power = [NSString stringWithFormat:@"⚡ wireless %.1f V", vw];   // native_oot2.py: no readable wireless input current, so its voltage
     else power = @"⚡ no input";
     if (isfinite(vb) && isfinite(ib) && (ib > 0.02 || ![power isEqualToString:@"⚡ no input"])) power = [power stringByAppendingFormat:@" · into battery %.1f W", vb * MAX(ib, 0)];   // plugged in: shown even at 0
-    else if ([power isEqualToString:@"⚡ no input"]) power = @"⚡ on battery";   // iOS has no readable discharge sensor
+    double bw = g_bat_w_n ? g_bat_w_sum / g_bat_w_n : NAN; g_bat_w_sum = 0; g_bat_w_n = 0;   // counter_power.py
+    if ([power isEqualToString:@"⚡ no input"]) power = isfinite(bw) && bw < 0 ? [NSString stringWithFormat:@"⚡ on battery · draw %.1f W", -bw] : @"⚡ on battery";   // iOS has no readable discharge sensor
     return [NSString stringWithFormat:@"%@\n%@", temps, power];
+}
+static void pmu_fast(void) {   // counter_power.py: between full reads, the hottest PMU die alone, while within 8 degrees of DM_THERMAL_PMU
+    static int thr = -1; if (thr < 0) { const char *e = getenv("DM_THERMAL_PMU"); thr = e ? atoi(e) : 0; }
+    if (thr <= 0 || g_pmu_hot_i < 0) return;
+    double p = g_pmu_c; if (!(p >= thr - 8)) return;
+    double v = sn_value(g_sn[g_pmu_hot_i].key, 1); if (isfinite(v) && v > 0) g_pmu_c = v;
 }
 static void sensors_start(void) {
     const char *e = getenv("DM_SENSORS"); if (e && !atoi(e)) return;
@@ -483,8 +515,10 @@ static void sensors_start(void) {
     dispatch_async(q, ^{
         if (!sensors_init()) { dispatch_async(dispatch_get_main_queue(), ^{ g_sensor_line = @"🌡 sensors not readable here"; }); return; }
         timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
-        dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC, 500 * NSEC_PER_MSEC);   // hud2.py: every 5 s (each read is a call into the HID system)
+        dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC, 200 * NSEC_PER_MSEC);   // counter_power.py: a 1 s tick, the full read every 5th   // hud2.py: every 5 s (each read is a call into the HID system)
         dispatch_source_set_event_handler(timer, ^{
+            static unsigned tick; batt_sample();
+            if (tick++ % 5) { pmu_fast(); return; }
             NSString *line = sensors_line();
             static int logged; if (logged++ % 2 == 0) LOG("front end: sensors: %s", [line stringByReplacingOccurrencesOfString:@"\n" withString:@" | "].UTF8String);   // every 10 s
             dispatch_async(dispatch_get_main_queue(), ^{ g_sensor_line = line; });
@@ -507,7 +541,7 @@ static UILabel *front_ios_fps_label(void) {
         n0 = n; t0 = now;
         int th = dm_thermal_now();
         static int last_th = -1; if (th != last_th) { LOG("front end: thermal state %d (%s)", th, thermal[th >= 0 && th <= 3 ? th : 0].UTF8String); last_th = th; }
-        NSString *text = [NSString stringWithFormat:@"%@ fps · 🌡 %@\n%@", fps, thermal[th >= 0 && th <= 3 ? th : 0], battery_line(&bat, now)];
+        NSString *text = [NSString stringWithFormat:@"%@ fps · 🌡 %@%@\n%@", fps, thermal[th >= 0 && th <= 3 ? th : 0], dm_thermal_capped() ? @" · ❄ 30 cap" : @"", battery_line(&bat, now)];   // counter_power.py
         if (g_sensor_line) text = [text stringByAppendingFormat:@"\n%@", g_sensor_line];   // sensors_hud.py
         if (fps_wide()) {   // hud2.py: two lines, frame rate and battery, then temperatures and power
             NSArray<NSString *> *p = [text componentsSeparatedByString:@"\n"];
