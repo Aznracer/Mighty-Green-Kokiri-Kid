@@ -65,3 +65,6 @@ pad_theme	forest
 # and no payback step (a late frame's lost time is let go instead of a step of 3 vsyncs shown for 2, a half-frame jump)
 present_snap	on
 link_latency30	2
+# The game submits a frame's commands behind an event its CPU signals once the frame before has left the GPU, so the GPU starts each frame with nothing queued and waits for the
+# replay: with Metal encoding on its own thread a GPU-bound Hyrule Field scene went 55.3-55.8 -> 56.5-56.9 fps (Apple M4 Pro, three runs a side, interleaved)
+enc_thread	on
