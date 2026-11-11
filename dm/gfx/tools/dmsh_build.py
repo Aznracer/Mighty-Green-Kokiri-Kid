@@ -575,6 +575,13 @@ def write_refl(key, refl):
     for target, d in (('mac', out),) + ((('ios', IOSOUT),) if IOSOUT else ()):
         atomic_json(os.path.join(d, key + '_b.json'), MTL.with_compiler(target, refl))
 
+def bz_strip(msl):   # a readable-tile variant without the blend-zero guard at all, as before 0662f9d8 (a GPU hang entering Kakariko came with it); the main shaders keep it
+    out = re.sub(r'^[ \t]*dm_blend0\(out, dm_blend\);\n', '', msl, flags=re.M)
+    out = re.sub(r',\s*constant dm_blend_state& dm_blend \[\[buffer\(\d+\)\]\]', '', out)
+    out = re.sub(r'struct dm_blend_state \{ uint zero; \};[^\n]*\n.*?void dm_blend0\([^)]*\)\n\{\n.*?\n\}\n', '', out, count=1, flags=re.S)
+    return out if 'dm_blend' not in out and 'dm_bz' not in out else bz_prune(msl)
+
+
 def bz_prune(msl):   # a readable-tile variant (dmsh_fetch.variant) without the guard's lines for the outputs it took out of main0_out (it blends those itself)
     st = re.search(r'struct main0_out\s*\{(.*?)\};', msl, re.S)
     if not st or 'dm_bz(' not in msl: return msl
@@ -586,7 +593,7 @@ def fetch_finish(key, src, refl):
     if refl['stage'] != 'ps': return refl
     # Those with rewritable samples get variants as before; those without get an output-mapping-only variant, and only for keys in the list (bf_want.tsv, produced by the host planner)
     fv, fmeta = dmsh_fetch.variant(src, refl['bindings'], om_only_ok=key in BF_WANT)
-    if fv: fv = bz_prune(fv)   # the blend-zero guard's lines for outputs the variant took out of main0_out (fix after 0662f9d8)
+    if fv: fv = bz_strip(fv)   # the blend-zero guard's lines for outputs the variant took out of main0_out (fix after 0662f9d8)
     if not fv:
         for path in (os.path.join(out, key + '_bf.metallib'), os.path.join(out, key + '_bf.metal')) + ((os.path.join(IOSOUT, key + '_bf.metallib'),) if IOSOUT else ()):
             try: os.unlink(path)

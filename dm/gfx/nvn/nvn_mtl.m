@@ -16861,9 +16861,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     // outside the committed set when the display command buffer sampled it. Super Smash Bros. Ultimate presents its window texture in its first frames before drawing into it:
     // the display queue page-faulted (kIOGPUCommandBufferCallbackErrorPageFault) and macOS then ignored every later command buffer of the process, so the window stayed pink
     // (headless runs never present, and every game before drew into a window texture before presenting it). A commit with nothing new costs nothing
-    // X11 (cheemu21 c73064ee): not for the host's own present snapshots and generated frames (serials 2^61 + n, in their own residency set, committed when made):
-    // the commit takes g_res_mu, which the submitting thread holds while it commits a frame's work, and on the display link thread that wait was a hitch (59-138 ms)
-    if ((t->serial >> 61) != 1) res_commit();
+    res_commit();
     // DM_NVN_REGLUM=x0,y0,x1,y1:file (normalized coordinates): read back this region on every present and record "present sequence number, present time ns, region mean luminance, subsampled grayscale thumbnail (hex)" (diagnostic: verify that animation speed is independent of frame rate).
     // A separate command buffer is queued after this frame's rendering (the same queue executes in submit order); does not wait for the GPU and does not disturb frame pacing
     static int rl = -1; static float rr[4]; static FILE *rlf; static pthread_mutex_t rlmu = PTHREAD_MUTEX_INITIALIZER;
