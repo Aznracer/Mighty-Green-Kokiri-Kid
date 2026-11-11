@@ -1190,9 +1190,14 @@ static uint64_t *g_rc_pend; static uint32_t g_rc_npend, g_rc_pcap;   // timestam
 // draws, 42% of them false on its Kokiri Forest route, which the host drew all the same). Other counter kinds only get a placeholder from the host and keep drawing for good
 // (sticky). The table is shared with the completion thread (rc_landed), under g_rc_lk; the result is written before the count is lowered, so a read after seeing 0 sees it.
 // DM_NVN_RC_LANDED=0: every condition on such an address keeps drawing, as before
-typedef struct { uint64_t addr; uint32_t pending; uint8_t sticky; } rc_occ_ent;
+typedef struct { uint64_t addr; uint32_t pending; uint8_t sticky, landed; } rc_occ_ent;   // landed: a result has been written at least once (rc_landed)
 static rc_occ_ent *g_rc_occ; static uint32_t g_rc_ocap, g_rc_on; static os_unfair_lock g_rc_lk = OS_UNFAIR_LOCK_INIT;
-static uint64_t g_rc_stat[3];   // conditions evaluated since the last report: drawn, not drawn, drawn as unknown (rc_report_line)
+static uint64_t g_rc_stat[5];   // conditions evaluated since the last report: drawn, not drawn, drawn as unknown, and of the first two those decided by the previous result (DM_NVN_RC_STALE)
+// DM_NVN_RC_STALE=1 (launcher: Skip hidden objects, experimental, off by default): a condition whose samples-passed result has not landed is decided by the result that landed
+// before it at that address, the same query a frame earlier, instead of drawing. 94 % of Ocarina of Time's conditions were drawn unknown (log 80: 137,221 of 145,517), and of
+// those decided about half were hidden. The cost: an object that comes into view is drawn one frame late (Metal has no predication to decide it on the GPU in time)
+static int g_rc_stale = -1;   // rc_stale_on's answer (-1: not read yet; tests set it)
+static int rc_stale_on(void) { if (g_rc_stale < 0) { const char *e = getenv("DM_NVN_RC_STALE"); g_rc_stale = e && atoi(e) > 0; if (g_rc_stale) MLOG("DM_NVN_RC_STALE=1: conditions whose result has not landed take the result before it (objects coming into view may be drawn a frame late)"); } return g_rc_stale; }
 static int rc_landed_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RC_LANDED"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_RC_LANDED=0: conditions on samples-passed reports always draw"); } return v; }
 static rc_occ_ent *rc_occ_find(uint64_t a) {   // g_rc_lk held
     if (!g_rc_ocap) return NULL;
@@ -1213,19 +1218,20 @@ static void rc_note(uint64_t a, int kind) {   // kind 1: a timestamp report; 2: 
     g_rc_pend[g_rc_npend++] = a;
 }
 static void rc_landed(uint64_t a) {   // post_run: a samples-passed result was written to a
-    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); if (e && e->pending) e->pending--; os_unfair_lock_unlock(&g_rc_lk);
+    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); if (e) { if (e->pending) e->pending--; e->landed = 1; } os_unfair_lock_unlock(&g_rc_lk);
 }
-static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at encode time
-    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); int unknown = e && (e->sticky || e->pending); os_unfair_lock_unlock(&g_rc_lk);
-    if (unknown) return 0;
+static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at encode time; 2 = the result that landed before the pending one (DM_NVN_RC_STALE)
+    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); int sticky = e && e->sticky, pend = e && e->pending, landed = e && e->landed; os_unfair_lock_unlock(&g_rc_lk);
+    if (sticky) return 0;
+    if (pend) { if (!(landed && rc_stale_on())) return 0; *v = *(const volatile uint64_t *)a; return 2; }
     for (uint32_t i = g_rc_npend; i-- > 0;) if (g_rc_pend[i] == a) { *v = 0; return 1; }
     *v = *(const volatile uint64_t *)a; return 1;
 }
 static void rc_report_line(uint64_t frame) {
     uint64_t n = g_rc_stat[0] + g_rc_stat[1] + g_rc_stat[2]; if (!n) return;
-    MLOG("[nvn] conditional rendering up to frame %llu: %llu conditions, %llu drawn, %llu not drawn, %llu drawn with their result not landed yet", (unsigned long long)frame, (unsigned long long)n,
-         (unsigned long long)g_rc_stat[0], (unsigned long long)g_rc_stat[1], (unsigned long long)g_rc_stat[2]);
-    g_rc_stat[0] = g_rc_stat[1] = g_rc_stat[2] = 0;
+    MLOG("[nvn] conditional rendering up to frame %llu: %llu conditions, %llu drawn, %llu not drawn, %llu drawn with their result not landed yet; by the result before it (DM_NVN_RC_STALE) %llu drawn, %llu not drawn", (unsigned long long)frame, (unsigned long long)n,
+         (unsigned long long)g_rc_stat[0], (unsigned long long)g_rc_stat[1], (unsigned long long)g_rc_stat[2], (unsigned long long)g_rc_stat[3], (unsigned long long)g_rc_stat[4]);
+    memset(g_rc_stat, 0, sizeof g_rc_stat);
 }
 // ---------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------
 // NVN semantics: samples passed is a cumulative counter on the queue - ResetCounter zeroes it, every draw afterwards adds to it, and ReportCounter writes out the cumulative value at that moment (+ timestamp) when the GPU completes.
@@ -15801,8 +15807,9 @@ void mtl_exec(const uint8_t *p) {
                 break; }
             case OP_RENDER_COND: { const p_render_cond *rc = a;   // recorded only with the profile key render_cond (hle_nvn.c)
                 if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); }
-                else { uint64_t x = 0, y = 0; int known = rc_value(rc->addr, &x) & rc_value(rc->addr + 16, &y);
+                else { uint64_t x = 0, y = 0; int ka = rc_value(rc->addr, &x), kb = rc_value(rc->addr + 16, &y), known = ka && kb;
                     g_rc_skip = known && (rc->mode ? x == y : x != y); g_rc_stat[!known ? 2 : g_rc_skip]++;
+                    if (known && (ka == 2 || kb == 2)) g_rc_stat[3 + g_rc_skip]++;
                     PD("E %llu conditional render %s addr=%#llx values %llu / %llu%s%s", g_stat_pass, rc->mode ? "draw if not equal" : "draw if equal", (unsigned long long)rc->addr, (unsigned long long)x, (unsigned long long)y, known ? "" : " (unknown, drawn)", g_rc_skip ? " → not drawn" : ""); }
                 break; }
             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = NVN_SYNC_FENCE_GPU;   // the fence value this submission (segment) commits with
@@ -16775,7 +16782,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     // outside the committed set when the display command buffer sampled it. Super Smash Bros. Ultimate presents its window texture in its first frames before drawing into it:
     // the display queue page-faulted (kIOGPUCommandBufferCallbackErrorPageFault) and macOS then ignored every later command buffer of the process, so the window stayed pink
     // (headless runs never present, and every game before drew into a window texture before presenting it). A commit with nothing new costs nothing
-    res_commit();
+    // X11 (cheemu21 c73064ee): not for the host's own present snapshots and generated frames (serials 2^61 + n, in their own residency set, committed when made):
+    // the commit takes g_res_mu, which the submitting thread holds while it commits a frame's work, and on the display link thread that wait was a hitch (59-138 ms)
+    if ((t->serial >> 61) != 1) res_commit();
     // DM_NVN_REGLUM=x0,y0,x1,y1:file (normalized coordinates): read back this region on every present and record "present sequence number, present time ns, region mean luminance, subsampled grayscale thumbnail (hex)" (diagnostic: verify that animation speed is independent of frame rate).
     // A separate command buffer is queued after this frame's rendering (the same queue executes in submit order); does not wait for the GPU and does not disturb frame pacing
     static int rl = -1; static float rr[4]; static FILE *rlf; static pthread_mutex_t rlmu = PTHREAD_MUTEX_INITIALIZER;
