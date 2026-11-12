@@ -2047,6 +2047,7 @@ static void high_cap_tick(void) {
 }
 __attribute__((weak)) int mtl_fg_native(void) { return 0; }   // nvn_mtl.m (DM_FRAMEGEN_ADAPT): the interpolation is stopped, the game runs at its own rate up to 60
 __attribute__((weak)) void mtl_fg_native_done(double ms, double s) { (void)ms; (void)s; }
+__attribute__((weak)) void mtl_fg_native_off(double ms, double s) { (void)ms; (void)s; }
 static int fps_step_cap(void) {
     if (!dm_fps_state) return fps_high() ? atomic_load(&g_high_cap) : 0;
     uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float t; memcpy(&t, &b, sizeof t);
@@ -2267,17 +2268,18 @@ static void fstep_tick(const win_t *o, int c) {
 // Adaptive frame generation (DM_FRAMEGEN_ADAPT=1): while the game runs at its own rate (mtl_fg_native), back to 30 with generated frames once it keeps a mean frame of
 // DM_FRAMEGEN_ADAPT_MS (24 by default) for the resume hold, with no frame over 40 ms; a window that ends slower starts again
 static void fg_adapt_tick(void) {
-    static uint64_t prev, w0, n, since; static int thr = -1;
+    static uint64_t prev, w0, n, since, hitch; static int thr = -1;
     int need = mtl_fg_native(); uint64_t t = now_ns();
     if (!need) { prev = since = 0; return; }
-    if (thr < 0) { const char *e = getenv("DM_FRAMEGEN_ADAPT_MS"); thr = e && *e ? atoi(e) : 24; if (thr < 17) thr = 17; if (thr > 30) thr = 30;
+    if (thr < 0) { const char *e = getenv("DM_FRAMEGEN_ADAPT_MS"); thr = e && *e ? atoi(e) : 18; if (thr < 17) thr = 17; if (thr > 30) thr = 30;
         LOG("[nvn] frame generation stopped: the cap is 60 until frames average %d ms or less (DM_FRAMEGEN_ADAPT_MS)", thr); }
     if (!since) since = t;
-    if (!prev || t - prev > 40000000ull) { w0 = t; n = 0; } else n++;
+    if (!prev) { w0 = t; n = 0; hitch = 0; } else { n++; if (t - prev > 40000000ull) hitch++; }   // a frame over 40 ms: a hitch (one a second allowed)
     prev = t;
     if (n && t - w0 >= (uint64_t)need * 33333333ull) {
-        if ((t - w0) / n <= (uint64_t)thr * 1000000ull) { mtl_fg_native_done((t - w0) / 1e6 / n, (t - since) / 1e9); prev = since = 0; }
-        else { w0 = t; n = 0; }
+        uint64_t span = t - w0;
+        if (span / n <= (uint64_t)thr * 1000000ull && hitch * 1000000000ull <= span) { mtl_fg_native_done(span / 1e6 / n, (t - since) / 1e9); prev = since = 0; }
+        else { mtl_fg_native_off(span / 1e6 / n, (t - since) / 1e9); prev = since = 0; }   // too slow: the plain back-off at 30
     }
 }
 void dm_vi_layer_crop(int c[4]);   // hle_vi.c: x, y, w, h the game last cropped its layer to (all 0 = none)

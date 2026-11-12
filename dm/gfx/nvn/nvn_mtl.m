@@ -1192,6 +1192,7 @@ static uint64_t *g_rc_pend; static uint32_t g_rc_npend, g_rc_pcap;   // timestam
 // DM_NVN_RC_LANDED=0: every condition on such an address keeps drawing, as before
 typedef struct { uint64_t addr; uint32_t pending; uint8_t sticky, landed; } rc_occ_ent;   // landed: a result has been written at least once (rc_landed)
 static rc_occ_ent *g_rc_occ; static uint32_t g_rc_ocap, g_rc_on; static os_unfair_lock g_rc_lk = OS_UNFAIR_LOCK_INIT;
+static uint64_t g_rc_raised, g_rc_lowered, g_rc_land0, g_rc_nofind;   // rc_diag.py: pending raised / lowered, landed with nothing pending, landed for an address not in the table (g_rc_lk)
 static uint64_t g_rc_stat[5];   // conditions evaluated since the last report: drawn, not drawn, drawn as unknown, and of the first two those decided by the previous result (DM_NVN_RC_STALE)
 // DM_NVN_RC_STALE=1 (launcher: Skip hidden objects, experimental, off by default): a condition whose samples-passed result has not landed is decided by the result that landed
 // before it at that address, the same query a frame earlier, instead of drawing. 94 % of Ocarina of Time's conditions were drawn unknown (log 80: 137,221 of 145,517), and of
@@ -1212,13 +1213,13 @@ static rc_occ_ent *rc_occ_add(uint64_t a) {   // g_rc_lk held
     g_rc_occ[i].addr = a; g_rc_on++; return &g_rc_occ[i];
 }
 static void rc_note(uint64_t a, int kind) {   // kind 1: a timestamp report; 2: a samples-passed report, whose result lands later (rc_landed); 3: another counter (a placeholder)
-    if (kind >= 2) { os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_add(a); if (kind == 2 && rc_landed_on()) e->pending++; else e->sticky = 1; os_unfair_lock_unlock(&g_rc_lk); return; }   // rc_value asks this table first
+    if (kind >= 2) { os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_add(a); if (kind == 2 && rc_landed_on()) { e->pending++; g_rc_raised++; } else e->sticky = 1; os_unfair_lock_unlock(&g_rc_lk); return; }   // rc_value asks this table first
     for (uint32_t i = 0; i < g_rc_npend; i++) if (g_rc_pend[i] == a) return;
     if (g_rc_npend == g_rc_pcap) { uint32_t nc = g_rc_pcap ? g_rc_pcap * 2 : 256; uint64_t *t = realloc(g_rc_pend, (size_t)nc * 8); if (!t) MDIE("no memory for the timestamp report table"); g_rc_pend = t; g_rc_pcap = nc; }
     g_rc_pend[g_rc_npend++] = a;
 }
 static void rc_landed(uint64_t a) {   // post_run: a samples-passed result was written to a
-    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); if (e) { if (e->pending) e->pending--; e->landed = 1; } os_unfair_lock_unlock(&g_rc_lk);
+    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); if (e) { if (e->pending) { e->pending--; g_rc_lowered++; } else g_rc_land0++; e->landed = 1; } else g_rc_nofind++; os_unfair_lock_unlock(&g_rc_lk);
 }
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at encode time; 2 = the result that landed before the pending one (DM_NVN_RC_STALE)
     os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); int sticky = e && e->sticky, pend = e && e->pending, landed = e && e->landed; os_unfair_lock_unlock(&g_rc_lk);
@@ -1232,6 +1233,15 @@ static void rc_report_line(uint64_t frame) {
     MLOG("[nvn] conditional rendering up to frame %llu: %llu conditions, %llu drawn, %llu not drawn, %llu drawn with their result not landed yet; by the result before it (DM_NVN_RC_STALE) %llu drawn, %llu not drawn", (unsigned long long)frame, (unsigned long long)n,
          (unsigned long long)g_rc_stat[0], (unsigned long long)g_rc_stat[1], (unsigned long long)g_rc_stat[2], (unsigned long long)g_rc_stat[3], (unsigned long long)g_rc_stat[4]);
     memset(g_rc_stat, 0, sizeof g_rc_stat);
+    {   // rc_diag.py: are pending counts lost? (stuck launches: 95-97 % of conditions not landed, through a trip to the home screen and a save load)
+        uint32_t np = 0, n4 = 0, mx = 0; uint64_t r, l, z, nf;
+        os_unfair_lock_lock(&g_rc_lk);
+        for (uint32_t i = 0; i < g_rc_ocap; i++) { uint32_t p = g_rc_occ[i].addr ? g_rc_occ[i].pending : 0; if (p) { np++; if (p >= 4) n4++; if (p > mx) mx = p; } }
+        r = g_rc_raised; l = g_rc_lowered; z = g_rc_land0; nf = g_rc_nofind;
+        os_unfair_lock_unlock(&g_rc_lk);
+        MLOG("[nvn] query reports up to frame %llu: raised %llu, lowered %llu (outstanding %lld), landed with nothing pending %llu, not in the table %llu; addresses pending now %u (%u of them 4 or more, most %u) of %u",
+             (unsigned long long)frame, (unsigned long long)r, (unsigned long long)l, (long long)(r - l), (unsigned long long)z, (unsigned long long)nf, np, n4, mx, g_rc_on);
+    }
 }
 // ---------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------
 // NVN semantics: samples passed is a cumulative counter on the queue - ResetCounter zeroes it, every draw afterwards adds to it, and ReportCounter writes out the cumulative value at that moment (+ timestamp) when the GPU completes.
@@ -17066,15 +17076,24 @@ static int g_fg_steady, g_fg_starved, g_fg_need = 1; static uint64_t g_fg_paused
 static _Atomic int g_fg_shed; static int g_fg_resume = 30; static uint64_t g_fg_sheds, g_fg_shed_frames, g_fg_calm;
 // Adaptive frame generation (DM_FRAMEGEN_ADAPT=1): while the interpolation is stopped (g_fg_shed) the frame step cap goes to 60 (hle_nvn.c fps_step_cap), so the game
 // runs at the rate it manages instead of 30 with nothing between. hle_nvn.c times its presents and calls mtl_fg_native_done once it keeps up, which brings back 30 and the interpolation
+#define FG_GRACE 10
+static int g_fg_native_off;   // DM_FRAMEGEN_ADAPT: the game's own rate was too slow this time; 30 with the interpolation stopped until it runs again (cleared at each new stop)
+static int g_fg_grace;   // presents after a return from the game's own rate whose drops don't count (the switch from 60 to 30 starves a tick or two)
 static int fg_adapt(void) {
     static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAMEGEN_ADAPT"); v = e && *e && strcmp(e, "0");
         if (v) MLOG("frame generation: the game runs at its own rate up to 60 while the interpolation is stopped (DM_FRAMEGEN_ADAPT)"); }
     return v;
 }
-int mtl_fg_native(void) { return fg_adapt() && atomic_load(&g_fg_shed) ? g_fg_resume : 0; }   // the presents (at 30) the game must keep up for; 0 = not at its own rate
+int mtl_fg_native(void) { return fg_adapt() && atomic_load(&g_fg_shed) && !g_fg_native_off ? g_fg_resume : 0; }   // the presents (at 30) the game must keep up for; 0 = not at its own rate
+void mtl_fg_native_off(double ms, double s) {   // hle_nvn.c: the game's own rate is too slow to beat 30 + generated frames: back to 30, the interpolation still stopped until presents come in time (as without DM_FRAMEGEN_ADAPT)
+    pthread_mutex_lock(&g_pq_mu);
+    if (atomic_load(&g_fg_shed) && !g_fg_native_off) { g_fg_native_off = 1; g_fg_steady = 0;
+        MLOG("frame generation: the game's own rate is %.1f ms a frame after %.1f s, too slow: back to 30, the interpolation runs again after %d presents in a row in time", ms, s, g_fg_resume); }
+    pthread_mutex_unlock(&g_pq_mu);
+}
 void mtl_fg_native_done(double ms, double s) {
     pthread_mutex_lock(&g_pq_mu);
-    if (atomic_load(&g_fg_shed)) { atomic_store(&g_fg_shed, 0); g_fg_last_drop = 0; g_fg_steady = 0; g_fg_need = FG_STEADY;
+    if (atomic_load(&g_fg_shed)) { atomic_store(&g_fg_shed, 0); g_fg_last_drop = 0; g_fg_steady = 0; g_fg_need = FG_STEADY; g_fg_grace = FG_GRACE;
         MLOG("frame generation: back to 30 with generated frames after %.1f s at the game's own rate (%.1f ms a frame)", s, ms); }
     pthread_mutex_unlock(&g_pq_mu);
 }
@@ -17169,8 +17188,9 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
         // Behind: older presents were dropped for this one. One newer present waiting is not: with snapshots the game runs a frame ahead of the screen, and taking that
         // as behind paused frame generation for 1,060 of about 2,900 presents of a run that dropped next to no frames (log 80)
         int behind = ticket > first, late = g_fg_starved, drop = behind || late; g_fg_starved = 0;
+        if (g_fg_grace) { g_fg_grace--; drop = 0; }   // DM_FRAMEGEN_ADAPT: just back at 30 (FG_GRACE)
         if (drop) { int again = g_fg_last_drop && ticket - g_fg_last_drop <= (uint64_t)fg_again(); g_fg_need = again ? FG_STEADY : 1; g_fg_last_drop = ticket;
-            if (again && fg_on() && !atomic_load(&g_fg_shed)) { atomic_store(&g_fg_shed, 1); if (g_fg_sheds++) g_fg_resume = MIN(g_fg_resume * 2, fg_resume_max()); g_fg_calm = 0;
+            if (again && fg_on() && !atomic_load(&g_fg_shed)) { atomic_store(&g_fg_shed, 1); g_fg_native_off = 0; if (g_fg_sheds++) g_fg_resume = MIN(g_fg_resume * 2, fg_resume_max()); g_fg_calm = 0;
                 MLOG("frame generation: frames keep dropping, the interpolation stops until %d presents in a row come in time (#%llu)", g_fg_resume, (unsigned long long)g_fg_sheds); } }
         g_fg_steady = drop ? 0 : g_fg_steady + 1;
         if (atomic_load(&g_fg_shed) && g_fg_steady >= g_fg_resume) { atomic_store(&g_fg_shed, 0); MLOG("frame generation: %d presents in time, the interpolation runs again", g_fg_steady); }
