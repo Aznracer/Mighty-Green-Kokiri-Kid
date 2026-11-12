@@ -1190,7 +1190,7 @@ static uint64_t *g_rc_pend; static uint32_t g_rc_npend, g_rc_pcap;   // timestam
 // draws, 42% of them false on its Kokiri Forest route, which the host drew all the same). Other counter kinds only get a placeholder from the host and keep drawing for good
 // (sticky). The table is shared with the completion thread (rc_landed), under g_rc_lk; the result is written before the count is lowered, so a read after seeing 0 sees it.
 // DM_NVN_RC_LANDED=0: every condition on such an address keeps drawing, as before
-typedef struct { uint64_t addr; uint32_t pending; uint8_t sticky, landed; } rc_occ_ent;   // landed: a result has been written at least once (rc_landed)
+typedef struct { uint64_t addr; uint32_t pending; uint8_t sticky, landed; uint64_t fence, t; } rc_occ_ent;   // fence, t: the submission and time of its latest report (rc_diag2.py)   // landed: a result has been written at least once (rc_landed)
 static rc_occ_ent *g_rc_occ; static uint32_t g_rc_ocap, g_rc_on; static os_unfair_lock g_rc_lk = OS_UNFAIR_LOCK_INIT;
 static uint64_t g_rc_raised, g_rc_lowered, g_rc_land0, g_rc_nofind;   // rc_diag.py: pending raised / lowered, landed with nothing pending, landed for an address not in the table (g_rc_lk)
 static uint64_t g_rc_stat[5];   // conditions evaluated since the last report: drawn, not drawn, drawn as unknown, and of the first two those decided by the previous result (DM_NVN_RC_STALE)
@@ -1213,7 +1213,7 @@ static rc_occ_ent *rc_occ_add(uint64_t a) {   // g_rc_lk held
     g_rc_occ[i].addr = a; g_rc_on++; return &g_rc_occ[i];
 }
 static void rc_note(uint64_t a, int kind) {   // kind 1: a timestamp report; 2: a samples-passed report, whose result lands later (rc_landed); 3: another counter (a placeholder)
-    if (kind >= 2) { os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_add(a); if (kind == 2 && rc_landed_on()) { e->pending++; g_rc_raised++; } else e->sticky = 1; os_unfair_lock_unlock(&g_rc_lk); return; }   // rc_value asks this table first
+    if (kind >= 2) { os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_add(a); if (kind == 2 && rc_landed_on()) { e->pending++; g_rc_raised++; e->fence = atomic_load(&g_fence) + 1; e->t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); } else e->sticky = 1; os_unfair_lock_unlock(&g_rc_lk); return; }   // rc_value asks this table first
     for (uint32_t i = 0; i < g_rc_npend; i++) if (g_rc_pend[i] == a) return;
     if (g_rc_npend == g_rc_pcap) { uint32_t nc = g_rc_pcap ? g_rc_pcap * 2 : 256; uint64_t *t = realloc(g_rc_pend, (size_t)nc * 8); if (!t) MDIE("no memory for the timestamp report table"); g_rc_pend = t; g_rc_pcap = nc; }
     g_rc_pend[g_rc_npend++] = a;
@@ -1221,9 +1221,19 @@ static void rc_note(uint64_t a, int kind) {   // kind 1: a timestamp report; 2: 
 static void rc_landed(uint64_t a) {   // post_run: a samples-passed result was written to a
     os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); if (e) { if (e->pending) { e->pending--; g_rc_lowered++; } else g_rc_land0++; e->landed = 1; } else g_rc_nofind++; os_unfair_lock_unlock(&g_rc_lk);
 }
+// rc_diag2.py: what a late answer waits for. Encode thread only, like rc_value; read by rc_report_line
+static uint64_t g_rcl_n, g_rcl_same, g_rcl_fly, g_rcl_lag, g_rcl_back, g_rcl_age;
+static void rc_late_note(uint64_t rf, uint64_t rt) {
+    uint64_t cur = atomic_load(&g_fence) + 1, done = atomic_load(&g_done);
+    g_rcl_n++;
+    if (rf >= cur) g_rcl_same++; else { g_rcl_fly++; if (rf > done) g_rcl_lag += rf - done; }
+    if (cur - 1 > done) g_rcl_back += cur - 1 - done;
+    uint64_t t = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); if (rt && t > rt) g_rcl_age += t - rt;
+}
 static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at encode time; 2 = the result that landed before the pending one (DM_NVN_RC_STALE)
-    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); int sticky = e && e->sticky, pend = e && e->pending, landed = e && e->landed; os_unfair_lock_unlock(&g_rc_lk);
+    os_unfair_lock_lock(&g_rc_lk); rc_occ_ent *e = rc_occ_find(a); int sticky = e && e->sticky, pend = e && e->pending, landed = e && e->landed; uint64_t rf = e ? e->fence : 0, rt = e ? e->t : 0; os_unfair_lock_unlock(&g_rc_lk);
     if (sticky) return 0;
+    if (pend) rc_late_note(rf, rt);   // rc_diag2.py
     if (pend) { if (!(landed && rc_stale_on())) return 0; *v = *(const volatile uint64_t *)a; return 2; }
     for (uint32_t i = g_rc_npend; i-- > 0;) if (g_rc_pend[i] == a) { *v = 0; return 1; }
     *v = *(const volatile uint64_t *)a; return 1;
@@ -1241,6 +1251,12 @@ static void rc_report_line(uint64_t frame) {
         os_unfair_lock_unlock(&g_rc_lk);
         MLOG("[nvn] query reports up to frame %llu: raised %llu, lowered %llu (outstanding %lld), landed with nothing pending %llu, not in the table %llu; addresses pending now %u (%u of them 4 or more, most %u) of %u",
              (unsigned long long)frame, (unsigned long long)r, (unsigned long long)l, (long long)(r - l), (unsigned long long)z, (unsigned long long)nf, np, n4, mx, g_rc_on);
+        if (g_rcl_n) {
+            double k = (double)g_rcl_n;
+            MLOG("[nvn] late answers up to frame %llu: %llu late; %llu in the same submission, %llu sent and not done (GPU %.2f submissions short of them on average); GPU backlog %.2f submissions committed and not done; reports %.1f ms old on average",
+                 (unsigned long long)frame, (unsigned long long)g_rcl_n, (unsigned long long)g_rcl_same, (unsigned long long)g_rcl_fly, g_rcl_fly ? (double)g_rcl_lag / g_rcl_fly : 0.0, g_rcl_back / k, g_rcl_age / k / 1e6);
+            g_rcl_n = g_rcl_same = g_rcl_fly = g_rcl_lag = g_rcl_back = g_rcl_age = 0;
+        }
     }
 }
 // ---------- Occlusion queries (NVN_COUNTER_TYPE_SAMPLES_PASSED) ----------
