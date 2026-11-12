@@ -446,3 +446,5 @@ DM_XV_FILE	path	File where the attachment validity ledger keeps the keys it disa
 DM_YIELD_BACKOFF	switch	`0` turns off the yield back-off; `=<cap µs>[:<start µs>]` sets its sleep cap and the run of yields after which it starts (default 250:2000)
 DM_PAD_THEME	player	The touch controls' colours: `0` Classic (translucent white), `1` Forest (blue A, green B, yellow X / Y, red +, deep green shoulders, bronze D-pad, gold rims, all translucent); default the profile's `pad_theme`; launcher setting
 DM_NVN_RC_STALE	switch	`1` (Skip hidden objects, off by default): a render condition whose occlusion result has not landed takes the result that landed before it at that address instead of drawing; an object coming into view is drawn a frame late (cheemu21 X12)
+DM_FRAMEGEN_AGAIN	switch	`<n>`: a dropped frame stops frame generation's interpolation only within n presents of the drop before it (30 by default); smaller lets a lone hiccup pass
+DM_FRAMEGEN_RESUME_MAX	switch	`<n>`: the longest run of presents in time frame generation waits for before it runs again after it stopped (300 by default, at least 30)

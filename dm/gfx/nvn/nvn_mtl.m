@@ -17048,6 +17048,16 @@ static uint64_t g_fg_late;
 // within FG_AGAIN presents of the one before, frames dropping on and on, takes the FG_STEADY presents, so guessed pictures do not mix into a rhythm of held ones (the flicker)
 #define FG_STEADY 3
 #define FG_AGAIN 30
+static int fg_again(void) {   // DM_FRAMEGEN_AGAIN: how close two drops must be to stop the interpolation (FG_AGAIN by default)
+    static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAMEGEN_AGAIN"); v = e && *e ? atoi(e) : FG_AGAIN; if (v < 1) v = 1;
+        if (e) MLOG("frame generation: a drop within %d presents of the one before stops the interpolation (DM_FRAMEGEN_AGAIN)", v); }
+    return v;
+}
+static int fg_resume_max(void) {   // DM_FRAMEGEN_RESUME_MAX: the longest run of presents in time asked before the interpolation runs again (300 by default)
+    static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAMEGEN_RESUME_MAX"); v = e && *e ? atoi(e) : 300; if (v < 30) v = 30;
+        if (e) MLOG("frame generation: the interpolation runs again after at most %d presents in a row in time (DM_FRAMEGEN_RESUME_MAX)", v); }
+    return v;
+}
 static int g_fg_steady, g_fg_starved, g_fg_need = 1; static uint64_t g_fg_paused_late, g_fg_paused_behind, g_fg_last_drop;
 // While frames keep dropping (a drop within FG_AGAIN presents of the one before), the interpolation is not run at all (g_fg_shed, read by snap_take): pausing only what is shown
 // left it costing its GPU time just when the GPU was short (X11 on a hot iPhone, log 8: the game 19-22 ms and the interpolation 10 ms a frame against 33, 55-123 of 300 frames
@@ -17145,8 +17155,8 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
         // Behind: older presents were dropped for this one. One newer present waiting is not: with snapshots the game runs a frame ahead of the screen, and taking that
         // as behind paused frame generation for 1,060 of about 2,900 presents of a run that dropped next to no frames (log 80)
         int behind = ticket > first, late = g_fg_starved, drop = behind || late; g_fg_starved = 0;
-        if (drop) { int again = g_fg_last_drop && ticket - g_fg_last_drop <= FG_AGAIN; g_fg_need = again ? FG_STEADY : 1; g_fg_last_drop = ticket;
-            if (again && fg_on() && !atomic_load(&g_fg_shed)) { atomic_store(&g_fg_shed, 1); if (g_fg_sheds++) g_fg_resume = MIN(g_fg_resume * 2, 300); g_fg_calm = 0;
+        if (drop) { int again = g_fg_last_drop && ticket - g_fg_last_drop <= (uint64_t)fg_again(); g_fg_need = again ? FG_STEADY : 1; g_fg_last_drop = ticket;
+            if (again && fg_on() && !atomic_load(&g_fg_shed)) { atomic_store(&g_fg_shed, 1); if (g_fg_sheds++) g_fg_resume = MIN(g_fg_resume * 2, fg_resume_max()); g_fg_calm = 0;
                 MLOG("frame generation: frames keep dropping, the interpolation stops until %d presents in a row come in time (#%llu)", g_fg_resume, (unsigned long long)g_fg_sheds); } }
         g_fg_steady = drop ? 0 : g_fg_steady + 1;
         if (atomic_load(&g_fg_shed) && g_fg_steady >= g_fg_resume) { atomic_store(&g_fg_shed, 0); MLOG("frame generation: %d presents in time, the interpolation runs again", g_fg_steady); }
