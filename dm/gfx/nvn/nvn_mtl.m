@@ -17064,6 +17064,20 @@ static int g_fg_steady, g_fg_starved, g_fg_need = 1; static uint64_t g_fg_paused
 // dropped). It runs again after g_fg_resume presents in a row in time, 30 at first and twice as many after each new shed (up to 300), so it does not flap between 60 and 30;
 // a minute in time halves it again. Decided by dropped frames, not by the device's temperature
 static _Atomic int g_fg_shed; static int g_fg_resume = 30; static uint64_t g_fg_sheds, g_fg_shed_frames, g_fg_calm;
+// Adaptive frame generation (DM_FRAMEGEN_ADAPT=1): while the interpolation is stopped (g_fg_shed) the frame step cap goes to 60 (hle_nvn.c fps_step_cap), so the game
+// runs at the rate it manages instead of 30 with nothing between. hle_nvn.c times its presents and calls mtl_fg_native_done once it keeps up, which brings back 30 and the interpolation
+static int fg_adapt(void) {
+    static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAMEGEN_ADAPT"); v = e && *e && strcmp(e, "0");
+        if (v) MLOG("frame generation: the game runs at its own rate up to 60 while the interpolation is stopped (DM_FRAMEGEN_ADAPT)"); }
+    return v;
+}
+int mtl_fg_native(void) { return fg_adapt() && atomic_load(&g_fg_shed) ? g_fg_resume : 0; }   // the presents (at 30) the game must keep up for; 0 = not at its own rate
+void mtl_fg_native_done(double ms, double s) {
+    pthread_mutex_lock(&g_pq_mu);
+    if (atomic_load(&g_fg_shed)) { atomic_store(&g_fg_shed, 0); g_fg_last_drop = 0; g_fg_steady = 0; g_fg_need = FG_STEADY;
+        MLOG("frame generation: back to 30 with generated frames after %.1f s at the game's own rate (%.1f ms a frame)", s, ms); }
+    pthread_mutex_unlock(&g_pq_mu);
+}
 
 // A display link callback whose present took 50 ms or more (three ticks): where the time went, so a silent link (the rescue below) can be traced to its wait.
 // what: the picture shown; snap: the wait for the encode thread to commit its snapshot; present: present_now, alloc of it waiting for a present allocator, res for the residency commit

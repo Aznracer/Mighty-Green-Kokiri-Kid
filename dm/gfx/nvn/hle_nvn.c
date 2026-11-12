@@ -2045,6 +2045,8 @@ static void high_cap_tick(void) {
     atomic_store(&g_high_cap, cap);
     if (!link_env) mtl_link_mode_set(ok ? 2 : 1);
 }
+__attribute__((weak)) int mtl_fg_native(void) { return 0; }   // nvn_mtl.m (DM_FRAMEGEN_ADAPT): the interpolation is stopped, the game runs at its own rate up to 60
+__attribute__((weak)) void mtl_fg_native_done(double ms, double s) { (void)ms; (void)s; }
 static int fps_step_cap(void) {
     if (!dm_fps_state) return fps_high() ? atomic_load(&g_high_cap) : 0;
     uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float t; memcpy(&t, &b, sizeof t);
@@ -2052,7 +2054,7 @@ static int fps_step_cap(void) {
     // Movies and a 30 fps target still need thermal samples: heat must reset the
     // calm interval, and cooling during those caps counts towards recovery.
     int thermal = thermal_capped();
-    return dm_movie_playing() || t <= 30 || thermal ? 30 : 60;   // a movie: its player takes a picture per game frame, paced for the Switch's 30 (hle_movie.c)
+    return dm_movie_playing() || (t <= 30 && !mtl_fg_native()) || thermal ? 30 : 60;   // DM_FRAMEGEN_ADAPT: 60 while frame generation is stopped   // a movie: its player takes a picture per game frame, paced for the Switch's 30 (hle_movie.c)
 }
 static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides the steps in whole vsyncs
 // Engine-native frame limiters have no frame-step state page. Their requested
@@ -2262,6 +2264,22 @@ static void fstep_tick(const win_t *o, int c) {
 // The crop a present shows: the window's own (nvnWindowSetCrop), else the vi layer's (vi::SetLayerCrop, hle_vi.c); on the Switch both become the crop of the buffer queued to the layer.
 // Link's Awakening crops only its layer: in handheld mode it draws 1280x720 into its 1920x1080 window textures and crops the layer to that. A layer crop that does not fit the
 // texture is reported once and the whole texture shown, as before the layer crop was read here. lc receives the layer crop
+// Adaptive frame generation (DM_FRAMEGEN_ADAPT=1): while the game runs at its own rate (mtl_fg_native), back to 30 with generated frames once it keeps a mean frame of
+// DM_FRAMEGEN_ADAPT_MS (24 by default) for the resume hold, with no frame over 40 ms; a window that ends slower starts again
+static void fg_adapt_tick(void) {
+    static uint64_t prev, w0, n, since; static int thr = -1;
+    int need = mtl_fg_native(); uint64_t t = now_ns();
+    if (!need) { prev = since = 0; return; }
+    if (thr < 0) { const char *e = getenv("DM_FRAMEGEN_ADAPT_MS"); thr = e && *e ? atoi(e) : 24; if (thr < 17) thr = 17; if (thr > 30) thr = 30;
+        LOG("[nvn] frame generation stopped: the cap is 60 until frames average %d ms or less (DM_FRAMEGEN_ADAPT_MS)", thr); }
+    if (!since) since = t;
+    if (!prev || t - prev > 40000000ull) { w0 = t; n = 0; } else n++;
+    prev = t;
+    if (n && t - w0 >= (uint64_t)need * 33333333ull) {
+        if ((t - w0) / n <= (uint64_t)thr * 1000000ull) { mtl_fg_native_done((t - w0) / 1e6 / n, (t - since) / 1e9); prev = since = 0; }
+        else { w0 = t; n = 0; }
+    }
+}
 void dm_vi_layer_crop(int c[4]);   // hle_vi.c: x, y, w, h the game last cropped its layer to (all 0 = none)
 static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
     if (win[2] || win[3]) return win;   // the window's own crop (present_crop_rect checks it)
@@ -2283,6 +2301,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         if (on < 0) { const char *e = getenv("DM_FRAME_DELTA"); on = !e || strcmp(e, "0"); LOG("[nvn] game step from the measured frame time: %s", on ? "on" : "off (DM_FRAME_DELTA=0)"); }
         if (on) { float s = nvn_fdelta_next(&fd, now_ns()); uint32_t b; memcpy(&b, &s, sizeof b); __atomic_store_n((uint32_t *)(dm_fps_state + 0x38), b, __ATOMIC_RELAXED); }
     }
+    fg_adapt_tick();
     int c = fps_step_cap();
     if (dm_fps_state) { static int was; if (c != was) { LOG("[nvn] frame step cap %d → %d fps at present %llu%s", was, c, (unsigned long long)o->presents, c == 30 && was == 60 ? (dm_movie_playing() ? " (movie playing)" : thermal_capped() ? " (thermal state serious)" : "") : ""); was = c; } }
     if (c) fstep_tick(o, c);

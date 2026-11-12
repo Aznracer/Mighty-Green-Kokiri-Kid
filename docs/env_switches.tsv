@@ -448,3 +448,5 @@ DM_PAD_THEME	player	The touch controls' colours: `0` Classic (translucent white)
 DM_NVN_RC_STALE	switch	`1` (Skip hidden objects, off by default): a render condition whose occlusion result has not landed takes the result that landed before it at that address instead of drawing; an object coming into view is drawn a frame late (cheemu21 X12)
 DM_FRAMEGEN_AGAIN	switch	`<n>`: a dropped frame stops frame generation's interpolation only within n presents of the drop before it (30 by default); smaller lets a lone hiccup pass
 DM_FRAMEGEN_RESUME_MAX	switch	`<n>`: the longest run of presents in time frame generation waits for before it runs again after it stopped (300 by default, at least 30)
+DM_FRAMEGEN_ADAPT	switch	`1`: while frame generation's interpolation is stopped for dropped frames the 30 cap is lifted to 60, so the game runs at its own rate; back to 30 with generated frames once it keeps up (off by default)
+DM_FRAMEGEN_ADAPT_MS	switch	`<ms>`: with DM_FRAMEGEN_ADAPT, the mean frame time the game must keep (no frame over 40 ms) for the resume hold before 30 and generated frames come back (24 by default, 17-30)
