@@ -16879,6 +16879,7 @@ static uint64_t g_present_alloc_wait_ns;   // present_now's waits for a present 
 static uint64_t g_present_res_ns;   // present_now's residency commits (display link thread: the slow-callback line)
 static int g_fg_owing;   // frame generation: present_now is showing a present's own picture after its generated frame (display link thread only; see g_fg_owe)
 static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
+static int fg_on(void);   // frame generation (below): present_now commits for every present unless it is on
 static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t ticket, const int crop[4], id<CAMetalDrawable> supplied, double target_ts) {
     if (g_present_stall_ns) { struct timespec ts = {0, (long)g_present_stall_ns}; nanosleep(&ts, NULL); }
     g_present_n++;
@@ -16905,7 +16906,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     // Not for the host's own present snapshots and generated frames (serials 2^61 + n, in their own residency set, committed when made): the commit takes g_res_mu, which the
     // submitting thread holds while it commits a frame's work, and on the display link thread that wait was a hitch on screen (X10b on an iPhone, log 6: four callbacks of
     // 59-138 ms, none of it for an allocator, with the encode thread off)
-    if ((t->serial >> 61) != 1) { uint64_t r0 = now_ns(); res_commit(); g_present_res_ns += now_ns() - r0; }
+    if ((t->serial >> 61) != 1 || !fg_on()) { uint64_t r0 = now_ns(); res_commit(); g_present_res_ns += now_ns() - r0; }
     // DM_NVN_REGLUM=x0,y0,x1,y1:file (normalized coordinates): read back this region on every present and record "present sequence number, present time ns, region mean luminance, subsampled grayscale thumbnail (hex)" (diagnostic: verify that animation speed is independent of frame rate).
     // A separate command buffer is queued after this frame's rendering (the same queue executes in submit order); does not wait for the GPU and does not disturb frame pacing
     static int rl = -1; static float rr[4]; static FILE *rlf; static pthread_mutex_t rlmu = PTHREAD_MUTEX_INITIALIZER;
