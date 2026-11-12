@@ -450,3 +450,6 @@ DM_FRAMEGEN_AGAIN	switch	`<n>`: a dropped frame stops frame generation's interpo
 DM_FRAMEGEN_RESUME_MAX	switch	`<n>`: the longest run of presents in time frame generation waits for before it runs again after it stopped (300 by default, at least 30)
 DM_FRAMEGEN_ADAPT	switch	`1`: while frame generation's interpolation is stopped for dropped frames the 30 cap is lifted to 60, so the game runs at its own rate; back to 30 with generated frames once it keeps up (off by default)
 DM_FRAMEGEN_ADAPT_MS	switch	`<ms>`: with DM_FRAMEGEN_ADAPT, the mean frame time the game must keep (no frame over 40 ms) for the resume hold before 30 and generated frames come back (24 by default, 17-30)
+DM_NVN_RC_RESYNC	switch	`1`: when over 90 % of the visibility answers stay late for 3 s (a stuck launch), the present waits once for the GPU to finish, as the menu lets it; at most every 10 s (off by default)
+DM_NVN_RC_STALE=2	switch	`2`: as 1 (late visibility answers take the one before), but conditional clears always run; 1 flashed white in Ocarina of Time
+DM_NVN_RC_UNSTICK	switch	`<n>`: with DM_NVN_RC_RESYNC=2, the presents after a firing in which late visibility answers count as hidden (4 by default, 1-30)

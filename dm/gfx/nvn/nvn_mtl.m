@@ -1199,6 +1199,8 @@ static uint64_t g_rc_stat[5];   // conditions evaluated since the last report: d
 // those decided about half were hidden. The cost: an object that comes into view is drawn one frame late (Metal has no predication to decide it on the GPU in time)
 static int g_rc_stale = -1;   // rc_stale_on's answer (-1: not read yet; tests set it)
 static int rc_stale_on(void) { if (g_rc_stale < 0) { const char *e = getenv("DM_NVN_RC_STALE"); g_rc_stale = e && atoi(e) > 0; if (g_rc_stale) MLOG("DM_NVN_RC_STALE=1: conditions whose result has not landed take the result before it (objects coming into view may be drawn a frame late)"); } return g_rc_stale; }
+// DM_NVN_RC_STALE=2 (rc_stale_draws.py): as =1, but a block skipped on the answer before (g_rc_skip 2) still runs its color and depth-stencil clears; =1 flashed white in Ocarina of Time
+static int rc_stale_draws(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RC_STALE"); v = e && atoi(e) == 2; if (v) MLOG("DM_NVN_RC_STALE=2: late answers take the one before for draws; clears always run"); } return v; }
 static int rc_landed_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RC_LANDED"); v = !(e && !strcmp(e, "0")); if (!v) MLOG("DM_NVN_RC_LANDED=0: conditions on samples-passed reports always draw"); } return v; }
 static rc_occ_ent *rc_occ_find(uint64_t a) {   // g_rc_lk held
     if (!g_rc_ocap) return NULL;
@@ -1223,6 +1225,9 @@ static void rc_landed(uint64_t a) {   // post_run: a samples-passed result was w
 }
 // rc_diag2.py: what a late answer waits for. Encode thread only, like rc_value; read by rc_report_line
 static uint64_t g_rcl_n, g_rcl_same, g_rcl_fly, g_rcl_lag, g_rcl_back, g_rcl_age;
+static uint64_t g_rcw_all, g_rcw_late;
+static int g_rc_unstick; static uint64_t g_rc_unstuck_n;   // DM_NVN_RC_RESYNC=2: presents left in which late answers count as hidden; conditions so counted
+static int rc_unstick_frames(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RC_UNSTICK"); v = e && *e ? atoi(e) : 4; if (v < 1) v = 1; if (v > 30) v = 30; } return v; }   // rc_resync.py: conditions evaluated / of them late, since launch
 static void rc_late_note(uint64_t rf, uint64_t rt) {
     uint64_t cur = atomic_load(&g_fence) + 1, done = atomic_load(&g_done);
     g_rcl_n++;
@@ -1237,6 +1242,36 @@ static int rc_value(uint64_t a, uint64_t *v) {   // 0 = unknown at encode time; 
     if (pend) { if (!(landed && rc_stale_on())) return 0; *v = *(const volatile uint64_t *)a; return 2; }
     for (uint32_t i = g_rc_npend; i-- > 0;) if (g_rc_pend[i] == a) { *v = 0; return 1; }
     *v = *(const volatile uint64_t *)a; return 1;
+}
+// DM_NVN_RC_RESYNC=1 (rc_resync.py, off by default): a stuck launch keeps the GPU half a frame out of step with the game (over 90 % of the visibility answers late, the
+// game spinning on its main thread) until a light scene such as the menu lets it catch up. Once over 90 % of at least 3,000 answers a second have been late for 3 s in a row,
+// the present waits once for the GPU to finish all committed work, as nvnQueueFinish does, and the next 5 s are logged. At most once every 10 s
+static void mtl_finish_gpu_at(int site);
+static int rc_resync_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RC_RESYNC"); v = e && atoi(e) > 0 ? atoi(e) : 0; if (v) MLOG("DM_NVN_RC_RESYNC=1: a wait for the GPU when over 90 %% of the visibility answers stay late for 3 s"); } return v; }
+static void rc_resync_tick(uint64_t f) {   // present_enqueue, once per present
+    if (!rc_resync_on()) return;
+    if (g_rc_unstick) g_rc_unstick--;   // DM_NVN_RC_RESYNC=2: one present fewer
+    static uint64_t f0, a0, l0; static int bad, cool, after, n;
+    if (!f0) { f0 = f; a0 = g_rcw_all; l0 = g_rcw_late; return; }
+    if (f < f0 + 30) return;   // a window of 30 frames, a second at 30 fps
+    uint64_t al = g_rcw_all - a0, la = g_rcw_late - l0; f0 = f; a0 = g_rcw_all; l0 = g_rcw_late;
+    static uint64_t ra[3], rl[3], near_f; static int ri, rn;   // rc_resync ring: the last three windows together
+    ra[ri] = al; rl[ri] = la; ri = (ri + 1) % 3; if (rn < 3) rn++;
+    uint64_t A = ra[0] + ra[1] + ra[2], L = rl[0] + rl[1] + rl[2];
+    int stuck = rn == 3 && A >= 9000 && L * 10 >= A * 9;
+    if (rn == 3 && A >= 9000 && !stuck && L * 100 >= A * 85 && f >= near_f + 300) { near_f = f; MLOG("[nvn] resync: near miss, %llu of %llu answers late over 3 s (%.0f %%, frame %llu)", (unsigned long long)L, (unsigned long long)A, 100.0 * L / A, (unsigned long long)f); }
+    if (after) { MLOG("[nvn] resync #%d, %d s after the wait: %llu of %llu answers late (%.0f %%)", n, 6 - after, (unsigned long long)la, (unsigned long long)al, al ? 100.0 * la / al : 0.0); after--; }
+    if (after == 4 && g_rc_unstuck_n) { MLOG("[nvn] resync #%d: %llu late conditions were counted as hidden", n, (unsigned long long)g_rc_unstuck_n); g_rc_unstuck_n = 0; }
+    bad = stuck ? 3 : 0;
+    if (cool) { cool--; return; }
+    if (!stuck) return;
+    la = L; al = A;   // for the line below: the three seconds
+    uint64_t back = atomic_load(&g_fence) - atomic_load(&g_done), t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    mtl_finish_gpu_at(WS_DRAIN);
+    MLOG("[nvn] resync #%d (DM_NVN_RC_RESYNC): %d s with over 90 %% of the answers late (%llu of %llu in the last); waited %.1f ms for the GPU to finish %llu submissions (frame %llu)",
+         ++n, bad, (unsigned long long)la, (unsigned long long)al, (clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0) / 1e6, (unsigned long long)back, (unsigned long long)f);
+    if (rc_resync_on() >= 2) { g_rc_unstick = rc_unstick_frames(); g_rc_unstuck_n = 0; MLOG("[nvn] resync #%d: late answers count as hidden for the next %d presents (DM_NVN_RC_RESYNC=2)", n, g_rc_unstick); }
+    bad = 0; cool = 10; after = 5; rn = 0;
 }
 static void rc_report_line(uint64_t frame) {
     uint64_t n = g_rc_stat[0] + g_rc_stat[1] + g_rc_stat[2]; if (!n) return;
@@ -2540,6 +2575,25 @@ static int post_claim(post_rec *record, uint64_t fence) {
     }
     return 1;
 }
+// gpu_lat.py: for each completed submission, how long the GPU ran it, how long the GPU sat idle before it, and how long after the GPU finished the host saw it
+// complete (when g_done moves and the query results are written). Logged every 2 s. Completion processing only, in fence order
+static void gpu_lat_note(double s, double e) {
+    static double prev_e, last, sum_lat, max_lat, sum_exec, sum_gap, max_gap; static uint64_t n;
+    double now = CACurrentMediaTime();
+    if (s > 0 && e >= s) {
+        double lat = now - e; if (lat < 0) lat = 0; sum_lat += lat; if (lat > max_lat) max_lat = lat;
+        sum_exec += e - s;
+        if (prev_e > 0 && s > prev_e) { double g = s - prev_e; sum_gap += g; if (g > max_gap) max_gap = g; }
+        if (e > prev_e) prev_e = e;
+        n++;
+    }
+    if (last <= 0) last = now;
+    if (now - last >= 2.0 && n) {
+        MLOG("[nvn] GPU completions over %.1f s: %llu submissions, GPU ran %.2f ms each, idle %.2f ms before each (max %.1f); completion seen %.2f ms after the GPU finished on average (max %.1f)",
+             now - last, (unsigned long long)n, sum_exec / n * 1e3, sum_gap / n * 1e3, max_gap * 1e3, sum_lat / n * 1e3, max_lat * 1e3);
+        n = 0; sum_lat = max_lat = sum_exec = sum_gap = max_gap = 0; last = now;
+    }
+}
 static void post_run(post_rec *record, uint64_t c0, uint64_t c1) {
     // A guest SyncWait may run completion on a thread whose outer pool never drains.
     // MTLBuffer.contents may autorelease its receiver; keep that lifetime inside the completed copy.
@@ -2758,6 +2812,7 @@ uint64_t mtl_sub_commit(void) {
     int lost_test = gpu_lost_test();
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) {
         gpu_tag_done(gpu_f, cb.GPUStartTime, cb.GPUEndTime);
+        gpu_lat_note(cb.GPUStartTime, cb.GPUEndTime);   // gpu_lat.py
         cbn_failed(&cbn, cb.error);
         if (ws_on()) ws_fb(fence, cb.GPUEndTime);
         uint64_t c0 = 0, c1 = 0; if (seg_ts()) { c0 = gpu_s_guest_ns(cb.GPUStartTime); c1 = gpu_s_guest_ns(cb.GPUEndTime); }
@@ -15951,8 +16006,9 @@ void mtl_exec(const uint8_t *p) {
             case OP_RENDER_COND: { const p_render_cond *rc = a;   // recorded only with the profile key render_cond (hle_nvn.c)
                 if (rc->mode >= 2) { g_rc_skip = rc->mode == 3; PD("E %llu render enable %d", g_stat_pass, rc->mode == 2); }
                 else { uint64_t x = 0, y = 0; int ka = rc_value(rc->addr, &x), kb = rc_value(rc->addr + 16, &y), known = ka && kb;
-                    g_rc_skip = known && (rc->mode ? x == y : x != y); g_rc_stat[!known ? 2 : g_rc_skip]++;
+                    g_rc_skip = known && (rc->mode ? x == y : x != y); g_rc_stat[!known ? 2 : g_rc_skip]++; g_rcw_all++; if (!known) g_rcw_late++; if (!known && g_rc_unstick) { g_rc_skip = 2; g_rc_unstuck_n++; }   // rc_resync: per condition; DM_NVN_RC_RESYNC=2: late counted as hidden, clears run
                     if (known && (ka == 2 || kb == 2)) g_rc_stat[3 + g_rc_skip]++;
+                    if (g_rc_skip && (ka == 2 || kb == 2) && rc_stale_draws()) g_rc_skip = 2;   // skipped on an old answer: draws dropped, clears run (DM_NVN_RC_STALE=2)
                     PD("E %llu conditional render %s addr=%#llx values %llu / %llu%s%s", g_stat_pass, rc->mode ? "draw if not equal" : "draw if equal", (unsigned long long)rc->addr, (unsigned long long)x, (unsigned long long)y, known ? "" : " (unknown, drawn)", g_rc_skip ? " → not drawn" : ""); }
                 break; }
             case OP_FENCE_SYNC: { sync_t *s; memcpy(&s, a, 8); s->fence = g_fence + 1; s->fenced = NVN_SYNC_FENCE_GPU;   // the fence value this submission (segment) commits with
@@ -15995,7 +16051,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_CLEAR_COLOR: {
                 const p_clear_color *c = a;
                 if (g_rcp_n) { if (R.has_sc) rc_area_add(R.sc.x, R.sc.y, R.sc.x + R.sc.w, R.sc.y + R.sc.h); else rc_area_add(-1e30f, -1e30f, 1e30f, 1e30f); }   // DM_NVN_RT_RECLAIM: a clear writes its scissor
-                if (g_rc_skip) { PD("c %llu color clear skipped by conditional rendering slot%d", g_stat_pass, c->index); break; }
+                if (g_rc_skip == 1) { PD("c %llu color clear skipped by conditional rendering slot%d", g_stat_pass, c->index); break; }
                 // A scissored clear to 0 outside a pass with all channels (SMBW clears pyramid levels as sub-rectangles of 480×272 and other targets): copy from the zero buffer into the scissor rectangle in the replay stream
                 if (!g_enc && c->mask == 0xf && !c->rgba[0] && !c->rgba[1] && !c->rgba[2] && !c->rgba[3] && R.has_sc && c->index >= 0 && c->index < R.rt.n && R.rt.color[c->index]
                     && !scissor_full(R.rt.color[c->index], &R.rt.cview[c->index], R.rt.has_cview[c->index]) && clear_rect_zero(c->index)) break;
@@ -16013,7 +16069,7 @@ void mtl_exec(const uint8_t *p) {
             case OP_CLEAR_DS: {
                 if (g_rcp_n) { if (R.has_sc) rc_area_add(R.sc.x, R.sc.y, R.sc.x + R.sc.w, R.sc.y + R.sc.h); else rc_area_add(-1e30f, -1e30f, 1e30f, 1e30f); }   // DM_NVN_RT_RECLAIM: a clear writes its scissor
                 const p_clear_ds *c = a;
-                if (g_rc_skip) { PD("c %llu depth-stencil clear skipped by conditional rendering", g_stat_pass); break; }
+                if (g_rc_skip == 1) { PD("c %llu depth-stencil clear skipped by conditional rendering", g_stat_pass); break; }
                 if (g_rt_merged || g_sm_pass) rp_end();
                 // A load-action clear covers the whole attachment and every stencil bit. A clear whose scissor does not cover the depth target, or whose stencil mask is partial, is drawn as a triangle
                 // (clear_ds_tri), in or before a pass: before the first draw and for a partial stencil mask in a pass it used to clear the whole target (PR #108)
@@ -17838,6 +17894,7 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
         else if (st == 2 && now - t0 >= at + dur) { st = 3; mtl_link_pause(0); MLOG("DM_TEST_LINK_STALL: resuming the display link (frame %llu)", (unsigned long long)atomic_load(&g_cur_frame)); }
     }
     if (ws_on()) { static uint64_t f0; uint64_t f = atomic_load(&g_cur_frame); if (!f0) f0 = f; else if (f >= f0 + 300) { ws_report(f, f - f0); f0 = f; } }
+    if (DM_GAME_RENDER_COND) rc_resync_tick(atomic_load(&g_cur_frame));   // DM_NVN_RC_RESYNC (rc_resync.py)
     if (DM_GAME_RENDER_COND) { static uint64_t rf0; uint64_t f = atomic_load(&g_cur_frame); if (!rf0) rf0 = f; else if (f >= rf0 + 300) { rc_report_line(f); rf0 = f; } }
     { static uint64_t pf0; uint64_t f = atomic_load(&g_cur_frame); if (!pf0) pf0 = f; else if (f >= pf0 + 600) { pb_report(f); pf0 = f; } }   // passes on the same attachments (pb_note)
     tex_t snap; uint64_t ss = 0; int slot = 0, whole = 0;
