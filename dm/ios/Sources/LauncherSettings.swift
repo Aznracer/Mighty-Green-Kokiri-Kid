@@ -1,6 +1,9 @@
 // Launcher settings, validation and persistence. Shared by the iOS UI, the Mac app's settings window (dm/mac/Launcher.swift) and the native storage regression test.
 import Foundation
 import Combine
+#if os(iOS)
+import GameController   // play_style.py
+#endif
 
 struct Setting: Decodable, Identifiable {
     let env, kind, label, note, def: String
@@ -102,6 +105,20 @@ final class LauncherModel: ObservableObject {
             store(s, v)
             setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v)\(s.isDefault(v) ? "" : " (changed)")\n", stderr)
         }
+        applyPlayStyle()
+    }
+    // play_style.py: Controls > Play style (DM_PLAY_STYLE, iOS only). Touch turns frame generation off, over an env file's DM_FRAMEGEN as well:
+    // touch play stuttered with it on. Auto picks Touch when no controller is connected when Play is pressed. Not set (the Mac app): nothing happens
+    func applyPlayStyle() {
+#if os(iOS)
+        guard let p = getenv("DM_PLAY_STYLE") else { return }
+        let style = String(cString: p)
+        let pad = GCController.controllers().contains { $0.extendedGamepad != nil }
+        let touch = style == "touch" || (style == "auto" && !pad)
+        let why = style == "auto" ? (pad ? " (controller connected)" : " (no controller)") : ""
+        fputs("launcher: play style \(style)\(why): \(touch ? "touch, frame generation off" : "controller, settings as set")\n", stderr)
+        if touch { setenv("DM_FRAMEGEN", "0", 1) }
+#endif
     }
     private func store(_ s: Setting, _ v: String) {
         if !ignoreSaved { if s.isDefault(v) { defaults.removeObject(forKey: "launcher." + s.env) } else { defaults.set(v, forKey: "launcher." + s.env) } }
@@ -121,5 +138,6 @@ final class LauncherModel: ObservableObject {
             let v = values[s.env] ?? s.def
             if !s.isDefault(v) { setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v) (saved choice)\n", stderr) }
         }
+        applyPlayStyle()
     }
 }
