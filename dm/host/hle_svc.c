@@ -88,6 +88,12 @@ static void *guest_file_thread(void *arg) {
             LOG("[RED] [mem] guest file: %.1f GB free on its disk, under %.1f: stopping the game (the free space statfs gives, f_bavail, which leaves out space the system could purge)", avail, g_gf_min_free / G);
             _exit(87);
         }
+        {   // DM_MEM_TRACE=1: one line every second (the log is line-buffered), so the last lines before a kill with no report show whether the footprint jumped
+            static int trace = -1; if (trace < 0) { const char *e = getenv("DM_MEM_TRACE"); trace = e && atoi(e) > 0; }
+            task_vm_info_data_t tv; mach_msg_type_number_t tn = TASK_VM_INFO_COUNT;
+            if (trace && task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&tv, &tn) == KERN_SUCCESS)
+                LOG("[memtrace] %us: footprint %.3f GB (internal %.3f, compressed %.3f), room to the system limit %llu MB", sec, tv.phys_footprint / G, tv.internal / G, tv.compressed / G, (unsigned long long)(os_proc_available_memory() >> 20));
+        }
         if (sec % 10) continue;
         for (int i = 0; i < g_gf_n; i++) if (!fstat(g_gf_tab[i], &st)) held += st.st_blocks * 512.0;
         int ru_ok = !proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru);
@@ -95,6 +101,22 @@ static void *guest_file_thread(void *arg) {
         LOG("%s[mem] guest file: %.2f GB allocated on disk; process read %.2f GB, %llu page-ins, logical writes %.2f GB; footprint %.2f GB (internal %.2f, compressed %.2f, peak so far %.2f), file pages mapped (external) %.2f GB; %.1f GB free on its disk",
             avail >= 0 && avail < 2 ? "[RED] " : "", held / G, ru_ok ? ru.ri_diskio_bytesread / G : -1, ru_ok ? (unsigned long long)ru.ri_pageins : 0ull,
             ru_ok ? ru.ri_logical_writes / G : -1, vi.phys_footprint / G, vi.internal / G, vi.compressed / G, ru_ok ? ru.ri_lifetime_max_phys_footprint / G : -1, vi.external / G, avail);
+    }
+    return NULL;
+}
+// DM_MEM_TRACE=1: 20 samples a second, a line whenever the footprint moved 0.1 GB from the last line, with the kernel's own peak since launch (a spike between two samples still shows in it)
+static void *memtrace_fast_thread(void *arg) {
+    (void)arg; const double G = 1073741824.0; double last = 0;
+    for (;;) {
+        usleep(50000);
+        task_vm_info_data_t tv; mach_msg_type_number_t tn = TASK_VM_INFO_COUNT;
+        if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&tv, &tn) != KERN_SUCCESS) continue;
+        double f = tv.phys_footprint / G;
+        if (f - last > 0.1 || last - f > 0.1) {
+            struct rusage_info_v4 ru; int ok = !proc_pid_rusage(getpid(), RUSAGE_INFO_V4, (rusage_info_t *)&ru);
+            LOG("[memtrace] fast: footprint %.3f GB (was %.3f), peak %.3f GB, room %llu MB", f, last, ok ? ru.ri_lifetime_max_phys_footprint / G : -1.0, (unsigned long long)(os_proc_available_memory() >> 20));
+            last = f;
+        }
     }
     return NULL;
 }
@@ -189,6 +211,7 @@ static void guest_file_init(void) {
     pthread_t th; int rc = pthread_create(&th, NULL, guest_file_thread, NULL);
     if (!rc) pthread_detach(th);
     else LOG("[RED] [mem] guest file: no thread to watch it (error %d): no 10-s line, and nothing stops the game when its disk fills", rc);
+    { const char *mt = getenv("DM_MEM_TRACE"); pthread_t t2; if (mt && atoi(mt) > 0 && !pthread_create(&t2, NULL, memtrace_fast_thread, NULL)) pthread_detach(t2); }
 }
 
 static void *alias_windows_thread(void *arg);
