@@ -17,6 +17,16 @@
 
 module_t *g_mod;
 int g_nmod;
+// thread top's sampler (nvn_mtl.m tt_sample_pc, tt_guest.py): a game code address as <module>+0x…, offsets from the module's base as the patches count them;
+// the patch area before a base (patch_off < 0) as <module> patch+0x…
+int dm_guest_addr_name(uintptr_t a, char *out, size_t n) {
+    for (int i = 0; i < g_nmod; i++) {
+        uintptr_t b = (uintptr_t)g_mod[i].base;
+        if (b && a >= b && a - b < g_mod[i].size) { snprintf(out, n, "%s+0x%lx", g_mod[i].name, (unsigned long)(a - b)); return 1; }
+        if (b && g_mod[i].patch_off < 0 && a < b && b - a <= (uintptr_t)(-g_mod[i].patch_off)) { snprintf(out, n, "%s patch-0x%lx", g_mod[i].name, (unsigned long)(b - a)); return 1; }
+    }
+    return 0;
+}
 // Stable module addresses live in g_mod; lookup order follows activation, including unload/reload.
 static module_t **g_loaded; static int g_nloaded, g_mod_capacity;
 static pthread_rwlock_t g_modules_mu = PTHREAD_RWLOCK_INITIALIZER;
@@ -312,6 +322,8 @@ void dm_fps_state_apply(void) {
     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f;
     if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= 1.0f)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to 1.0; keeping the game's size", rs); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", g_fps_mod, sc); }
     memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
+    // A full model heap (Ocarina of Time's patches.py heap_retry, PR #2497): DM_HEAP_RETRY=0 writes 1 at +0x17c, and the game's allocations that found their heap full stay as shipped
+    { const char *hr = getenv("DM_HEAP_RETRY"); if (hr && !strcmp(hr, "0")) { uint32_t off = 1; memcpy(dm_fps_state + 0x17c, &off, 4); LOG("%s: full model heap retry off (DM_HEAP_RETRY=0)", g_fps_mod); } }
     // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
     // (Breath of the Wild 1.9.0's patches.py) render that shape: the output keeps its width (1920) and takes the height that gives the ratio, a multiple of 48 so the
     // 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896. State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9

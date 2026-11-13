@@ -455,3 +455,6 @@ DM_FRAMEGEN_ADAPT_MS	switch	`<ms>`: with DM_FRAMEGEN_ADAPT, the mean frame time 
 DM_NVN_RC_RESYNC	switch	`1`: when over 90 % of the visibility answers stay late for 3 s (a stuck launch), the present waits once for the GPU to finish, as the menu lets it; at most every 10 s (off by default)
 DM_NVN_RC_STALE=2	switch	`2`: as 1 (late visibility answers take the one before), but conditional clears always run; 1 flashed white in Ocarina of Time
 DM_NVN_RC_UNSTICK	switch	`<n>`: with DM_NVN_RC_RESYNC=2, the presents after a firing in which late visibility answers count as hidden (4 by default, 1-30)
+DM_RT_PRESENT	switch	`0`: the presenting thread gets no time-constraint policy of its own when another thread acquires (default: it declares the period with its own measured computation, `hle_nvn.c` `rt_present_tick`)
+DM_HEAP_RETRY	switch	`0`: Ocarina of Time's model rebuild (main+0x4366e0) goes on with a null block when its small model heap is full, as shipped; by default the CPU buffers and GPU memory are tried again in the heap's parents and the default heap (PR #2497)
+DM_NVN_VIS_HEAPFRAME	switch	`0`: an image heap's alias flush on every barrier, as before; by default only at a submission's first barrier and after an encoder that may have written memory (PR #2525)

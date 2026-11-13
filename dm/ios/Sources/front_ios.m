@@ -63,6 +63,8 @@ static int fps_wide(void) { static int v = -1; if (v < 0) { const char *e = gete
     UIScreen *screen = self.window.windowScene.screen;
     CGFloat scale = screen ? screen.nativeScale : MAX(self.traitCollection.displayScale, 1);
     if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));
+    else { const char *e = getenv("DM_DRAWABLE_MAX_W"); double mw = e ? atof(e) : 0;   // drawable_cap.py: the phone's picture at most this many pixels across
+        if (mw >= 640) scale = MIN(scale, mw / MAX(self.bounds.size.width, 1)); }
     l.contentsScale = scale;
     l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);
 }

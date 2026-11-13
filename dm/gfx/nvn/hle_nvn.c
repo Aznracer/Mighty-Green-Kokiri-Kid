@@ -1635,6 +1635,7 @@ static void set_time_constraint(uint64_t period_ns);
 static void rt_comp_tick(uint64_t period_ns);
 static double g_rt_comp_ms;   // Currently declared real-time computation amount (ms; 0 = not declared)
 static double g_rt_period_ms;
+static _Atomic uint64_t g_rt_acq_tid;   // the thread the acquire declared on (set_time_constraint_comp)
 static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
 static uint64_t rt_period_ns(const win_t *o, uint64_t period);
@@ -1822,6 +1823,8 @@ static void power_line(uint64_t frame) {
         double nf = frame > pf ? (double)(frame - pf) : 1;   // per frame: the fair comparison when one build holds the frame rate better than another
         LOG("[nvn] power up to frame %llu: CPU energy %.2f W, %.1f mJ per frame (%.1f fps); CPU %.0f%% (100 = one core), %.0f%% of it on performance cores; wakeups %.0f/s (out of platform idle %.0f); GPU %.1f ms/s; thermal %d; top yielders: %s", frame,
             (e - pe) / 1e9 / s, (e - pe) / 1e6 / nf, nf / s, (cpu - pcpu) / 1e7 / s, cpu > pcpu ? 100.0 * (double)(p - pp) / (double)(cpu - pcpu) : 0, (iw - piw) / s, (idw - ppw) / s, (g - pg) / 1e6 / s, dm_thermal_now(), yt);
+        if (dm_fps_state) { uint32_t hc, hg; memcpy(&hc, dm_fps_state + 0x170, 4); memcpy(&hg, dm_fps_state + 0x174, 4);   // Ocarina of Time's patches.py heap_retry (PR #2497)
+            static uint32_t phc, phg; if (hc != phc || hg != phg) { LOG("[nvn] full model heap up to frame %llu: %u CPU buffers made in a parent heap, %u GPU blocks made in a parent or the default heap (so far)", (unsigned long long)frame, hc, hg); phc = hc; phg = hg; } }
         char rs[400]; mtl_res_stats(rs, sizeof rs); static uint64_t pbs, pbf; uint64_t bs, bf; mtl_barrier_stats(&bs, &bf);
         uint64_t mtl_cut_count(void), mtl_copy_cut_count(void), mtl_blit_splits(void); void mtl_ubd_stats(uint64_t *, uint64_t *); static uint64_t pcut, pccut, pbsp, pud, puc; uint64_t cut = mtl_cut_count(), ccut = mtl_copy_cut_count(), bsp = mtl_blit_splits(), ud, uc; mtl_ubd_stats(&ud, &uc);
         void mtl_ubp_stats(uint64_t *, uint64_t *, uint64_t *); static uint64_t ppm, ppr, ppf; uint64_t pm, pr, pf_; mtl_ubp_stats(&pm, &pr, &pf_);
@@ -1948,7 +1951,7 @@ static void set_time_constraint_comp(uint64_t period_ns, uint64_t comp_ns) {
         .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp_ns * tb.denom / tb.numer),
         .constraint = (uint32_t)(period_ns * tb.denom / tb.numer), .preemptible = 1};
     kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
-    if (kr == KERN_SUCCESS) { g_rt_comp_ms = comp_ns / 1e6; g_rt_period_ms = period_ns / 1e6; }
+    if (kr == KERN_SUCCESS) { g_rt_comp_ms = comp_ns / 1e6; g_rt_period_ms = period_ns / 1e6; uint64_t t; pthread_threadid_np(NULL, &t); atomic_store(&g_rt_acq_tid, t); }
     LOG("[nvn] present thread time-constraint policy (period %.3f ms, computation %.3f ms) %s", period_ns / 1e6, comp_ns / 1e6, kr == KERN_SUCCESS ? "set" : "failed to set");
 }
 static int rt_comp_fixed_ms(void) { static int v = -2; if (v == -2) { const char *e = getenv("DM_RT_COMP"); v = e && *e && strcmp(e, "auto") ? atoi(e) : -1; } return v; }   // −1 = auto
@@ -1966,6 +1969,32 @@ static void rt_comp_tick(uint64_t period_ns) {
     // two frames in 120 near 4.4 ms; declared at 2.5 ms (p90 × 1.25) it stalled about once a second, at 30 fps and at 60; declared above the peak it held 60 fps at the same CPU energy
     double p90 = v[107], comp = fmax(p90 * 1.25, v[119] * 1.1), cap = period_ns * 0.9 / 1e6; if (comp > cap) comp = cap; if (comp < 1) comp = 1;
     if (comp > g_rt_comp_ms * 1.15 || comp < g_rt_comp_ms * 0.85) set_time_constraint_comp(period_ns, (uint64_t)(comp * 1e6));
+}
+// The presenting thread's own declaration. A game can acquire the window texture on one guest thread and present on another (Ocarina of Time does; PR #2320 found the
+// policy line read the wrong thread), and the presenting thread is then the one that records and translates the frame: 16-21 ms of CPU a frame in Hyrule Field on an iPhone 17
+// Pro, at 1.3-1.7 GHz with 4-45 % on performance cores (HookLink issue 3). The acquire thread's declaration never reaches it. At each present a thread that is not the acquire
+// thread declares the same period with its own computation: the larger of 1.25 x the p90 and 1.1 x the peak of its CPU time per frame over 120 frames (as rt_comp_tick),
+// capped at 0.9 x the period, re-declared when it moves by 15 %. DM_RT_PRESENT=0 leaves it as it was; DM_RT=0 turns off both. From HookLink's 65e7c9b8 (dsi-hub/nxnative)
+static void rt_present_tick(uint64_t period_ns) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_RT_PRESENT"); on = rt_on() && !(e && !strcmp(e, "0")); if (!on) LOG("[nvn] DM_RT_PRESENT=0: the presenting thread gets no time-constraint policy of its own"); }
+    if (!on || !period_ns) return;
+    uint64_t me; pthread_threadid_np(NULL, &me);
+    if (me == atomic_load(&g_rt_acq_tid)) return;   // one thread does both: its declaration is the acquire's
+    static uint64_t last, tid; static double win[120], declared; static int n;
+    static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
+    if (tid != me) { tid = me; last = 0; n = 0; declared = 0; }   // another thread presents now: measure it afresh
+    uint64_t c = clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID); if (!last) { last = c; return; }
+    win[n++] = (double)(c - last) / 1e6; last = c;
+    if (n < 120) return;
+    double v[120]; memcpy(v, win, sizeof v); qsort(v, 120, sizeof *v, dcmp); n = 0;
+    double comp = fmax(v[107] * 1.25, v[119] * 1.1), cap = period_ns * 0.9 / 1e6; if (comp > cap) comp = cap; if (comp < 1) comp = 1;
+    if (declared && comp <= declared * 1.15 && comp >= declared * 0.85) return;
+    thread_time_constraint_policy_data_t p = {
+        .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp * 1e6 * tb.denom / tb.numer),
+        .constraint = (uint32_t)(period_ns * tb.denom / tb.numer), .preemptible = 1};
+    kern_return_t kr = thread_policy_set(pthread_mach_thread_np(pthread_self()), THREAD_TIME_CONSTRAINT_POLICY, (thread_policy_t)&p, THREAD_TIME_CONSTRAINT_POLICY_COUNT);
+    if (kr == KERN_SUCCESS) declared = comp;
+    LOG("[nvn] presenting thread %#llx time-constraint policy (period %.3f ms, computation %.3f ms, the acquire thread is another) %s", (unsigned long long)me, period_ns / 1e6, comp, kr == KERN_SUCCESS ? "set" : "failed to set");
 }
 static void sleep_until_ns(uint64_t dl) {   // absolute time on the monotonic clock
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
@@ -2295,6 +2324,7 @@ static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
 }
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    if (!dm_detclock_enabled() && g_rt_period_ms > 0) rt_present_tick((uint64_t)(g_rt_period_ms * 1e6));   // the presenting thread's own deadline (rt_present_tick)
     dm_ue_cvar_tick();
     if (fps_high()) high_cap_tick();
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 4), (uint32_t)dm_movie_playing(), __ATOMIC_RELAXED);   // the stubs' copy of the movie state (hle.h)
