@@ -300,6 +300,15 @@ static void glassChip(CALayer *g, NSString *t, BOOL square, CGFloat scale) {
 }
 
 static BOOL fullOnly(int b) { return b == B_LS || b == B_RS || b >= B_LEFT; }   // keys shown only in the 3D layout
+// pad_raster.py: each control drawn once into a bitmap the system compositor reuses at every refresh, instead of redrawing its gradients, masks and shadows over
+// every new frame (frame generation doubles them; that GPU work runs ahead of the game's). DM_PAD_RASTER=0 draws them live as before
+static BOOL pad_raster(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_PAD_RASTER"); v = !(e && !strcmp(e, "0"));
+        LOG("front end: touch controls %s", v ? "cached as bitmaps (each redrawn only when it changes; DM_PAD_RASTER=0 draws them live)" : "drawn live (DM_PAD_RASTER=0)"); }
+    return v;
+}
+static void pad_cache(CALayer *l, CGFloat scale) { if (l && pad_raster()) { l.shouldRasterize = YES; l.rasterizationScale = scale; } }
 
 - (instancetype)initWithFrame:(CGRect)f {
     if ((self = [super initWithFrame:f])) {
@@ -711,6 +720,8 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     setPath(_knob, circlePath(CGPointMake(k, k), k));
     CAShapeLayer *in = (CAShapeLayer *)_knob.sublayers.firstObject; CGPathRef ip = circlePath(CGPointMake(k, k), k * 0.62);
     in.frame = _knob.bounds; in.path = ip; CGPathRelease(ip);
+    for (int b = 0; b < B_N; b++) pad_cache(_key[b], scale);
+    pad_cache(_ring, scale); pad_cache(_knob, scale);
     [CATransaction commit];
     [self refresh];
 }
@@ -722,7 +733,7 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     if (!_native) { _nring = _nknob = nil; _nknobBase = nil; return; }
     CGFloat g = self.gu;
     _nring = glassDisc(N_RING_R * g, NULL); _nring.position = self.natStickHome; [_nat addSublayer:_nring];
-    CAShapeLayer *kb = nil; _nknob = glassDisc(N_KNOB_R * g, &kb); _nknobBase = kb; _nknob.position = self.natStickHome; [_nat addSublayer:_nknob];
+    CAShapeLayer *kb = nil; _nknob = glassDisc(N_KNOB_R * g, &kb); _nknobBase = kb; _nknob.position = self.natStickHome; [_nat addSublayer:_nknob]; pad_cache(_nring, scale); pad_cache(_nknob, scale);
     static NSString *const sym[B_N] = { [B_A] = @"figure.run", [B_B] = @"xmark", [B_X] = @"chevron.up.2", [B_R] = @"square.grid.2x2", [B_ZL] = @"scope", [B_ZR] = @"figure.archery", [B_PLUS] = @"line.3.horizontal", [B_MINUS] = @"map",
                                         [B_LEFT] = @"music.note", [B_RIGHT] = @"sparkles", [B_UP] = @"chevron.up", [B_DOWN] = @"chevron.down" };   // native_oot.py: Ocarina of Time's actions
     static NSString *const chip[B_N] = { [B_A] = @"A", [B_B] = @"B", [B_X] = @"X", [B_Y] = @"Y", [B_R] = @"R", [B_ZL] = @"ZL", [B_ZR] = @"ZR", [B_PLUS] = @"+", [B_MINUS] = @"\u2212" };
@@ -730,7 +741,7 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
         CAShapeLayer *base = nil; CALayer *d = glassDisc(r, &base); d.position = c;
         if (b == B_Y) glassSword(d, 24 * g); else if (b == B_B) glassWords(d, @"Put\nAway", 9.5 * g, scale); else glassSymbol(d, sym[b], (b == B_A ? 17 : b == B_PLUS || b == B_MINUS || b >= B_LEFT ? 11 : b == B_X ? 14 : b == B_B ? 12 : 15) * g, scale);
         if (b < B_LEFT) glassChip(d, chip[b], b == B_R || b == B_ZL || b == B_ZR, scale);   // the D-pad keys carry their icon alone
-        [_nat addSublayer:d]; _nk[b] = d; _nbase[b] = base;
+        [_nat addSublayer:d]; _nk[b] = d; _nbase[b] = base; pad_cache(d, scale);
     }
 }
 - (void)safeAreaInsetsDidChange { [super safeAreaInsetsDidChange]; [self setNeedsLayout]; }
