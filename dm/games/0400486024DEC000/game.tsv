@@ -74,3 +74,6 @@ link_latency30	2
 # The game submits a frame's commands behind an event its CPU signals once the frame before has left the GPU, so the GPU starts each frame with nothing queued and waits for the
 # replay: with Metal encoding on its own thread a GPU-bound Hyrule Field scene went 55.3-55.8 -> 56.5-56.9 fps (Apple M4 Pro, three runs a side, interleaved)
 enc_thread	on
+# Screen shape (patches.py screen_shape): DM_SCREEN_ASPECT renders the iPhone Duo's 1.43:1 screen in its own shape, the display size's height from the screen's ratio
+# (2560x1792 docked) and the views' vertical angle widened so 16:9's sides stay in view (more above and below); the iOS launcher offers it (Picture shape)
+screen_aspect	on

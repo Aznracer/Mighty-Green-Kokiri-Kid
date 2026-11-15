@@ -41,6 +41,7 @@ def frame_step(ctx):
     emit(0x1e201828); emit(B(here(), site + 4))   # orig: fdiv s8,s1,s0; back
     fs_put(site, [B(site, start)], 'frame ratio: the host\'s step × base rate / 60, or base rate × the measured frame time when that is longer (state +0x38), instead of base rate / the game\'s frame rate (state page target fps; 0 = the game\'s ratio)')
     heap_retry(ctx)   # a full model heap (PR #2497)
+    screen_shape(ctx)   # DM_SCREEN_ASPECT: the iPhone Duo's 1.43:1 picture
 
 
 FRAME_STEP = {'e0f3ccfaf50065ae4ea01eb5aeb13b1a': frame_step}
@@ -110,3 +111,63 @@ def heap_retry(ctx):
     for site, obj, fail in ((0x436f1c, 0x91038360, 0x437be4), (0x437098, 0xaa1503e0, 0x437c04)):            # add x0, x27, #0xe0 / mov x0, x21: the object
         start = stub(heap_gpu_words, site, 0x37000040, {8: obj}, site + 8, fail)
         fs_put(site, [B(site, start)], 'full model heap: GPU memory the heap had no room for is made in its parents or the default heap (Hookshot issue 1697)')
+
+
+# Screen shape (DM_SCREEN_ASPECT, loader.c): a screen taller than 16:9 keeps the picture's width and takes the height of the screen's ratio. State +0x48 the output height
+# at 1920 wide (1344 at 1.43), +0x54 the sites mask (bit 0 sizes, bit 5 field of view), +0x58 the screen's ratio, +0x5c k = (16/9) / ratio, +0x60 the ratio tolerance;
+# all zero unless DM_SCREEN_ASPECT is set, and then every stub runs the original instructions. Found on v131072 with scripts/oot_iphone/oot_aspect_scan.py.
+#
+# Sizes (bit 0). The display size setter (main+0x1087f40, called by the mode update main+0x6502e0 with the mode's size, clamped to the table main+0x3f58540 of 640x480 ..
+# 3840x2160 that main+0x112c5e0 picks from, and by main+0x1087b70) keeps the size at +0x10 and sets a change flag (+0x8 bit 21) when it differs, then maps the
+# requested size to a mode index (+0x18: 0..6, 7 for any other size). The stored size takes the screen's height (width x the output height / 1920: 2560 -> 1792,
+# 1920 -> 1344); the comparison takes the same, so an unchanged mode is not flagged again; the mode index still comes from the requested 16:9 size.
+#
+# Field of view (bit 5). sead::PerspectiveProjection (fovy +0xa0, sin / cos / tan of half of it +0xa4 / +0xa8 / +0xac, aspect +0xb0): a view of the screen's ratio
+# takes 2 atan(tan(fovy / 2) k), so it keeps 16:9's sides and shows more above and below (Breath of the Wild's stub, 01007EF00011E000/patches.py). The widened fovy
+# is stored too (culling), and the last 64 widened are kept at state +0x400 (+0x300 the next slot) so a fovy read back and set again is not widened twice. Each stub
+# replaces the site's call to sinf (the half angle in s0 after it): setFovy_ main+0x3485b70, the constructor main+0x3485bd0, set() main+0xea4ad0 (aspect still in s8),
+# and the two camera updates that copy their parameters (fovy +0x13c, aspect +0x140) into their projection inline (main+0x4c48c0, main+0x2e1b960)
+_SS_SIZE_CMP = [0x29402c2a, 0xd4200020, 0xb9405611, 0x360000d1, 0xb9404a11, 0x34000091, 0x1b117d4b, 0x5280f011, 0x1ad1096b, 0xd4200040]
+#   ldp w10, w11, [x1]; adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #0, 9f; ldr w17, [x16, #0x48]; cbz w17, 9f; mul w11, w10, w17; mov w17, #1920; udiv w11, w11, w17; 9: b back
+_SS_SIZE_STORE = [0xd4200020, 0xb9405611, 0x360000f1, 0xb9404a11, 0x340000b1, 0x1b117d0a, 0x5280f011, 0x1ad1094a, 0xb3607d48, 0xf9000808, 0xd4200040]
+#   adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #0, 9f; ldr w17, [x16, #0x48]; cbz w17, 9f; mul w10, w8, w17; mov w17, #1920; udiv w10, w10, w17; bfi x8, x10, #32, #32
+#   9: str x8, [x0, #0x10]; b back
+_SS_FOV = [0xd4200020, 0xbd405a01, 0x1e202028, 0x54000420, 0xd4200060, 0x1e213842, 0x1e20c042, 0xbd406203, 0x1e232040, 0x5400036a, 0xb9405611, 0x36280331,
+           0xb940a269, 0x9110020a, 0x5280080b, 0xb840454c, 0x6b09019f, 0x54000260, 0x7100056b, 0x54ffff81, 0x1e204100, 0xd4200200, 0xd4200020, 0xbd405e01,
+           0x1e210800, 0xd4200220, 0x1e204008, 0x1e202800, 0xbd00a260, 0xd4200020, 0xb943020b, 0x1200156c, 0x1100056b, 0xb903020b, 0x9110020a, 0xbc2c5940,
+           0x1e204100, 0xd4200240, 0xd4200040]
+#   adrp x16, state; ldr s1, [x16, #0x58]; fcmp s1, #0.0; b.eq 9f; <s2 = the view's ratio>; fsub s2, s2, s1; fabs s2, s2; ldr s3, [x16, #0x60]; fcmp s2, s3; b.ge 9f
+#   ldr w17, [x16, #0x54]; tbz w17, #5, 9f; ldr w9, [P, #0xa0]; add x10, x16, #0x400; mov w11, #64; 1: ldr w12, [x10], #4; cmp w12, w9; b.eq 9f; subs w11, w11, #1; b.ne 1b
+#   fmov s0, H; bl tanf; adrp x16, state; ldr s1, [x16, #0x5c]; fmul s0, s0, s1; bl atanf; fmov H, s0; fadd s0, s0, s0; str s0, [P, #0xa0]
+#   adrp x16, state; ldr w11, [x16, #0x300]; and w12, w11, #63; add w11, w11, #1; str w11, [x16, #0x300]; add x10, x16, #0x400; str s0, [x10, w12, uxtw #2]
+#   9: fmov s0, H; bl sinf; b back        (P = the projection, H = the half angle's register; written for x19 / s8)
+_SINF, _TANF, _ATANF = 0x3c41d50, 0x3c41dd0, 0x3c41e40   # main's PLT stubs (v131072)
+_SS_FOV_SITES = [
+    # (site: its bl sinf, projection register, half angle register, the view's ratio into s2, what)
+    (0x3485b98, 19, 8, 0xbd40b262, 'setFovy_'),                                         # ldr s2, [x19, #0xb0]
+    (0x3485c8c, 19, 8, 0xbd40b262, 'the constructor'),                                  # ldr s2, [x19, #0xb0]
+    (0xea4b00, 19, 9, 0x1e204102, 'set() (aspect in s8)'),                              # fmov s2, s8
+    (0x4c5308, 20, 8, 0xbd414262, 'camera update main+0x4c48c0 (aspect +0x140)'),       # ldr s2, [x19, #0x140]
+    (0x2e1bb40, 23, 8, 0xbd414262, 'camera update main+0x2e1b960 (aspect +0x140)'),     # ldr s2, [x19, #0x140]
+]
+
+
+def screen_shape(ctx):
+    here, emit, fs_site, fs_put, STATE = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
+    def stub(site, orig_word, words, back, why, subst=None):
+        fs_site(site, orig_word.to_bytes(4, 'little').hex())
+        start = here()
+        for w in words:
+            w = (subst or {}).get(w, w)
+            if w == 0xd4200020: w = ADRP(16, here(), STATE)
+            elif w == 0xd4200040: w = B(here(), back)
+            elif w == 0xd4200200: w = BL(here(), _TANF)
+            elif w == 0xd4200220: w = BL(here(), _ATANF)
+            elif w == 0xd4200240: w = BL(here(), _SINF)
+            emit(w)
+        fs_put(site, [B(site, start)], why)
+    stub(0x1087f44, 0x29402c2a, _SS_SIZE_CMP, 0x1087f48, 'display size compared in the screen\'s shape (bit 0)')
+    stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
+    for site, p, h, ratio, what in _SS_FOV_SITES:
+        subst = {0xd4200060: ratio, 0xb940a269: 0xb940a009 | p << 5, 0xbd00a260: 0xbd00a000 | p << 5, 0x1e204100: 0x1e204000 | h << 5, 0x1e204008: 0x1e204000 | h}
+        stub(site, BL(site, _SINF), _SS_FOV, site + 4, f'sead::PerspectiveProjection fovy widened for a view of the screen\'s ratio, {what} (bit 5)', subst)
