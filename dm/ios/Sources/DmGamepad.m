@@ -284,6 +284,17 @@ static void glassWords(CALayer *g, NSString *s, CGFloat size, CGFloat scale) {
     t.shadowColor = UIColor.blackColor.CGColor; t.shadowOpacity = 0.5; t.shadowRadius = 1.5; t.shadowOffset = CGSizeMake(0, 1);
     [g addSublayer:t];
 }
+// DM_PAD_LAYOUT=xbox / playstation (dm_input.h): the touch keys carry that pad's labels (the game's icons: A cross, B circle, X square, Y triangle; L1 / R1 / L2 / R2 or LB / RB / LT / RT)
+static NSString *pad_label(int b, NSString *sw) {
+    switch (dm_pad_face_layout()) {
+    case DM_PAD_LAYOUT_PLAYSTATION:
+        switch (b) { case B_A: return @"\u2715"; case B_B: return @"\u25CB"; case B_X: return @"\u25A1"; case B_Y: return @"\u25B3";
+                     case B_L: return @"L1"; case B_R: return @"R1"; case B_ZL: return @"L2"; case B_ZR: return @"R2"; default: return sw; }
+    case DM_PAD_LAYOUT_XBOX:
+        switch (b) { case B_L: return @"LB"; case B_R: return @"RB"; case B_ZL: return @"LT"; case B_ZR: return @"RT"; case B_LS: return @"LS"; case B_RS: return @"RS"; default: return sw; }
+    default: return sw;
+    }
+}
 static void glassChip(CALayer *g, NSString *t, BOOL square, CGFloat scale) {
     CGFloat r = g.bounds.size.width / 2;
     if (square) {
@@ -339,7 +350,7 @@ static void pad_cache(CALayer *l, CGFloat scale) { if (l && pad_raster()) { l.sh
         static NSString *const names[B_N] = {@"A", @"B", @"X", @"Y", @"L3", @"R3", @"L", @"R", @"ZL", @"ZR", @"+", @"−"};
         for (int b = 0; b < B_N; b++) {
             _key[b] = shape(_controls); _key[b].fillColor = k_kidle[b].CGColor; _key[b].strokeColor = k_kline[b].CGColor;
-            if (names[b]) { _label[b] = label(_key[b], names[b]); _label[b].foregroundColor = k_ktext[b].CGColor; }   // the D-pad arms carry no label
+            if (names[b]) { _label[b] = label(_key[b], pad_label(b, names[b])); _label[b].foregroundColor = k_ktext[b].CGColor; }   // the D-pad arms carry no label
         }
         _nat = [CALayer layer]; [_controls addSublayer:_nat];   // the Native layout's layers, made in layoutSubviews (their sizes follow the screen)
         _menu = [DmMenuButton buttonWithType:UIButtonTypeCustom];
@@ -439,6 +450,7 @@ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPoint
 - (CGFloat)faceR { return K_FACE_R * self.u; }
 - (CGFloat)faceHitR { return MAX(self.faceR * 1.25, _layout.separated ? 22 : 0); }
 - (CGPoint)facePos:(int)b { CGPoint c = self.faceCenter; CGFloat g = self.faceGap;
+    if (dm_pad_labels_mode()) switch (b) { case B_A: b = B_B; break; case B_B: b = B_A; break; case B_X: b = B_Y; break; default: b = B_X; break; }   // Xbox / PlayStation: A bottom, B right, X left, Y top
     switch (b) { case B_A: return CGPointMake(c.x + g, c.y); case B_B: return CGPointMake(c.x, c.y + g); case B_X: return CGPointMake(c.x, c.y - g); default: return CGPointMake(c.x - g, c.y); } }
 - (CGPoint)stickHome {
     if (self.portraitControls) {
@@ -740,7 +752,7 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     for (int i = 0; i < (int)(sizeof k_nat / sizeof *k_nat); i++) { int b = k_nat[i]; CGPoint c; CGFloat r; [self nat:b centre:&c radius:&r];
         CAShapeLayer *base = nil; CALayer *d = glassDisc(r, &base); d.position = c;
         if (b == B_Y) glassSword(d, 24 * g); else if (b == B_B) glassWords(d, @"Put\nAway", 9.5 * g, scale); else glassSymbol(d, sym[b], (b == B_A ? 17 : b == B_PLUS || b == B_MINUS || b >= B_LEFT ? 11 : b == B_X ? 14 : b == B_B ? 12 : 15) * g, scale);
-        if (b < B_LEFT) glassChip(d, chip[b], b == B_R || b == B_ZL || b == B_ZR, scale);   // the D-pad keys carry their icon alone
+        if (b < B_LEFT) glassChip(d, pad_label(b, chip[b]), b == B_R || b == B_ZL || b == B_ZR, scale);   // the D-pad keys carry their icon alone
         [_nat addSublayer:d]; _nk[b] = d; _nbase[b] = base; pad_cache(d, scale);
     }
 }
@@ -773,14 +785,7 @@ static int32_t axis(float v) { return (int32_t)(fmaxf(-1.f, fminf(1.f, v)) * 327
 static void read_pad(GCExtendedGamepad *g) {
     int p = g_merge ? 0 : pad_slot_of(&g_slots, (__bridge const void *)g.controller); if (p < 0) return;
     dm_haptics_apple_controller(p, g.controller);
-    _Static_assert(DM_BTN_A == 1u << B_A && DM_BTN_B == 1u << B_B && DM_BTN_X == 1u << B_X && DM_BTN_Y == 1u << B_Y, "face button bits");
-    uint64_t m = dm_pad_face(g);   // by position, a Nintendo pad by its labels
-    #define K(btn, bit) if (btn.isPressed) m |= 1ull << bit
-    K(g.leftShoulder, B_L); K(g.rightShoulder, B_R); K(g.leftTrigger, B_ZL); K(g.rightTrigger, B_ZR);
-    K(g.buttonMenu, B_PLUS); if (g.buttonOptions) K(g.buttonOptions, B_MINUS);
-    if (g.leftThumbstickButton) K(g.leftThumbstickButton, B_LS); if (g.rightThumbstickButton) K(g.rightThumbstickButton, B_RS);
-    K(g.dpad.left, B_LEFT); K(g.dpad.up, B_UP); K(g.dpad.right, B_RIGHT); K(g.dpad.down, B_DOWN);
-    #undef K
+    uint64_t m = dm_pad_buttons(g);   // by position (Switch layout), or by label (Nintendo pad / DM_PAD_LAYOUT), plus DM_PAD_MAP
     dm_pad_set_player(p, m, axis(g.leftThumbstick.xAxis.value), axis(g.leftThumbstick.yAxis.value), axis(g.rightThumbstick.xAxis.value), axis(g.rightThumbstick.yAxis.value));
 }
 // Home and Capture: without this iOS takes them as system gestures (Home opens the Games overlay, Capture a screenshot); the app gives them no function

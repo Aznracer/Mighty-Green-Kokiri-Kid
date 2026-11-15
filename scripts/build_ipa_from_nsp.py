@@ -2645,12 +2645,29 @@ def mac_host(py, repo, work, env, logs, g):
     PROG.set(step='button-icon font')
     font = work / 'font'; ttf, kf = font / 'nintendo_ext.ttf', font / 'nintendo_ext.key'
     key = fingerprint(('files', [repo / 'dm/tools/make_ext_font.py']))
-    if not (ttf.is_file() and reused(kf, key) is not None):
+    if not (ttf.is_file() and all((font / f'nintendo_ext_{l}.ttf').is_file() for l in ('xbox', 'playstation')) and reused(kf, key) is not None):
         rmtree(kf); font.mkdir(parents=True, exist_ok=True)
         run([py, repo / 'dm/tools/make_ext_font.py', ttf], logs / 'make_ext_font.log', env=env)
+        for l in ('xbox', 'playstation'): run([py, repo / 'dm/tools/make_ext_font.py', '--layout', l, font / f'nintendo_ext_{l}.ttf'], logs / f'make_ext_font_{l}.log', env=env)   # DM_PAD_LAYOUT glyphs
         kf.write_text(f'{key}\n')
     PROG.end(str(host))
     return host, font
+
+
+def mac_pad_overlays(py, repo, work, game, g, env, logs):
+    """For Ocarina of Time (0400486024DEC000), generate overlay_playstation/ and overlay_xbox/ in <id>_build/ from the extracted RomFS so DM_PAD_LAYOUT=playstation|xbox swaps the controller diagrams and external glyph font."""
+    if g.id != '0400486024DEC000' or not (repo / 'scripts/oot_pad_overlay.py').is_file(): return ()
+    romfs = Path(rfs.source(game))
+    if not romfs.exists(): return ()
+    ps, xb, kf = work / 'overlay_playstation', work / 'overlay_xbox', work / 'pad_overlays.key'
+    key = fingerprint(('files', [repo / 'scripts/oot_pad_overlay.py', repo / 'dm/tools/oot_pad_overlay.m',
+                                 repo / 'dm/games/0400486024DEC000/controller_dualsense.png',
+                                 repo / 'dm/games/0400486024DEC000/controller_xbox.png']))
+    if not (ps.is_dir() and xb.is_dir() and reused(kf, key) is not None):
+        rmtree(kf); rmtree(ps); rmtree(xb)
+        run([py, repo / 'scripts/oot_pad_overlay.py', romfs, work], logs / 'oot_pad_overlay.log', env=env)
+        kf.write_text(f'{key}\n')
+    return (ps, xb)
 
 
 def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, env, logs, g, env_file='', partial=False, parts=None, jit=False):
@@ -2659,6 +2676,7 @@ def mac_run(work, game, patched, host, font, msl, aoc, gfx, lang, env, logs, g, 
     c1_full.tsv and cb_extent.tsv are read beside it), the game language, and the switches of an environment file (DM_ENV_FILE / --env-file). partial (--seen-shaders): the pipeline bases go into an
     archive of their own, as the prebuild's stamp does not name the library (the whole library would find its bases done), and the command keeps its log, which the next partial build reads.
     parts: a dict that gets the command's parts (a multi-program application's programs.tsv, mac_programs). jit: what the game's nn::jit plugin makes in play goes to jit_capture/play, for the iPhone's image (capture_jit)"""
+    mac_pad_overlays(sys.executable, host.parents[2] if (host.parents[2] / 'scripts/oot_pad_overlay.py').is_file() else find_repo(Path(__file__).resolve()), work, game, g, env, logs)
     rd = work / 'run'
     for d in ('save', 'temp'): (rd / d).mkdir(parents=True, exist_ok=True)
     renv = {'DM_ROOT': work, 'DM_ROMFS': rfs.source(game), 'DM_SAVE': rd / 'save', 'DM_TEMP': rd / 'temp', 'DM_MSL_DIR': msl, 'DM_FONT_DIR': font}
@@ -2786,6 +2804,7 @@ def mac_app(py, repo, out, app, work, game, patched, host, font, msl, aoc, gfx, 
                    ('--env-file', Path(os.path.expanduser(env_file)).resolve() if env_file else None), ('--settings', settings)):
         if v: cmd += [opt, v]
     for n, r in (programs or {}).items(): cmd += ['--program', f'{n}\t{r["patched"]}\t{r["romfs"]}\t{r["msl"]}\t{r["tables"]}\t{r["html"]}']
+    for ov in mac_pad_overlays(py, repo, work, game, g, env, logs): cmd += ['--overlay', ov]
     if (game / 'html').is_dir(): cmd += ['--html', game / 'html']
     unchanged = False
     def line(ln):

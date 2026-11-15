@@ -108,6 +108,8 @@ dm/gfx/nvn/msl_image.h	*:*	reads each shader from the one-file library: every NV
 dm/tools/shader_lib.py	*:*	the shader libraries as one file: every NVN game build and regress chain
 dm/tools/shader_cache.py	*:*	the compile cache as one file: every NVN game build and regress chain
 dm/tools/tree_tar.py	*:*	one tar in place of Xcode's derived data and quiet work folders: every game build
+dm/tools/oot_pad_overlay.m	hle:*fs*	Ocarina of Time controller diagram and callout texture overlay generator
+scripts/oot_pad_overlay.py	hle:*fs*	Ocarina of Time PlayStation and Xbox controller RomFS overlay generator
 dm/tools/nro_collect.py	*:*	NRO discovery from game resources during packing
 dm/tools/nx_extract/*	*:*	NSP extraction: every game's resource inputs
 dm/mac/launcher.c	*:*	Mac app resource discovery and host launch
@@ -143,6 +145,9 @@ dm/host/front_mac.m	present:*	the Mac front end
 dm/host/dm_input.h	hle:*hid*	the shared input interface
 dm/host/motion_apple.h	hle:*SixAxisSensor*	controller motion supplied by GameController
 dm/host/pad_apple.h	hle:*hid*	controller face buttons from GameController
+dm/host/pad_hid.h	hle:*hid*	controller layout mapping and physical HID input
+dm/tools/make_ext_font.py	*:*	shared-font button icons: every game's Mac and iOS build
+dm/tools/make_shared_fonts.py	*:*	shared-font stand-ins: every game's Mac and iOS build
 dm/host/motion_fusion.h	hle:*SixAxisSensor*	six-axis motion mapping and orientation
 dm/host/motion_pro.h	hle:*SixAxisSensor*	passive Switch Pro Controller IMU decoder
 dm/host/motion_pro_mac.h	hle:*SixAxisSensor*	Mac Pro Controller raw motion transport and routing
