@@ -141,6 +141,23 @@ _SS_FOV = [0xd4200020, 0xbd405a01, 0x1e202028, 0x54000420, 0xd4200060, 0x1e21384
 #   fmov s0, H; bl tanf; adrp x16, state; ldr s1, [x16, #0x5c]; fmul s0, s0, s1; bl atanf; fmov H, s0; fadd s0, s0, s0; str s0, [P, #0xa0]
 #   adrp x16, state; ldr w11, [x16, #0x300]; and w12, w11, #63; add w11, w11, #1; str w11, [x16, #0x300]; add x10, x16, #0x400; str s0, [x10, w12, uxtw #2]
 #   9: fmov s0, H; bl sinf; b back        (P = the projection, H = the half angle's register; written for x19 / s8)
+# The layout space (bits 8..16, one per site, DM_SCREEN_ASPECT_SITES to try them apart). The game's 2D screens (HUD, menus, the map, the save list) lay out in a 1280x720
+# space that is stretched to the picture: on the taller picture they came out 1.24 times as tall (iPhone Duo, 2026-11-15: the map and Link in the equipment screen).
+# Each site where the game builds 720 beside 1280 takes the layout height instead (state +0x4c u32, +0x50 the same as a float: 896 at 1.43), so the layouts keep
+# their shape, centred. Every stub runs the site's own instruction first and keeps x16 / x17 (pushed below sp) since some of these functions use them
+_SS_LAYOUT = [
+    # (site, the site's instruction, the layout height as float (+0x50) or u32 (+0x4c), the instruction that puts it in place, bit, what)
+    (0xea4720, 0xf2e88689, 0x50, 0xb3607e29, 8, 'a view\'s 1280x720 screen size (+0x48) and the aspect its constructor gives its projection'),   # movk x9 / bfi x9
+    (0x66e588, 0xf2e88689, 0x50, 0xb3607e29, 9, 'the 1280.0x720.0 screen size written into a uniform block each frame'),                      # movk x9 / bfi x9
+    (0xf6f4d0, 0xf2e88688, 0x50, 0xb3607e28, 10, 'a 0,0,1280,720 rect (+0x30) of a constructor'),                                             # movk x8 / bfi x8
+    (0x12030a0, 0xf2e88688, 0x50, 0xb3607e28, 11, '1280.0x720.0 passed to main+0x346be50 at start-up'),                                       # movk x8 / bfi x8
+    (0x369a44c, 0xf2c05a17, 0x4c, 0xb3607e37, 12, 'the 1280x720 size (+0x270) of each of a list of layers'),                                 # movk x23 / bfi x23
+    (0x369a450, 0xf2e88698, 0x50, 0xb3607e38, 12, 'the 1280.0x720.0 sizes (+0x118, +0x124) of each of that list'),                            # movk x24 / bfi x24
+    (0x27be170, 0x52a88688, 0x50, 0x2a1103e8, 13, 'the 0,0,1280,720 viewport rect of a camera calculation (main+0x27be140)'),                # mov w8 / mov w8, w17
+    (0x2dd7148, 0x52a88689, 0x50, 0x2a1103e9, 14, 'a 2D camera\'s 1280/720 aspect (main+0x2dd2fd0)'),                                        # mov w9 / mov w9, w17
+    (0x377b35c, 0x52a88689, 0x50, 0x2a1103e9, 15, 'a position divided by 720 (main+0x377b260)'),                                             # mov w9 / mov w9, w17
+    (0xdbb42c, 0x52805a02, 0x4c, 0x2a1103e2, 16, 'a 1280x720 render target made at start-up (main+0xdbab00)'),                               # mov w2 / mov w2, w17
+]
 _SINF, _TANF, _ATANF = 0x3c41d50, 0x3c41dd0, 0x3c41e40   # main's PLT stubs (v131072)
 _SS_FOV_SITES = [
     # (site: its bl sinf, projection register, half angle register, the view's ratio into s2, what)
@@ -168,6 +185,10 @@ def screen_shape(ctx):
         fs_put(site, [B(site, start)], why)
     stub(0x1087f44, 0x29402c2a, _SS_SIZE_CMP, 0x1087f48, 'display size compared in the screen\'s shape (bit 0)')
     stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
+    for site, orig, off, apply, bit, what in _SS_LAYOUT:
+        words = [orig, 0xa9bf47f0, 0xd4200020, 0xb9405611, 0x36000091 | bit << 19, 0xb9400211 | (off // 4) << 10, 0x34000051, apply, 0xa8c147f0, 0xd4200040]
+        #        orig; stp x16, x17, [sp, #-16]!; adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #bit, 9f; ldr w17, [x16, #off]; cbz w17, 9f; apply; 9: ldp x16, x17, [sp], #16; b back
+        stub(site, orig, words, site + 4, f'layout space 1280 x the layout height: {what} (bit {bit})')
     for site, p, h, ratio, what in _SS_FOV_SITES:
         subst = {0xd4200060: ratio, 0xb940a269: 0xb940a009 | p << 5, 0xbd00a260: 0xbd00a000 | p << 5, 0x1e204100: 0x1e204000 | h << 5, 0x1e204008: 0x1e204000 | h}
         stub(site, BL(site, _SINF), _SS_FOV, site + 4, f'sead::PerspectiveProjection fovy widened for a view of the screen\'s ratio, {what} (bit 5)', subst)
