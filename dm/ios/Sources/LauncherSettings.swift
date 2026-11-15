@@ -116,9 +116,9 @@ final class LauncherModel: ObservableObject {
         let pad = GCController.controllers().contains { $0.extendedGamepad != nil }
         let touch = style == "touch" || (style == "auto" && !pad)
         let why = style == "auto" ? (pad ? " (controller connected)" : " (no controller)") : ""
-        let t15 = touch && getenv("DM_TOUCH_FPS").map { String(cString: $0) == "15" } == true   // touch15.py: 15 fps + frame generation
-        fputs("launcher: play style \(style)\(why): \(t15 ? "touch, 15 fps with frame generation (DM_TOUCH_FPS=15)" : touch ? "touch, frame generation off" : "controller, settings as set")\n", stderr)
-        if t15 { setenv("DM_FPS_TARGET", "15", 1); setenv("DM_FRAMEGEN", "1", 1) }
+        let t20 = touch && getenv("DM_TOUCH_FPS").map { String(cString: $0) == "20" } == true   // touch20.py: 20 fps + frame generation
+        fputs("launcher: play style \(style)\(why): \(t20 ? "touch, 20 fps with frame generation (DM_TOUCH_FPS=20)" : touch ? "touch, frame generation off" : "controller, settings as set")\n", stderr)
+        if t20 { setenv("DM_FPS_TARGET", "20", 1); setenv("DM_FRAMEGEN", "1", 1) }
         else if touch { setenv("DM_FRAMEGEN", "0", 1) }
 #endif
     }

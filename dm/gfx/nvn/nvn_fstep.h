@@ -51,7 +51,7 @@ static inline float nvn_fdelta_next(nvn_fdelta *f, uint64_t now_ns) {
     return mean * 60 < 1.01 ? 0.0f : (float)fmin(mean, 4.0 / 60);
 }
 
-#define FSTEP_MAX 4           // the largest step: 4 only at a 15 fps cap (touch15.py: DM_FPS_TARGET=15, Ocarina of Time's touch play), where every frame is held 4
+#define FSTEP_MAX 3           // the largest step (touch20.py: a 20 fps cap holds every frame 3)
 #define FSTEP_TOP 3           // the largest step at a 30 or 60 fps cap: both games' own interval logic uses 1–3 (BotW clamps to [2, 3], TOTK picks 2 or 3), so their integer readers never see 4
 #define FSTEP_LATE 0.1        // a frame is late when it or its GPU work took this many vsyncs (1.7 ms) more than k: 53 fps is not 60 (start-to-start jitter on time is well below)
 #define FSTEP_FIT 0.85        // a frame would fit k − 1 when its cost is at most this share of it
