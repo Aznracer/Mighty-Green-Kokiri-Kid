@@ -277,8 +277,8 @@ MAPS+=("$P/msl/$MSLDIR=$MSL_IOS/$MSLDIR" "$P=$APP")
   if [ -d "$(dirname "$ROMFS")/html" ]; then MAPS+=("$P/html=$(dirname "$ROMFS")/html"); t "offline HTML pages: $(dirname "$ROMFS")/html"; fi   # beside its RomFS, where the host finds them (hle_web.c)
   if [ -d "$(dirname "$ROMFS")/jit" ]; then MAPS+=("$P/jit=$(dirname "$ROMFS")/jit"); t "nn::jit image: $(dirname "$ROMFS")/jit"; fi
   if [ "$GAME" = "0400486024DEC000" ] && [ -e "$ROMFS" ] && [ -f "$(dirname "$DM")/scripts/oot_pad_overlay.py" ]; then
-    if [ ! -d "$O/overlays/overlay_playstation" ] || [ ! -d "$O/overlays/overlay_xbox" ]; then
-      mkdir -p "$O/overlays" && "${FONT_PY:-python3}" "$(dirname "$DM")/scripts/oot_pad_overlay.py" "$ROMFS" "$O/overlays" || die "oot_pad_overlay"
+    if [ ! -f "$O/overlays/done" ]; then   # done: written only after both folders are whole (a failed run leaves the font without the textures)
+      rm -rf "$O/overlays" && mkdir -p "$O/overlays" && "${FONT_PY:-python3}" "$(dirname "$DM")/scripts/oot_pad_overlay.py" "$ROMFS" "$O/overlays" && touch "$O/overlays/done" || die "oot_pad_overlay"
     fi
     MAPS+=("$P/dm/overlay_playstation=$O/overlays/overlay_playstation" "$P/dm/overlay_xbox=$O/overlays/overlay_xbox"); t "controller layout overlays: $O/overlays"   # beside dm/font, where pad_layout_env finds them
   fi
