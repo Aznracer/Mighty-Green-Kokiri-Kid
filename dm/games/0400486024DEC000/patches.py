@@ -159,6 +159,16 @@ _SS_LAYOUT = [
     (0xdbb42c, 0x52805a02, 0x4c, 0x2a1103e2, 16, 'a 1280x720 render target made at start-up (main+0xdbab00)'),                               # mov w2 / mov w2, w17
 ]
 _SINF, _TANF, _ATANF = 0x3c41d50, 0x3c41dd0, 0x3c41e40   # main's PLT stubs (v131072)
+# The game's view at 16:9 (bit 18). The camera updates main+0x4c48c0 and main+0x2e1b960 copy the game camera's fovy (+0x13c) and aspect (+0x140) into the view's
+# projection; the aspect stayed 16:9 on the taller screen (bit 5 never widened: the log's "fovy widened 0"), so the game's view came out 1.24 times as tall (iPhone
+# Duo, 2026-11-15: the Hylian Shield from behind 0.71 wide for its height at 1.43 against 0.89 at 16:9). Before those two sites' bit 5 stub, a camera aspect within
+# 0.02 of 16/9 takes the screen's ratio (state +0x58; counted at +0x5ec, logged by hle_nvn.c), so bit 5 widens the fovy (16:9's sides kept) and the projection is
+# built for the screen. At the bl sinf s2 / s3 and x16 / x17 are free
+_SS_CAM_ASPECT = [0xd4200020, 0xb9405611, 0x36900271, 0xbd405a02, 0x1e202048, 0x54000200, 0xbd414262, 0x5291c731, 0x72a7fc71, 0x1e270223, 0x7ea3d442, 0x529ae151,
+                  0x72a79471, 0x1e270223, 0x1e232040, 0x540000cc, 0xbd405a02, 0xbd014262, 0xb945ee11, 0x11000631, 0xb905ee11]
+# adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #18, 9f; ldr s2, [x16, #0x58]; fcmp s2, #0.0; b.eq 9f; ldr s2, [x19, #0x140]; |s2 - 16/9| > 0.02: 9f;
+# ldr s2, [x16, #0x58]; str s2, [x19, #0x140]; [x16 + 0x5ec] += 1; 9: (the bit 5 stub)
+
 _SS_FOV_SITES = [
     # (site: its bl sinf, projection register, half angle register, the view's ratio into s2, what)
     (0x3485b98, 19, 8, 0xbd40b262, 'setFovy_'),                                         # ldr s2, [x19, #0xb0]
@@ -212,4 +222,5 @@ def screen_shape(ctx):
         stub(site, orig, words, site + 4, f'layout space 1280 x the layout height: {what} (bit {bit})')
     for site, p, h, ratio, what in _SS_FOV_SITES:
         subst = {0xd4200060: ratio, 0xb940a269: 0xb940a009 | p << 5, 0xbd00a260: 0xbd00a000 | p << 5, 0x1e204100: 0x1e204000 | h << 5, 0x1e204008: 0x1e204000 | h}
-        stub(site, BL(site, _SINF), _SS_FOV, site + 4, f'sead::PerspectiveProjection fovy widened for a view of the screen\'s ratio, {what} (bit 5)', subst)
+        pre = _SS_CAM_ASPECT if site in (0x4c5308, 0x2e1bb40) else []   # the game camera's aspect: 16:9 becomes the screen's ratio first (bit 18)
+        stub(site, BL(site, _SINF), pre + _SS_FOV, site + 4, f'sead::PerspectiveProjection fovy widened for a view of the screen\'s ratio, {what} (bit 5{", 18" if pre else ""})', subst)
