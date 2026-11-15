@@ -246,6 +246,16 @@ static NSError *gpu_lost_test_error(void) {
 }
 
 static pthread_mutex_t g_res_mu = PTHREAD_MUTEX_INITIALIZER;   // Dedicated lock for the residency set: res_add is called on paths that hold g_mu (arena_new), so it cannot share g_mu
+// port2715.py, upstream #2715: DM_RES_CB=1 keeps g_res off both queues and names it on every command buffer (useResidencySet just before endCommandBuffer,
+// a classic command buffer when it is made), under g_res_mu as the queue commits are. Upstream: the driver's wiring state in 10 of 20 OoT launches without it, 0 of 20 with it
+static int g_res_cb; static _Atomic uint64_t g_res_cb_uses, g_res_cb_ns, g_res_cb_max;
+static void res_use(id cb) {
+    uint64_t t0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+    pthread_mutex_lock(&g_res_mu); [cb useResidencySet:g_res]; pthread_mutex_unlock(&g_res_mu);
+    uint64_t d = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - t0, mx = atomic_load(&g_res_cb_max);
+    atomic_fetch_add(&g_res_cb_ns, d); atomic_fetch_add(&g_res_cb_uses, 1);
+    while (d > mx && !atomic_compare_exchange_weak(&g_res_cb_max, &mx, d)) {}
+}
 // Wait ledger (DM_NVN_WAITS=1): every place a thread of the host or the game waits on the CPU for the GPU or for the encode thread, counted per frame (calls, calls that blocked,
 // the time they blocked) and logged every 300 frames with the frame's GPU idle. The game's own SyncWait is split by how far its fence is behind the newest one (0: the last submission)
 enum { WS_SYNC, WS_SYNC_NEWEST, WS_SYNC_POLL, WS_ACQ, WS_FINISH, WS_ALLOC, WS_VIS, WS_PG, WS_MDI, WS_READTEX, WS_T2T, WS_DIAG, WS_SNAP, WS_UPZERO, WS_UPALLOC, WS_DRAIN, WS_UBC, WS_OLDQ, WS_POST, WS_N };
@@ -434,7 +444,8 @@ void mtl_res_stats(char *out, size_t n) {
     size_t o = snprintf(out, n, "commits %llu / %.1f ms, added %llu, %.0f MB (", (unsigned long long)g_rs_commits, g_rs_commit_ns / 1e6, (unsigned long long)tn, tb / 1048576.0);
     for (int i = 0; i < 4 && o < n; i++) { int best = -1; for (int k = 0; k < RS_SITES; k++) if (g_rs_site[k].n && (best < 0 || g_rs_site[k].bytes > g_rs_site[best].bytes)) best = k;
         if (best < 0) break; o += snprintf(out + o, n - o, "%sline %d: %llu, %.0f MB", i ? ", " : "", g_rs_site[best].line, (unsigned long long)g_rs_site[best].n, g_rs_site[best].bytes / 1048576.0); g_rs_site[best].n = 0; }
-    if (o < n) snprintf(out + o, n - o, "), removed %llu, %lu allocations in the set (%.0f MB)", (unsigned long long)g_rs_rm, g_res ? (unsigned long)g_res.allocationCount : 0ul, g_res ? g_res.allocatedSize / 1048576.0 : 0.0);
+    if (o < n) o += snprintf(out + o, n - o, "), removed %llu, %lu allocations in the set (%.0f MB)", (unsigned long long)g_rs_rm, g_res ? (unsigned long)g_res.allocationCount : 0ul, g_res ? g_res.allocatedSize / 1048576.0 : 0.0);
+    if (g_res_cb && o < n) snprintf(out + o, n - o, ", named on %llu command buffers in %.2f ms, longest %.2f ms (DM_RES_CB)", (unsigned long long)atomic_exchange(&g_res_cb_uses, 0), atomic_exchange(&g_res_cb_ns, 0) / 1e6, atomic_exchange(&g_res_cb_max, 0) / 1e6);
     memset(g_rs_site, 0, sizeof g_rs_site); g_rs_rm = g_rs_commits = g_rs_commit_ns = 0;
     pthread_mutex_unlock(&g_res_mu);
 }
@@ -824,8 +835,9 @@ void mtl_init(void) {
     // BC textures are created and uploaded as BC, with no decompression path (dm/gfx/tex/README.md); without BC the first one aborts in Metal's descriptor validation mid-game
     // (GitHub issue #704: an iPhone 15, A16). The iOS front end refuses such a device before the launcher (main.m); this stops every other route at the device, with the reason
     if (!g_dev.supportsBCTextureCompression) MDIE("the Metal device %s has no BC texture formats, which the games' textures use and the host does not decompress: an iPhone needs an A17 Pro or later, an iPad an M1 or later", g_dev.name.UTF8String);
-    [g_q addResidencySet:g_res];
-    [g_q4 addResidencySet:g_res];
+    { const char *rc = getenv("DM_RES_CB"); g_res_cb = rc && atoi(rc) == 1; }   // port2715.py
+    if (g_res_cb) MLOG("residency set: named on each command buffer, not attached to the queues (DM_RES_CB=1)");
+    else { [g_q addResidencySet:g_res]; [g_q4 addResidencySet:g_res]; }
     { void crash_set_wait_dump(void (*fn)(void)); void mtl_wait_state_dump(void); crash_set_wait_dump(mtl_wait_state_dump); }
     g_alloc_n = 3;
     for (int i = 0; i < 3; i++) {
@@ -1562,7 +1574,7 @@ static void up_owner_check(const char *where) {
 // Old-queue command buffers (readback / diagnostics / present; to be deleted once M4-4 and M4-5 are migrated away): uploads are already on the Metal 4 queue, and there is no ordering guarantee between the two queues -
 // wait for the upload to complete after flushing it, and only then can the old queue read the upload result (mtl_read_texels waited first and flushed afterwards, the readback beat the upload, 4 failures on t_nvn upload content)
 static void up_wait_zero(_Atomic int *v, int site);
-static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); rec_drain(); up_wait_zero(&g_up_pending, WS_OLDQ); } return [g_q commandBuffer]; }
+static id<MTLCommandBuffer> q_cb(void) { if (on_sub_thread()) { up_flush(); rec_drain(); up_wait_zero(&g_up_pending, WS_OLDQ); } id<MTLCommandBuffer> cb = [g_q commandBuffer]; if (g_res_cb) res_use(cb); return cb; }
 static post_op *g_post; static int g_npost, g_postcap;
 // One autorelease pool per submission: submissions run on a guest thread (long-lived, no run loop, never drains the implicit pool), so objects autoreleased in the Metal replay
 // (command buffers, encoders, pass descriptors, etc.) are never released unless put in a pool. Measured on the character select screen of a real iOS device: the host heap grows by about 47 objects per frame, 0.22 MiB/s.
@@ -2871,6 +2883,7 @@ uint64_t mtl_sub_commit(void) {
     res_commit();
     if (g_gp_state == 1 && !gp_active()) { int gn = g_gp_n; gp_lab *gl = malloc(sizeof(gp_lab) * (gn ? gn : 1)); memcpy(gl, g_gp_lab, sizeof(gp_lab) * gn); uint64_t gf = g_gp_frame; g_gp_state = 2; atomic_store(&g_gp_busy, 1);
         [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) { (void)f; gp_report(gn, gl, gf); }]; }
+    if (g_res_cb && !rec_on()) res_use(g_cb);
     [g_cb endCommandBuffer];
     rec_commit(g_cb, o);
     if (!lost_test) rec_signal(g_ev, fence);
@@ -3897,6 +3910,7 @@ static void up_flush(void) {
         up_wake();
     }];
     res_commit();
+    if (g_res_cb) res_use(cb);
     [cb endCommandBuffer];
     rec_commit_upload(cb, o);
     // Outside a submission nothing else hands the encode thread its current block until the next submission, so a batch flushed on the spot stayed a record and every wait for it
@@ -10696,7 +10710,7 @@ static id<MTLTexture> dummy_tex(int dtt, int dpf) {
         MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
         if (dpf == NVN_DPF_DEPTH) { rp.depthAttachment.texture = t; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.clearDepth = 0; rp.depthAttachment.storeAction = MTLStoreActionStore; }
         else { rp.colorAttachments[0].texture = t; rp.colorAttachments[0].loadAction = MTLLoadActionClear; rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0); rp.colorAttachments[0].storeAction = MTLStoreActionStore; }
-        id<MTLCommandBuffer> cb = [g_q commandBuffer]; [[cb renderCommandEncoderWithDescriptor:rp] endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        id<MTLCommandBuffer> cb = [g_q commandBuffer]; if (g_res_cb) res_use(cb); [[cb renderCommandEncoderWithDescriptor:rp] endEncoding]; [cb commit]; [cb waitUntilCompleted];
         cache[dtt % DMY_NT][dpf & 3] = t; g_dummy_tex_rid[dtt % DMY_NT][dpf & 3] = t.gpuResourceID._impl; res_add(t);
         return t;
     }
@@ -14014,6 +14028,7 @@ static void mdi_wait(void) {
     if (g_blit) { enc_b_end(g_blit); g_blit = nil; }
     up_flush(); gmem_commit_patch(); /* PR #2330: pool table words before this mid-submission commit, as at sub_cut */ res_commit();
     cbn_entry cbn = cbn_close('w', g_seg, g_fence + 1);   // a command buffer of its own: the draws before the wait are not the next segment's
+    if (g_res_cb && !rec_on()) res_use(g_cb);
     [g_cb endCommandBuffer];
     MTL4CommitOptions *o = [MTL4CommitOptions new]; [o addFeedbackHandler:^(id<MTL4CommitFeedback> cb) { cbn_failed(&cbn, cb.error); }];
     rec_commit(g_cb, o);
@@ -15914,6 +15929,7 @@ static void sub_cut(void) {
     }];
     gmem_commit_patch();
     res_commit();
+    if (g_res_cb && !rec_on()) res_use(g_cb);
     [g_cb endCommandBuffer];
     rec_commit(g_cb, o);
     if (rec_on()) rec_publish();   // the segment reaches the encode thread now, not when its block of records fills
@@ -17078,6 +17094,7 @@ static int present_offscreen_m4(id<MTLTexture> src, const int crop[4], id<MTLTex
     res_add(out); res_add(uvb); res_commit();
     [cb beginCommandBufferWithAllocator:al];
     int kind = present_encode_m4(cb, raw, out, crop, uvb, &fx);
+    if (g_res_cb) res_use(cb);
     [cb endCommandBuffer];
     if (!kind) { res_remove(out); res_remove(uvb); res_remove(fx.in); res_remove(fx.out); return 0; }
     MTL4CommitOptions *options = [MTL4CommitOptions new];
@@ -17212,6 +17229,7 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
     int kind = present_encode_m4(cb, src, dr.texture, crop, g_present_uv[alloc_i], &g_fx_present);
     if (!kind) { [cb endCommandBuffer]; [g_q4 signalDrawable:dr]; return 0; }
     int fx_kind = kind == PRESENT_METALFX;
+    if (g_res_cb) res_use(cb);
     [cb endCommandBuffer];
     MTL4CommitOptions *o = [MTL4CommitOptions new];
     [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
@@ -18005,6 +18023,7 @@ static uint64_t snap_take(const tex_t *t, double period, const int crop[4], int 
         if (fg_mv_on()) fg_luma(cb, k);
         if (period > 0.025 && !atomic_load(&g_fg_shed)) fg_encode(cb, k, pk, period); else { g_fg_warm = 0; if (period > 0.025) g_fg_shed_frames++; }
     }
+    if (g_res_cb) res_use(cb);
     [cb endCommandBuffer];
     MTL4CommitOptions *o = nil;
     if (g_snap[k].gen_ok && g_fg_heap) {
