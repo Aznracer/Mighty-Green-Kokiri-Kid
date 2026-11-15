@@ -169,21 +169,23 @@ _SS_FOV_SITES = [
 ]
 
 
-# 16:9 projections (bit 17). The menus, the HUD and the menus' 3D models are drawn through projections of their own fixed at 16:9 (aspect +0xb0 1.778 whatever the
-# screen), so on the taller screen they came out 1.24 times as tall (iPhone Duo, 2026-11-15: the map, the save list, Link in the equipment screen). At the return of
-# sead::PerspectiveProjection::doUpdateMatrix (main+0x3485cc0, the 4x4 row-major at x1: y row +0x10..+0x1c) a projection within 1 % of 16:9 has its y row divided
-# by k (state +0x5c, (16/9) / ratio): its picture keeps its shape and 16:9's sides, centred, with more above and below. The game's own view (aspect the screen's
-# ratio, bit 5's widened fovy) is not 16:9 and is left alone. Leaf function: s2..s6 and x16 / x17 are free
-_SS_PERSP16 = [0xd4200020, 0xb9405611, 0x368802b1, 0xbd405e02, 0x1e202048, 0x54000240, 0xbd40b003, 0x5291c731, 0x72a7fc71, 0x1e270224, 0x7ea4d465, 0x529ae151,
-               0x72a78471, 0x1e270226, 0x1e260886, 0x1e2620a0, 0x540000ec, 0xbd401423, 0x1e221863, 0xbd001423, 0xbd401823, 0x1e221863, 0xbd001823, 0xd65f03c0]
-# Before it, while DM_SCREEN_ASPECT is on, each build of a projection is counted (state +0x5f4) and its aspect / tan(half fovy) / near kept in a table of the first
-# 15 different ones (+0x500, 16 bytes each with a count at +0xc; +0x5f0 how many, +0x5f8 'PORJ'), which hle_nvn.c logs every 300 frames: which projections the
-# menus and the game's view are, and whether this function builds them at all
-_SS_PROJ_LOG = [0xd4200020, 0xb9404a09, 0x340003e9, 0x5289ea09, 0x72a94a49, 0xb905fa09, 0xb945f609, 0x11000529, 0xb905f609, 0xb940b00a, 0xb940ac0b, 0xb945f20c,
-                0x9114020d, 0x5280000e, 0x6b0c01df, 0x5400010a, 0x294025af, 0x6b0a01ff, 0x7a4b0120, 0x54000160, 0x910041ad, 0x110005ce, 0x17fffff8, 0x71003d9f,
-                0x5400012a, 0xb9409809, 0x29002daa, 0x29017da9, 0x1100058c, 0xb905f20c, 0xb9400da9, 0x11000529, 0xb9000da9]
-# adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #17, 9f; ldr s2, [x16, #0x5c]; fcmp s2, #0.0; b.eq 9f; ldr s3, [x0, #0xb0]; s4 = 16/9; fabd s5, s3, s4;
-# s6 = s4 x 0.01; fcmp s5, s6; b.gt 9f; [x1 + 0x14] /= s2; [x1 + 0x18] /= s2; 9: ret
+# 16:9 projections (bit 17). The menus, the HUD, the menus' 3D models (and any view the game keeps at 16:9) are projections fixed at 16:9, so on the taller screen
+# they came out 1.24 times as tall (iPhone Duo, 2026-11-15: the map, the save list, Link in the equipment screen). sead::Projection's matrix update is inlined:
+# main+0x23b910 (38 callers) and a copy in main+0x4ec60 check the doUpdateMatrix slot (+0x58) against the perspective (main+0x3485cc0), orthographic (main+0x3486000)
+# and set-matrix ones and build the 4x4 (row-major at +0xc) in place, so the virtual itself never runs. Where every kind joins (mov w8, #0x100 before the dirty
+# flags: main+0x23ba44 with the projection in x0, main+0x4f0ac with it in x21), a matrix of 16:9's shape (|m5| / |m0| within 0.05 of 16/9; perspective m5 / m0 is
+# its aspect, orthographic its width / height) has its y row (+0x1c..+0x28) divided by k (state +0x5c, (16/9) / ratio): its picture keeps its shape and 16:9's
+# sides, centred, with more above and below. Once divided it is no longer 16:9's shape, so a matrix copied into another projection is not divided twice; the game's
+# own view (the screen's ratio, bit 5) is not 16:9 either. While DM_SCREEN_ASPECT is on each update is counted (state +0x5f4) and the first 15 different m0 / m5
+# pairs kept (+0x500, 16 bytes: m0, m5, divided, count; +0x5f0 how many, +0x5f8 'PORJ'), which hle_nvn.c logs every 300 frames. x9..x14 are saved, s0..s7 free
+_SS_PROJ_X0 = [
+    0xd4200020, 0xb9404a11, 0x34000931, 0xa9bd2be9, 0xa90133eb, 0xa9023bed, 0xbd400c00, 0xbd402001, 0x1e20c002, 0x1e20c023, 0x1e202048, 0x540007a0, 0x1e221864,
+    0x5291c731, 0x72a7fc71, 0x1e270225, 0x7ea5d486, 0x529999b1, 0x72a7a991, 0x1e270227, 0x1e2720c0, 0x1a9f87e9, 0xb9405611, 0x53114631, 0x0a110129, 0x5289ea11,
+    0x72a94a51, 0xb905fa11, 0xb945f611, 0x11000631, 0xb905f611, 0x1e26000a, 0x1e26002b, 0xb945f20c, 0x9114020d, 0x5280000e, 0x6b0c01df, 0x5400014a, 0xb94001b1,
+    0x6b0a023f, 0x54000081, 0xb94005b1, 0x6b0b023f, 0x54000140, 0x910041ad, 0x110005ce, 0x17fffff6, 0x71003d9f, 0x5400010a, 0x29002daa, 0x29017da9, 0x1100058c,
+    0xb905f20c, 0xb9400db1, 0x11000631, 0xb9000db1, 0x34000209, 0xbd405e05, 0x1e2020a8, 0x540001a0, 0xbd401c00, 0x1e251800, 0xbd001c00, 0xbd402000, 0x1e251800,
+    0xbd002000, 0xbd402400, 0x1e251800, 0xbd002400, 0xbd402800, 0x1e251800, 0xbd002800, 0xa9423bed, 0xa94133eb, 0xa8c32be9, 0x52802008, 0xd4200040]
+_SS_PROJ_X21 = [w | 21 << 5 if w & 0xffc00000 in (0xbd400000, 0xbd000000) and (w >> 5) & 31 == 0 else w for w in _SS_PROJ_X0]   # the same with the projection in x21
 
 
 def screen_shape(ctx):
@@ -202,7 +204,8 @@ def screen_shape(ctx):
         fs_put(site, [B(site, start)], why)
     stub(0x1087f44, 0x29402c2a, _SS_SIZE_CMP, 0x1087f48, 'display size compared in the screen\'s shape (bit 0)')
     stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
-    stub(0x3485d60, 0xd65f03c0, _SS_PROJ_LOG + _SS_PERSP16, None, 'sead::PerspectiveProjection::doUpdateMatrix: a 16:9 projection keeps its shape on the taller screen, y row / k (bit 17)')
+    stub(0x23ba44, 0x52802008, _SS_PROJ_X0, 0x23ba48, 'sead::Projection matrix update (inlined): a 16:9 matrix keeps its shape on the taller screen, y row / k (bit 17)')
+    stub(0x4f0ac, 0x52802008, _SS_PROJ_X21, 0x4f0b0, 'sead::Projection matrix update (inlined copy): a 16:9 matrix keeps its shape on the taller screen, y row / k (bit 17)')
     for site, orig, off, apply, bit, what in _SS_LAYOUT:
         words = [orig, 0xa9bf47f0, 0xd4200020, 0xb9405611, 0x36000091 | bit << 19, 0xb9400211 | (off // 4) << 10, 0x34000051, apply, 0xa8c147f0, 0xd4200040]
         #        orig; stp x16, x17, [sp, #-16]!; adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #bit, 9f; ldr w17, [x16, #off]; cbz w17, 9f; apply; 9: ldp x16, x17, [sp], #16; b back
