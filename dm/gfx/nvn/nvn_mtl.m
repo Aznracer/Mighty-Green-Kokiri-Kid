@@ -17306,6 +17306,10 @@ static int fg_again(void) {   // DM_FRAMEGEN_AGAIN: how close two drops must be 
         if (e) MLOG("frame generation: a drop within %d presents of the one before stops the interpolation (DM_FRAMEGEN_AGAIN)", v); }
     return v;
 }
+// fg15.py: frame generation's counts of presents, for the time they stand for at 30 fps: halved at DM_FPS_TARGET=15 (touch15.py), where a present lasts twice as long
+static int fg_n(int n) { static int h = -1; if (h < 0) { const char *e = getenv("DM_FPS_TARGET"); h = e && atoi(e) == 15;
+        if (h) MLOG("frame generation: at 15 fps its stop and resume counts are halved, so they last as long as at 30 (fg15.py)"); }
+    return h ? (n + 1) / 2 : n; }
 static int fg_resume_max(void) {   // DM_FRAMEGEN_RESUME_MAX: the longest run of presents in time asked before the interpolation runs again (300 by default)
     static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAMEGEN_RESUME_MAX"); v = e && *e ? atoi(e) : 300; if (v < 30) v = 30;
         if (e) MLOG("frame generation: the interpolation runs again after at most %d presents in a row in time (DM_FRAMEGEN_RESUME_MAX)", v); }
@@ -17432,12 +17436,12 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
         // as behind paused frame generation for 1,060 of about 2,900 presents of a run that dropped next to no frames (log 80)
         int behind = ticket > first, late = g_fg_starved, drop = behind || late; g_fg_starved = 0;
         if (g_fg_grace) { g_fg_grace--; drop = 0; }   // DM_FRAMEGEN_ADAPT: just back at 30 (FG_GRACE)
-        if (drop) { int again = g_fg_last_drop && ticket - g_fg_last_drop <= (uint64_t)fg_again(); g_fg_need = again ? FG_STEADY : 1; g_fg_last_drop = ticket;
+        if (drop) { int again = g_fg_last_drop && ticket - g_fg_last_drop <= (uint64_t)fg_n(fg_again()); g_fg_need = again ? fg_n(FG_STEADY) : 1; g_fg_last_drop = ticket;
             if (again && fg_on() && !atomic_load(&g_fg_shed)) { atomic_store(&g_fg_shed, 1); g_fg_native_off = 0; if (g_fg_sheds++) g_fg_resume = MIN(g_fg_resume * 2, fg_resume_max()); g_fg_calm = 0;
-                MLOG("frame generation: frames keep dropping, the interpolation stops until %d presents in a row come in time (#%llu)", g_fg_resume, (unsigned long long)g_fg_sheds); } }
+                MLOG("frame generation: frames keep dropping, the interpolation stops until %d presents in a row come in time (#%llu)", fg_n(g_fg_resume), (unsigned long long)g_fg_sheds); } }
         g_fg_steady = drop ? 0 : g_fg_steady + 1;
-        if (atomic_load(&g_fg_shed) && g_fg_steady >= g_fg_resume) { atomic_store(&g_fg_shed, 0); MLOG("frame generation: %d presents in time, the interpolation runs again", g_fg_steady); }
-        if (!drop && ++g_fg_calm >= 1800 && g_fg_resume > 30) { g_fg_resume /= 2; g_fg_calm = 0; }
+        if (atomic_load(&g_fg_shed) && g_fg_steady >= fg_n(g_fg_resume)) { atomic_store(&g_fg_shed, 0); MLOG("frame generation: %d presents in time, the interpolation runs again", g_fg_steady); }
+        if (!drop && ++g_fg_calm >= fg_n(1800) && g_fg_resume > 30) { g_fg_resume /= 2; g_fg_calm = 0; }
         if (it.gen && g_fg_steady < g_fg_need) { it.gen = 0; if (behind) g_fg_paused_behind++; else g_fg_paused_late++; }
     }
     g_pq_read = ticket;
