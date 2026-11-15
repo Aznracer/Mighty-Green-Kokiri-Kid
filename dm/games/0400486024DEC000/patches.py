@@ -176,6 +176,12 @@ _SS_FOV_SITES = [
 # ratio, bit 5's widened fovy) is not 16:9 and is left alone. Leaf function: s2..s6 and x16 / x17 are free
 _SS_PERSP16 = [0xd4200020, 0xb9405611, 0x368802b1, 0xbd405e02, 0x1e202048, 0x54000240, 0xbd40b003, 0x5291c731, 0x72a7fc71, 0x1e270224, 0x7ea4d465, 0x529ae151,
                0x72a78471, 0x1e270226, 0x1e260886, 0x1e2620a0, 0x540000ec, 0xbd401423, 0x1e221863, 0xbd001423, 0xbd401823, 0x1e221863, 0xbd001823, 0xd65f03c0]
+# Before it, while DM_SCREEN_ASPECT is on, each build of a projection is counted (state +0x5f4) and its aspect / tan(half fovy) / near kept in a table of the first
+# 15 different ones (+0x500, 16 bytes each with a count at +0xc; +0x5f0 how many, +0x5f8 'PORJ'), which hle_nvn.c logs every 300 frames: which projections the
+# menus and the game's view are, and whether this function builds them at all
+_SS_PROJ_LOG = [0xd4200020, 0xb9404a09, 0x340003e9, 0x5289ea09, 0x72a94a49, 0xb905fa09, 0xb945f609, 0x11000529, 0xb905f609, 0xb940b00a, 0xb940ac0b, 0xb945f20c,
+                0x9114020d, 0x5280000e, 0x6b0c01df, 0x5400010a, 0x294025af, 0x6b0a01ff, 0x7a4b0120, 0x54000160, 0x910041ad, 0x110005ce, 0x17fffff8, 0x71003d9f,
+                0x5400012a, 0xb9409809, 0x29002daa, 0x29017da9, 0x1100058c, 0xb905f20c, 0xb9400da9, 0x11000529, 0xb9000da9]
 # adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #17, 9f; ldr s2, [x16, #0x5c]; fcmp s2, #0.0; b.eq 9f; ldr s3, [x0, #0xb0]; s4 = 16/9; fabd s5, s3, s4;
 # s6 = s4 x 0.01; fcmp s5, s6; b.gt 9f; [x1 + 0x14] /= s2; [x1 + 0x18] /= s2; 9: ret
 
@@ -196,7 +202,7 @@ def screen_shape(ctx):
         fs_put(site, [B(site, start)], why)
     stub(0x1087f44, 0x29402c2a, _SS_SIZE_CMP, 0x1087f48, 'display size compared in the screen\'s shape (bit 0)')
     stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
-    stub(0x3485d60, 0xd65f03c0, _SS_PERSP16, None, 'sead::PerspectiveProjection::doUpdateMatrix: a 16:9 projection keeps its shape on the taller screen, y row / k (bit 17)')
+    stub(0x3485d60, 0xd65f03c0, _SS_PROJ_LOG + _SS_PERSP16, None, 'sead::PerspectiveProjection::doUpdateMatrix: a 16:9 projection keeps its shape on the taller screen, y row / k (bit 17)')
     for site, orig, off, apply, bit, what in _SS_LAYOUT:
         words = [orig, 0xa9bf47f0, 0xd4200020, 0xb9405611, 0x36000091 | bit << 19, 0xb9400211 | (off // 4) << 10, 0x34000051, apply, 0xa8c147f0, 0xd4200040]
         #        orig; stp x16, x17, [sp, #-16]!; adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #bit, 9f; ldr w17, [x16, #off]; cbz w17, 9f; apply; 9: ldp x16, x17, [sp], #16; b back
