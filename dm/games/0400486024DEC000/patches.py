@@ -186,16 +186,22 @@ _SS_FOV_SITES = [
 # flags: main+0x23ba44 with the projection in x0, main+0x4f0ac with it in x21), a matrix of 16:9's shape (|m5| / |m0| within 0.05 of 16/9; perspective m5 / m0 is
 # its aspect, orthographic its width / height) has its y row (+0x1c..+0x28) divided by k (state +0x5c, (16/9) / ratio): its picture keeps its shape and 16:9's
 # sides, centred, with more above and below. Once divided it is no longer 16:9's shape, so a matrix copied into another projection is not divided twice; the game's
-# own view (the screen's ratio, bit 5) is not 16:9 either. While DM_SCREEN_ASPECT is on each update is counted (state +0x5f4) and the first 15 different m0 / m5
-# pairs kept (+0x500, 16 bytes: m0, m5, divided, count; +0x5f0 how many, +0x5f8 'PORJ'), which hle_nvn.c logs every 300 frames. x9..x14 are saved, s0..s7 free
+# own view (the screen's ratio, bit 5) is not 16:9 either. The other inlined copies (the menus' layouts did not follow the first two) join the same way. While DM_SCREEN_ASPECT is on each update is counted (state +0x5f4) and the first 15 different m0 / m5
+# pairs kept (+0x500, 16 bytes: m0, m5, divided, count; +0x5f0 how many, +0x5f8 'PORJ'), which hle_nvn.c logs every 300 frames. x9..x14 and q0..q7 are saved
 _SS_PROJ_X0 = [
-    0xd4200020, 0xb9404a11, 0x34000931, 0xa9bd2be9, 0xa90133eb, 0xa9023bed, 0xbd400c00, 0xbd402001, 0x1e20c002, 0x1e20c023, 0x1e202048, 0x540007a0, 0x1e221864,
-    0x5291c731, 0x72a7fc71, 0x1e270225, 0x7ea5d486, 0x529999b1, 0x72a7a991, 0x1e270227, 0x1e2720c0, 0x1a9f87e9, 0xb9405611, 0x53114631, 0x0a110129, 0x5289ea11,
-    0x72a94a51, 0xb905fa11, 0xb945f611, 0x11000631, 0xb905f611, 0x1e26000a, 0x1e26002b, 0xb945f20c, 0x9114020d, 0x5280000e, 0x6b0c01df, 0x5400014a, 0xb94001b1,
-    0x6b0a023f, 0x54000081, 0xb94005b1, 0x6b0b023f, 0x54000140, 0x910041ad, 0x110005ce, 0x17fffff6, 0x71003d9f, 0x5400010a, 0x29002daa, 0x29017da9, 0x1100058c,
-    0xb905f20c, 0xb9400db1, 0x11000631, 0xb9000db1, 0x34000209, 0xbd405e05, 0x1e2020a8, 0x540001a0, 0xbd401c00, 0x1e251800, 0xbd001c00, 0xbd402000, 0x1e251800,
-    0xbd002000, 0xbd402400, 0x1e251800, 0xbd002400, 0xbd402800, 0x1e251800, 0xbd002800, 0xa9423bed, 0xa94133eb, 0xa8c32be9, 0x52802008, 0xd4200040]
-_SS_PROJ_X21 = [w | 21 << 5 if w & 0xffc00000 in (0xbd400000, 0xbd000000) and (w >> 5) & 31 == 0 else w for w in _SS_PROJ_X0]   # the same with the projection in x21
+    0xd4200020, 0xb9404a11, 0x34000a31, 0xa9b52be9, 0xa90133eb, 0xa9023bed, 0xad0187e0, 0xad028fe2, 0xad0397e4, 0xad049fe6, 0xbd400c00, 0xbd402001, 0x1e20c002,
+    0x1e20c023, 0x1e202048, 0x540007a0, 0x1e221864, 0x5291c731, 0x72a7fc71, 0x1e270225, 0x7ea5d486, 0x529999b1, 0x72a7a991, 0x1e270227, 0x1e2720c0, 0x1a9f87e9,
+    0xb9405611, 0x53114631, 0x0a110129, 0x5289ea11, 0x72a94a51, 0xb905fa11, 0xb945f611, 0x11000631, 0xb905f611, 0x1e26000a, 0x1e26002b, 0xb945f20c, 0x9114020d,
+    0x5280000e, 0x6b0c01df, 0x5400014a, 0xb94001b1, 0x6b0a023f, 0x54000081, 0xb94005b1, 0x6b0b023f, 0x54000140, 0x910041ad, 0x110005ce, 0x17fffff6, 0x71003d9f,
+    0x5400010a, 0x29002daa, 0x29017da9, 0x1100058c, 0xb905f20c, 0xb9400db1, 0x11000631, 0xb9000db1, 0x34000209, 0xbd405e05, 0x1e2020a8, 0x540001a0, 0xbd401c00,
+    0x1e251800, 0xbd001c00, 0xbd402000, 0x1e251800, 0xbd002000, 0xbd402400, 0x1e251800, 0xbd002400, 0xbd402800, 0x1e251800, 0xbd002800, 0xad449fe6, 0xad4397e4,
+    0xad428fe2, 0xad4187e0, 0xa9423bed, 0xa94133eb, 0xa8cb2be9, 0x52802008, 0xd4200040]
+_SS_PROJ_SITES = [   # (the join: mov w8, #0x100, the projection's register): every inlined copy (scripts/oot_iphone/oot_aspect_scan.py --projsites)
+    (0x23ba44, 0, 'main+0x23b910 (38 callers)'), (0x4f0ac, 21, 'main+0x4ec60'), (0x20d97c, 0, 'main+0x20d890'), (0x25aff0, 0, 'main+0x25aef0 (orthographic only)'),
+    (0x33b8bc, 2, 'main+0x33a8c0'), (0x346f678, 2, 'main+0x346f480 (a text writer)'),
+]
+def _proj_words(n):   # the same with the projection in xN: its ldr / str s at [x0, #...] take xN
+    return [w | n << 5 if w & 0xffc00000 in (0xbd400000, 0xbd000000) and (w >> 5) & 31 == 0 else w for w in _SS_PROJ_X0]
 
 
 def screen_shape(ctx):
@@ -214,8 +220,8 @@ def screen_shape(ctx):
         fs_put(site, [B(site, start)], why)
     stub(0x1087f44, 0x29402c2a, _SS_SIZE_CMP, 0x1087f48, 'display size compared in the screen\'s shape (bit 0)')
     stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
-    stub(0x23ba44, 0x52802008, _SS_PROJ_X0, 0x23ba48, 'sead::Projection matrix update (inlined): a 16:9 matrix keeps its shape on the taller screen, y row / k (bit 17)')
-    stub(0x4f0ac, 0x52802008, _SS_PROJ_X21, 0x4f0b0, 'sead::Projection matrix update (inlined copy): a 16:9 matrix keeps its shape on the taller screen, y row / k (bit 17)')
+    for site, n, what in _SS_PROJ_SITES:
+        stub(site, 0x52802008, _proj_words(n), site + 4, f'sead::Projection matrix update inlined in {what}: a 16:9 matrix keeps its shape on the taller screen, y row / k (bit 17)')
     for site, orig, off, apply, bit, what in _SS_LAYOUT:
         words = [orig, 0xa9bf47f0, 0xd4200020, 0xb9405611, 0x36000091 | bit << 19, 0xb9400211 | (off // 4) << 10, 0x34000051, apply, 0xa8c147f0, 0xd4200040]
         #        orig; stp x16, x17, [sp, #-16]!; adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #bit, 9f; ldr w17, [x16, #off]; cbz w17, 9f; apply; 9: ldp x16, x17, [sp], #16; b back
