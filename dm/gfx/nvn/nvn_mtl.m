@@ -15860,7 +15860,7 @@ static const char *cctx_snap(void) {
 // When the game itself asks for 30 fps (pacing by the game's present interval, interval 2, hle_nvn.c) the display link runs at 30 Hz too: games whose logic counts frames, such as Engage, are not pulled up to 60 fps by the display link on iOS
 __attribute__((weak)) int nvn_game_fps(void) { return 60; }   // hle_nvn.c provides the strong definition
 int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d: frame rate pinned by the test switch", env); }
-    int g = nvn_game_fps(); return env > 0 ? env : g == 20 || g == 30 || g == 120 ? g : 60; }
+    int g = nvn_game_fps(); return env > 0 ? env : g == 15 || g == 30 || g == 120 ? g : 60; }
 // Hand a submission to the GPU in segments (DM_NVN_CUT=draw count, 0 = off; default 64): when the game holds back the next frame's submit until this frame's GPU work is done (The Legend of Zelda: Breath of the Wild: the main thread's nvnSyncWait on the fence of the frame just submitted),
 // the GPU sits idle for the milliseconds the host spends translating inside the submit (in the shrine each frame is GPU 13 ms + translation 7 ms back to back). Each time this many draws have accumulated, the command buffer encoded so far is committed between two passes: the GPU runs the earlier passes while the CPU translates the later ones.
 // Cut only when no encoder is open and no pass is deferred / merged / hoisted; commit this batch's uploads first (later draws use them). The fence signal and completion work stay on the last segment only: the queue executes in commit order and every encoder starts with a queue barrier
@@ -17306,10 +17306,10 @@ static int fg_again(void) {   // DM_FRAMEGEN_AGAIN: how close two drops must be 
         if (e) MLOG("frame generation: a drop within %d presents of the one before stops the interpolation (DM_FRAMEGEN_AGAIN)", v); }
     return v;
 }
-// fg15.py, touch20.py: frame generation's counts of presents, for the time they stand for at 30 fps: 2/3 at DM_FPS_TARGET=20, where a present lasts 1.5 times as long
-static int fg_n(int n) { static int h = -1; if (h < 0) { const char *e = getenv("DM_FPS_TARGET"); h = e && atoi(e) == 20;
-        if (h) MLOG("frame generation: at 20 fps its stop and resume counts are 2/3, so they last as long as at 30 (touch20.py)"); }
-    return h ? (2 * n + 2) / 3 : n; }
+// fg15.py: frame generation's counts of presents, for the time they stand for at 30 fps: halved at DM_FPS_TARGET=15 (touch15.py), where a present lasts twice as long
+static int fg_n(int n) { static int h = -1; if (h < 0) { const char *e = getenv("DM_FPS_TARGET"); h = e && atoi(e) == 15;
+        if (h) MLOG("frame generation: at 15 fps its stop and resume counts are halved, so they last as long as at 30 (fg15.py)"); }
+    return h ? (n + 1) / 2 : n; }
 static int fg_resume_max(void) {   // DM_FRAMEGEN_RESUME_MAX: the longest run of presents in time asked before the interpolation runs again (300 by default)
     static int v = -1; if (v < 0) { const char *e = getenv("DM_FRAMEGEN_RESUME_MAX"); v = e && *e ? atoi(e) : 300; if (v < 30) v = 30;
         if (e) MLOG("frame generation: the interpolation runs again after at most %d presents in a row in time (DM_FRAMEGEN_RESUME_MAX)", v); }
