@@ -169,6 +169,17 @@ _SS_FOV_SITES = [
 ]
 
 
+# 16:9 projections (bit 17). The menus, the HUD and the menus' 3D models are drawn through projections of their own fixed at 16:9 (aspect +0xb0 1.778 whatever the
+# screen), so on the taller screen they came out 1.24 times as tall (iPhone Duo, 2026-11-15: the map, the save list, Link in the equipment screen). At the return of
+# sead::PerspectiveProjection::doUpdateMatrix (main+0x3485cc0, the 4x4 row-major at x1: y row +0x10..+0x1c) a projection within 1 % of 16:9 has its y row divided
+# by k (state +0x5c, (16/9) / ratio): its picture keeps its shape and 16:9's sides, centred, with more above and below. The game's own view (aspect the screen's
+# ratio, bit 5's widened fovy) is not 16:9 and is left alone. Leaf function: s2..s6 and x16 / x17 are free
+_SS_PERSP16 = [0xd4200020, 0xb9405611, 0x368802b1, 0xbd405e02, 0x1e202048, 0x54000240, 0xbd40b003, 0x5291c731, 0x72a7fc71, 0x1e270224, 0x7ea4d465, 0x529ae151,
+               0x72a78471, 0x1e270226, 0x1e260886, 0x1e2620a0, 0x540000ec, 0xbd401423, 0x1e221863, 0xbd001423, 0xbd401823, 0x1e221863, 0xbd001823, 0xd65f03c0]
+# adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #17, 9f; ldr s2, [x16, #0x5c]; fcmp s2, #0.0; b.eq 9f; ldr s3, [x0, #0xb0]; s4 = 16/9; fabd s5, s3, s4;
+# s6 = s4 x 0.01; fcmp s5, s6; b.gt 9f; [x1 + 0x14] /= s2; [x1 + 0x18] /= s2; 9: ret
+
+
 def screen_shape(ctx):
     here, emit, fs_site, fs_put, STATE = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
     def stub(site, orig_word, words, back, why, subst=None):
@@ -185,6 +196,7 @@ def screen_shape(ctx):
         fs_put(site, [B(site, start)], why)
     stub(0x1087f44, 0x29402c2a, _SS_SIZE_CMP, 0x1087f48, 'display size compared in the screen\'s shape (bit 0)')
     stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
+    stub(0x3485d60, 0xd65f03c0, _SS_PERSP16, None, 'sead::PerspectiveProjection::doUpdateMatrix: a 16:9 projection keeps its shape on the taller screen, y row / k (bit 17)')
     for site, orig, off, apply, bit, what in _SS_LAYOUT:
         words = [orig, 0xa9bf47f0, 0xd4200020, 0xb9405611, 0x36000091 | bit << 19, 0xb9400211 | (off // 4) << 10, 0x34000051, apply, 0xa8c147f0, 0xd4200040]
         #        orig; stp x16, x17, [sp, #-16]!; adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #bit, 9f; ldr w17, [x16, #off]; cbz w17, 9f; apply; 9: ldp x16, x17, [sp], #16; b back
