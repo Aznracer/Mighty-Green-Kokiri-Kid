@@ -51,7 +51,8 @@ static inline float nvn_fdelta_next(nvn_fdelta *f, uint64_t now_ns) {
     return mean * 60 < 1.01 ? 0.0f : (float)fmin(mean, 4.0 / 60);
 }
 
-#define FSTEP_MAX 3           // the largest step: both games' own interval logic uses 1–3 (BotW clamps to [2, 3], TOTK picks 2 or 3), so their integer readers never see 4
+#define FSTEP_MAX 4           // the largest step: 4 only at a 15 fps cap (touch15.py: DM_FPS_TARGET=15, Ocarina of Time's touch play), where every frame is held 4
+#define FSTEP_TOP 3           // the largest step at a 30 or 60 fps cap: both games' own interval logic uses 1–3 (BotW clamps to [2, 3], TOTK picks 2 or 3), so their integer readers never see 4
 #define FSTEP_LATE 0.1        // a frame is late when it or its GPU work took this many vsyncs (1.7 ms) more than k: 53 fps is not 60 (start-to-start jitter on time is well below)
 #define FSTEP_FIT 0.85        // a frame would fit k − 1 when its cost is at most this share of it
 #define FSTEP_RUN 30          // frames in a row that fit k − 1 before a trial, and frames a trial must hold
@@ -118,7 +119,7 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     if (!s->uhold) s->uhold = hold0;
     int gpu_on = s->gpu_on; double gpu = s->gpu; s->gpu_on = 0; s->gpu = 0;   // cleared on every return
     if (fixed > 0) {   // the game's own step: speed is right by construction, nothing to pay back
-        s->k = s->step = fixed < FSTEP_MAX ? fixed : FSTEP_MAX;
+        s->k = s->step = fixed < FSTEP_TOP ? fixed : FSTEP_TOP;
         s->debt = 0; s->late_run = s->ilate_run = s->fit_run = s->trial = s->probe = s->grace = 0; s->run = 0; s->ontime_run = 0;
         s->kmin = FSTEP_MAX + 1;   // when it ends, k starts again from kmin
         return s->step;
@@ -189,7 +190,7 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = s->ilate_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;   // urun ends with the next frame at kmin (kept for the caller's log)
     }
     if (s->nopay && s->debt > 0) { s->dropped += s->debt; s->debt = 0; }   // no payback: the time lost is let go at once, as a console game slows down
-    s->step = s->k + (s->debt >= 1 && s->k < FSTEP_MAX);
+    s->step = s->k + (s->debt >= 1 && s->k < FSTEP_TOP);
     s->paid += s->step > s->k;
     return s->step;
 }
