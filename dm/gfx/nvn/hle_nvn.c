@@ -2084,7 +2084,7 @@ static int fps_step_cap(void) {
     // Movies and a 30 fps target still need thermal samples: heat must reset the
     // calm interval, and cooling during those caps counts towards recovery.
     int thermal = thermal_capped();
-    if (t <= 15 && !dm_movie_playing()) return mtl_fg_native() ? 30 : 15;   // touch15.py: 15 + frame generation; heat keeps it (already the lowest), a movie's player needs 30
+    if (t <= 20 && !dm_movie_playing()) return mtl_fg_native() ? 30 : t <= 15 ? 15 : 20;   // touch15.py: 15 + frame generation; heat keeps it (already the lowest), a movie's player needs 30
     return dm_movie_playing() || (t <= 30 && !mtl_fg_native()) || thermal ? 30 : 60;   // DM_FRAMEGEN_ADAPT: 60 while frame generation is stopped   // a movie: its player takes a picture per game frame, paced for the Switch's 30 (hle_movie.c)
 }
 static int fstep_on(void) { return fps_step_cap() != 0; }   // the host decides the steps in whole vsyncs
@@ -2098,7 +2098,7 @@ static int fps_present_cap(void) {
     if (dm_fps_state || fps_high()) return fps_step_cap();
     if (g_present_cap < 0) {
         const char *e=getenv("DM_FPS_TARGET");int t=e?atoi(e):DM_GAME_FPS_TARGET;
-        g_present_cap=t==15||t==30||t==60?t:t==120?60:0;   // 120 here: not this game's (fps_high), so it runs at 60
+        g_present_cap=t==15||t==20||t==30||t==60?t:t==120?60:0;   // 120 here: not this game's (fps_high), so it runs at 60
         if (g_present_cap && !dm_fps_lock_engine()) {
             LOG("[nvn] present cap %d fps (%s) not applied: this main has neither a frame step nor an engine frame limit the host writes, so the game's own present interval stays", g_present_cap, e ? "DM_FPS_TARGET" : "game profile fps_target");
             g_present_cap=0;
