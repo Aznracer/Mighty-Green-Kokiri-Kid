@@ -478,7 +478,7 @@ static void encode_img_into_bntx(const ImgBuf *imgBuf, const char *label, uint8_
     }
     const uint8_t *src = imgBuf->rgba;
     int nvn_fmt = (bfmt == 0x1d01) ? 0x49 : 0x87;
-    nvn_texdesc td = { .target = 1, .format = nvn_fmt, .width = w, .height = h, .depth = 1, .levels = 1, .pkg_layout = (tlay & 0xff) + 1 };
+    nvn_texdesc td = { .target = 1, .format = nvn_fmt, .width = w, .height = h, .depth = 1, .levels = 1, .pkg_block_h = (tlay & 0xff) + 1 };
     nvn_texlayout L; nvn_tex_layout(&td, &L);
     uint32_t rb = 0, rows = 0, slices = 0, bpb = 0; uint64_t base = 0; unsigned th = 0, td2 = 0;
     if (nvn_deswizzle_geom(&td, 0, 0, &rb, &rows, &slices, &base, &th, &td2, &bpb) != 0) {
@@ -540,7 +540,7 @@ static ImgBuf decode_bntx_tex(id<MTLDevice> dev, id<MTLCommandQueue> q, id<MTLLi
     int nvn_fmt = (bfmt == 0x1d01) ? 0x49 : 0x87;
     MTLPixelFormat src_pf = (bfmt == 0x1d01) ? MTLPixelFormatBC4_RUnorm : MTLPixelFormatASTC_4x4_sRGB;
     MTLPixelFormat dst_pf = (bfmt == 0x1d01) ? MTLPixelFormatRGBA8Unorm : MTLPixelFormatRGBA8Unorm_sRGB;
-    nvn_texdesc td = { .target = 1, .format = nvn_fmt, .width = w, .height = h, .depth = 1, .levels = 1, .pkg_layout = (tlay & 0xff) + 1 };
+    nvn_texdesc td = { .target = 1, .format = nvn_fmt, .width = w, .height = h, .depth = 1, .levels = 1, .pkg_block_h = (tlay & 0xff) + 1 };
     uint32_t rb = 0, rows = 0, slices = 0, bpb = 0; uint64_t base = 0; unsigned th = 0, td2 = 0;
     nvn_deswizzle_geom(&td, 0, 0, &rb, &rows, &slices, &base, &th, &td2, &bpb);
     uint8_t *lin = calloc(rows, rb);
