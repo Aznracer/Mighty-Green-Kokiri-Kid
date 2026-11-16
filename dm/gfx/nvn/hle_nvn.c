@@ -1883,6 +1883,76 @@ static void canvas_names(uint64_t obj, char *out, size_t cap) {
     if (!found) snprintf(out, cap, "?");
 }
 
+// UI edges (Ocarina of Time's screen shape, patches.py _SS_CANVAS_LOG): every canvas the game makes is queued in the state page (+0xd00, a ring of 64; +0xffc the count).
+// Each new one is named by the strings its screen points to (canvas - 0x1b8, read safely), and one whose names match DM_UI_EDGE is moved to the taller screen's top or
+// bottom edge by writing its matrix (made once by main+0x774330: canvas +8 for row vectors, y column at +4 of each row, the y translation at +0x3c; a y-flipped
+// copy at +0x48, translation at +0x7c) by 1 - 1/k in clip space. DM_UI_EDGE: rules "include[!exclude]:up|down", comma-separated (default: the pause menus' button
+// guide, CtrlGuide_00 but not the save list's, SystemSaveLoad_00). A canvas whose matrix the game makes again is moved again; one whose names no longer match (freed
+// and reused) is dropped. Logged every 300 frames with tsummary
+typedef struct { uint64_t cv; char names[240]; int mode; float t1, t2; int done; } ui_cv_t;
+static ui_cv_t g_ui[256]; static int g_nui; static uint32_t g_ui_seen;
+static struct { char inc[64], exc[64]; int mode; } g_ui_rule[16]; static int g_ui_nrule = -1;
+static void canvas_names_all(uint64_t obj, char *out, size_t cap) {   // up to 4 different layout names (no '.' files), space-separated
+    uint64_t w[96], w2[32]; size_t o = 0; int found = 0; out[0] = 0;
+    if (!canvas_read(obj, w, sizeof w)) return;
+    for (int i = 0; i < 96 && found < 4; i++) {
+        char s[72]; int got = canvas_str(w[i], s, sizeof s);
+        if (!got && canvas_read(w[i], w2, sizeof w2)) for (int j = 0; j < 32 && !got; j++) got = canvas_str(w2[j], s, sizeof s);
+        if (!got || strchr(s, '.') || strstr(out, s)) continue;
+        o += snprintf(out + o, cap - o, "%s%s", found ? " " : "", s); found++;
+        if (o >= cap - 72) break;
+    }
+}
+static void ui_rules_load(void) {
+    const char *e = getenv("DM_UI_EDGE"); if (!e) e = "CtrlGuide_00!SystemSaveLoad_00:down";
+    g_ui_nrule = 0;
+    while (*e && g_ui_nrule < 16) {
+        const char *end = strchr(e, ','); size_t n = end ? (size_t)(end - e) : strlen(e); char r[160];
+        snprintf(r, sizeof r, "%.*s", (int)n, e); e += n + (end ? 1 : 0);
+        char *colon = strrchr(r, ':'); if (!colon) continue; *colon = 0;
+        int mode = !strcmp(colon + 1, "up") ? 1 : !strcmp(colon + 1, "down") ? 2 : 0; if (!mode) continue;
+        char *bang = strchr(r, '!'); if (bang) *bang = 0;
+        snprintf(g_ui_rule[g_ui_nrule].inc, 64, "%s", r); snprintf(g_ui_rule[g_ui_nrule].exc, 64, "%s", bang ? bang + 1 : "");
+        g_ui_rule[g_ui_nrule++].mode = mode;
+    }
+    LOG("[dm] UI edges: %d rule(s) from %s", g_ui_nrule, getenv("DM_UI_EDGE") ? "DM_UI_EDGE" : "the default (CtrlGuide_00!SystemSaveLoad_00:down)");
+}
+static int ui_match(const char *names) {
+    for (int i = 0; i < g_ui_nrule; i++)
+        if (g_ui_rule[i].inc[0] && strstr(names, g_ui_rule[i].inc) && !(g_ui_rule[i].exc[0] && strstr(names, g_ui_rule[i].exc))) return g_ui_rule[i].mode;
+    return 0;
+}
+static void ui_edges_tick(void) {
+    if (!dm_fps_state) return;
+    uint32_t idx; memcpy(&idx, dm_fps_state + 0xffc, 4); if (!idx) return;
+    float k; memcpy(&k, dm_fps_state + 0x5c, 4); if (!(k > 1.0f && k < 4.0f)) return;
+    if (g_ui_nrule < 0) ui_rules_load();
+    if (idx - g_ui_seen > 64) g_ui_seen = idx - 64;
+    for (; g_ui_seen != idx; g_ui_seen++) {
+        uint64_t cv; memcpy(&cv, dm_fps_state + 0xd00 + 8 * (g_ui_seen & 63), 8);
+        int i = 0; while (i < g_nui && g_ui[i].cv != cv) i++;
+        if (i == g_nui) { if (g_nui == 256) continue; g_nui++; g_ui[i].cv = cv; g_ui[i].names[0] = 0; g_ui[i].mode = -1; }
+        if (g_ui[i].mode == -1 || g_ui[i].mode > 0) {   // new, or placed: named (again; some small canvases are made every frame, and are named once)
+            canvas_names_all(cv - 0x1b8, g_ui[i].names, sizeof g_ui[i].names);
+            g_ui[i].mode = ui_match(g_ui[i].names);
+        }
+        g_ui[i].done = 0;
+    }
+    float d = 1.0f - 1.0f / k;
+    for (int i = 0; i < g_nui; i++) {
+        ui_cv_t *u = &g_ui[i]; float a, b;
+        if (u->mode <= 0 || !canvas_read(u->cv + 0x3c, &a, 4) || !canvas_read(u->cv + 0x7c, &b, 4)) continue;
+        if (u->done && a == u->t1 && b == u->t2) continue;   // still where it was put
+        if (u->done) {   // the game wrote it again, or the canvas is gone: only a canvas with the same names is placed again
+            char now[240]; canvas_names_all(u->cv - 0x1b8, now, sizeof now);
+            if (strcmp(now, u->names)) { u->mode = 0; continue; }
+        }
+        if (a != -b) { u->mode = 0; continue; }   // not this function's pair of matrices
+        float s = u->mode == 1 ? d : -d;
+        *(volatile float *)(uintptr_t)(u->cv + 0x3c) = a + s; *(volatile float *)(uintptr_t)(u->cv + 0x7c) = b - s;
+        u->t1 = a + s; u->t2 = b - s; u->done = 1;
+    }
+}
 static void tsummary(uint64_t frame) {
     char line[1024]; size_t o = 0;
     for (int k = 0; k < 6; k++) {
@@ -1915,6 +1985,15 @@ static void tsummary(uint64_t frame) {
             o += snprintf(pl + o, sizeof pl - o, " %#llx x%u %s;", (unsigned long long)(vt - (module_of(dm_fps_state) ? (uint64_t)(uintptr_t)module_of(dm_fps_state)->base : 0)), h, names);
         }
         LOG("[dm] canvases up to frame %llu: %u projection loads; screens (main+vtable, loads, name):%s", frame, loads, o ? pl : " none");
+    }
+    if (g_nui) {   // every canvas ui_edges_tick has seen: its names, its placement (U up, D down) and its y translation
+        static char pl[16384]; size_t o = 0;
+        for (int i = 0; i < g_nui && o < sizeof pl - 300; i++) {
+            float a = 0; canvas_read(g_ui[i].cv + 0x3c, &a, 4);
+            if (!g_ui[i].names[0]) continue;
+            o += snprintf(pl + o, sizeof pl - o, " [%s]%s %.3f;", g_ui[i].names, g_ui[i].mode == 1 ? " U" : g_ui[i].mode == 2 ? " D" : "", a);
+        }
+        LOG("[dm] UI canvases up to frame %llu (%d seen; names, placement, y translation):%s", frame, g_nui, o ? pl : " none");
     }
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
@@ -2497,6 +2576,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();
+    ui_edges_tick();   // the UI canvases the screen-shape stubs queue (Ocarina of Time): placed at the taller screen's edges by name
     if (g_frame % TWIN == 0) tsummary(g_frame);
     mtl_set_frame(g_frame);
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
