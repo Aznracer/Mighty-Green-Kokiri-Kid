@@ -212,6 +212,17 @@ _SS_RENDER_VIEW = [
     0x1e270230, 0x1e302220, 0x540000ac, 0xbd405a01, 0xb945ea11, 0x11000631, 0xb905ea11, 0xd4200040]
 
 
+# The full-screen canvases, logged (while DM_SCREEN_ASPECT is on): each canvas loads its projection at main+0x774368 (ldp q1, q4, [x2]; its screen at x0 - 0x1b8, per
+# seedds/nxnative pull request 2795). For the HUD's edges, which screens are which: a canvas of the 3840x2160 projection (x scale 2/3840 exactly) has its screen's
+# vtable kept, the first 15 different (+0x600, 16 bytes: vtable, y scale, 0, count; +0x6f0 how many, +0x6f4 loads, +0x6f8 'NVCS'), logged by hle_nvn.c every 300
+# frames. x9..x14 saved, x16 / x17 free there
+_SS_CANVAS_LOG = [
+    0xad401041, 0xd4200020, 0xb9404a11, 0x34000531, 0xb946f611, 0x11000631, 0xb906f611, 0x1e260031, 0xa9bd2be9, 0xa90133eb, 0xa9023bed, 0x52911129, 0x72a74109,
+    0x6b09023f, 0x54000361, 0x528ac9d1, 0x72aa6871, 0xb906fa11, 0xd106e009, 0xf9400129, 0x0e0c3c8a, 0xb946f20c, 0x9118020d, 0x5280000e, 0x6b0c01df, 0x540000ea,
+    0xf94001ab, 0xeb09017f, 0x54000140, 0x910041ad, 0x110005ce, 0x17fffff9, 0x71003d9f, 0x5400010a, 0xf90001a9, 0x29017daa, 0x1100058c, 0xb906f20c, 0xb9400dab,
+    0x1100056b, 0xb9000dab, 0xa9423bed, 0xa94133eb, 0xa8c32be9, 0xd4200040]
+
+
 def screen_shape(ctx):
     here, emit, fs_site, fs_put, STATE = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
     def stub(site, orig_word, words, back, why, subst=None):
@@ -229,6 +240,7 @@ def screen_shape(ctx):
     stub(0x1087f44, 0x29402c2a, _SS_SIZE_CMP, 0x1087f48, 'display size compared in the screen\'s shape (bit 0)')
     stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
     stub(0x25d770, 0x1e221821, _SS_RENDER_VIEW, 0x25d774, 'render view aspect: a 16:9 view takes the screen\'s ratio (bit 19)')
+    stub(0x774368, 0xad401041, _SS_CANVAS_LOG, 0x77436c, 'full-screen canvas projection: the screens drawn with it, logged')
     for site, n, what in _SS_PROJ_SITES:
         stub(site, 0x52802008, _proj_words(n), site + 4, f'sead::Projection matrix update inlined in {what}: a 16:9 matrix keeps its shape on the taller screen, y row / k (bit 17)')
     for site, orig, off, apply, bit, what in _SS_LAYOUT:

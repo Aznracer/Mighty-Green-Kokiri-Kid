@@ -1879,6 +1879,16 @@ static void tsummary(uint64_t frame) {
         }
         LOG("[dm] projections up to frame %llu: %u updates (sites %#x, k %.3f, fovy widened %u, game camera 16:9 aspects made the screen's %u, render views %u); m0/m5 (ratio):%s", frame, calls, mask, k, fov, cam, rv, o ? pl : " none");
     }
+    if (dm_fps_state && !memcmp(dm_fps_state + 0x6f8, "NVCS", 4)) {   // the full-screen canvases' screens (Ocarina of Time patches.py _SS_CANVAS_LOG): vtable, y scale, loads
+        uint32_t used, loads; char pl[1024]; size_t o = 0;
+        memcpy(&used, dm_fps_state + 0x6f0, 4); memcpy(&loads, dm_fps_state + 0x6f4, 4);
+        for (uint32_t i = 0; i < used && i < 15 && o < sizeof pl - 64; i++) {
+            uint64_t vt; float y; uint32_t h; const uint8_t *e = dm_fps_state + 0x600 + 16 * i;
+            memcpy(&vt, e, 8); memcpy(&y, e + 8, 4); memcpy(&h, e + 12, 4);
+            o += snprintf(pl + o, sizeof pl - o, " %#llx y %.4g x%u;", (unsigned long long)vt, y, h);
+        }
+        LOG("[dm] canvases up to frame %llu: %u projection loads; screens (vtable, y scale, loads):%s", frame, loads, o ? pl : " none");
+    }
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > tgt;
