@@ -11416,6 +11416,7 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
         && !(sh->rf.drv_read[0] && sh->ab_binst != g_draw_binst) && !(sh->rf.pool && sh->ab_pgen != g_psnap_gen) && !g_res_check_on) {
         NSUInteger len = sh->arg_len ? sh->arg_len : sh->ae.encodedLength;
         id<MTLBuffer> ab; size_t off = arena_alloc(len, &ab);
+        uint64_t ab_gpu = g_cur_arena->gpu + off;   // before ubd_shadow / ubp_get allocate and may roll g_cur_arena over to a new block (PR #2847)
         uint64_t *d = (uint64_t *)(g_cur_arena->cpu + off);
         memcpy(d, sh->ab_cpu, len);
         for (int i = 0; i < sh->rf.nb; i++) { const nvn_rbind *b = &sh->rf.b[i]; if (b->kind != NVN_RB_CBUF) continue;
@@ -11427,8 +11428,8 @@ static int encode_args_(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stage, i
             d[b->aid] = gpu; }
         static int chk = -1; if (chk < 0) chk = getenv("DM_NVN_CB_CHECK") != NULL;
         if (chk) { g_cbchk = d; g_cbchk_len = len; goto full; }   // (test) the full path below writes the table too and compares
-        bind_args(en, nvn_stage, metal_vertex, ab, g_cur_arena->gpu + off, off, sh->rf.abi);
-        sh->ab_buf = ab; sh->ab_cpu = (uint8_t *)d; sh->ab_gpu = g_cur_arena->gpu + off; sh->ab_off = off; sh->ab_binst = g_draw_binst; g_args_dirty[nvn_stage] = 0;
+        bind_args(en, nvn_stage, metal_vertex, ab, ab_gpu, off, sh->rf.abi);
+        sh->ab_buf = ab; sh->ab_cpu = (uint8_t *)d; sh->ab_gpu = ab_gpu; sh->ab_off = off; sh->ab_binst = g_draw_binst; g_args_dirty[nvn_stage] = 0;
         g_stat_args_cb++;
         return 1;
     }
