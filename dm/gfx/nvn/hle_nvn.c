@@ -1890,7 +1890,7 @@ static void canvas_names(uint64_t obj, char *out, size_t cap) {
 // of its names: a screen also points to its neighbours'), exclude any of them; none by default (the pause menus and the minimap are not drawn through these canvases,
 // iPhone Duo 2026-11-15). A canvas whose matrix the game makes again is moved again; one whose names no longer match (freed
 // and reused) is dropped. Logged every 300 frames with tsummary
-typedef struct { uint64_t cv; char names[240]; int mode; float t1, t2; int done; } ui_cv_t;
+typedef struct { uint64_t cv; char names[240]; int mode; float t1, t2; int done, roots; } ui_cv_t;
 static ui_cv_t g_ui[256]; static int g_nui; static uint32_t g_ui_seen;
 static struct { char inc[64], exc[64]; int mode; } g_ui_rule[16]; static int g_ui_nrule = -1;
 static void canvas_names_all(uint64_t obj, char *out, size_t cap) {   // up to 4 different layout names (no '.' files), space-separated
@@ -1924,6 +1924,42 @@ static int ui_match(const char *names) {   // the include must be the screen's o
         if (g_ui_rule[i].inc[0] && strlen(g_ui_rule[i].inc) == own && !strncmp(names, g_ui_rule[i].inc, own) && !(g_ui_rule[i].exc[0] && strstr(names, g_ui_rule[i].exc))) return g_ui_rule[i].mode;
     return 0;
 }
+// Taller layout roots (DM_UI_ROOT, on unless 0): each new canvas's screen is searched (3 pointer levels, read safely) for its layouts' root panes, a pane named
+// "RootPane" with the 16:9 size (1920 x 1080 or 3840 x 2160) inline; its height becomes the taller screen's (x k), once, when the screen is made. Panes the layouts
+// pin to their parent's top or bottom edge (the layout editor's parent origin) then follow the edges: the pause menus' tabs and button guides, the save list's title
+// and Back. A test (iPhone Duo, 2026-11-15): nothing moves if the menus do not use parent origins
+static uint64_t g_root_done[1024]; static int g_nroot, g_root_on = -1;
+static int root_try(uint64_t obj, float k) {
+    uint8_t b[0x180]; if (!canvas_read(obj, b, sizeof b)) return 0;
+    void *n = memmem(b, sizeof b, "RootPane", 9); if (!n) return 0;
+    for (int i = 0; i < g_nroot; i++) if (g_root_done[i] == obj) return 0;
+    for (size_t o = 0; o + 8 <= sizeof b; o += 4) {
+        float w, h; memcpy(&w, b + o, 4); memcpy(&h, b + o + 4, 4);
+        if (!((w == 1920.0f && h == 1080.0f) || (w == 3840.0f && h == 2160.0f))) continue;
+        *(volatile float *)(uintptr_t)(obj + o + 4) = h * k;
+        if (g_nroot < 1024) g_root_done[g_nroot++] = obj;
+        return 1;
+    }
+    return 0;
+}
+static int ui_roots(uint64_t screen, float k) {   // root panes made taller under this screen
+    if (g_root_on < 0) { const char *e = getenv("DM_UI_ROOT"); g_root_on = !(e && e[0] == '0'); LOG("[dm] UI roots: %s", g_root_on ? "on (DM_UI_ROOT=0 turns them off)" : "off"); }
+    if (!g_root_on) return 0;
+    uint64_t l0[64], l1[32], l2[32]; int got = 0;
+    if (!canvas_read(screen, l0, sizeof l0)) return 0;
+    for (int i = 0; i < 64; i++) {
+        if (l0[i] < 0x100000000ull || (l0[i] & 7)) continue;
+        got += root_try(l0[i], k);
+        if (!canvas_read(l0[i], l1, sizeof l1)) continue;
+        for (int j = 0; j < 32; j++) {
+            if (l1[j] < 0x100000000ull || (l1[j] & 7) || l1[j] == l0[i]) continue;
+            got += root_try(l1[j], k);
+            if (!canvas_read(l1[j], l2, sizeof l2)) continue;
+            for (int m = 0; m < 32; m++) if (l2[m] >= 0x100000000ull && !(l2[m] & 7) && l2[m] != l1[j]) got += root_try(l2[m], k);
+        }
+    }
+    return got;
+}
 static void ui_edges_tick(void) {
     if (!dm_fps_state) return;
     uint32_t idx; memcpy(&idx, dm_fps_state + 0xffc, 4); if (!idx) return;
@@ -1935,6 +1971,7 @@ static void ui_edges_tick(void) {
         int i = 0; while (i < g_nui && g_ui[i].cv != cv) i++;
         if (i == g_nui) { if (g_nui == 256) continue; g_nui++; g_ui[i].cv = cv; g_ui[i].names[0] = 0; g_ui[i].mode = -1; }
         if (g_ui[i].mode == -1 || g_ui[i].mode > 0) {   // new, or placed: named (again; some small canvases are made every frame, and are named once)
+            if (g_ui[i].mode == -1) g_ui[i].roots = ui_roots(cv - 0x1b8, k);
             canvas_names_all(cv - 0x1b8, g_ui[i].names, sizeof g_ui[i].names);
             g_ui[i].mode = ui_match(g_ui[i].names);
         }
@@ -1993,9 +2030,10 @@ static void tsummary(uint64_t frame) {
         for (int i = 0; i < g_nui && o < sizeof pl - 300; i++) {
             float a = 0; canvas_read(g_ui[i].cv + 0x3c, &a, 4);
             if (!g_ui[i].names[0]) continue;
-            o += snprintf(pl + o, sizeof pl - o, " [%s]%s %.3f;", g_ui[i].names, g_ui[i].mode == 1 ? " U" : g_ui[i].mode == 2 ? " D" : "", a);
+            o += snprintf(pl + o, sizeof pl - o, " [%s]%s %.3f", g_ui[i].names, g_ui[i].mode == 1 ? " U" : g_ui[i].mode == 2 ? " D" : "", a);
+            o += g_ui[i].roots ? snprintf(pl + o, sizeof pl - o, " R%d;", g_ui[i].roots) : snprintf(pl + o, sizeof pl - o, ";");
         }
-        LOG("[dm] UI canvases up to frame %llu (%d seen; names, placement, y translation):%s", frame, g_nui, o ? pl : " none");
+        LOG("[dm] UI canvases up to frame %llu (%d seen, %d root panes taller; names, placement, y translation, R roots):%s", frame, g_nui, g_nroot, o ? pl : " none");
     }
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
