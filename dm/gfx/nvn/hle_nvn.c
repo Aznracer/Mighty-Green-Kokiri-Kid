@@ -1924,40 +1924,56 @@ static int ui_match(const char *names) {   // the include must be the screen's o
         if (g_ui_rule[i].inc[0] && strlen(g_ui_rule[i].inc) == own && !strncmp(names, g_ui_rule[i].inc, own) && !(g_ui_rule[i].exc[0] && strstr(names, g_ui_rule[i].exc))) return g_ui_rule[i].mode;
     return 0;
 }
-// Taller layout roots (DM_UI_ROOT, on unless 0): each new canvas's screen is searched (3 pointer levels, read safely) for its layouts' root panes, a pane named
-// "RootPane" with the 16:9 size (1920 x 1080 or 3840 x 2160) inline; its height becomes the taller screen's (x k), once, when the screen is made. Panes the layouts
-// pin to their parent's top or bottom edge (the layout editor's parent origin) then follow the edges: the pause menus' tabs and button guides, the save list's title
-// and Back. A test (iPhone Duo, 2026-11-15): nothing moves if the menus do not use parent origins
+// Taller layout roots (DM_UI_ROOT, on unless 0): a menu screen's objects (breadth first through guest heap pointers, 0x7000000000 up, read safely; up to 6
+// levels and 8000 objects; screens named in DM_UI_ROOT_SCAN, default the menus') are searched for its layouts' root panes, an object holding the name "RootPane"
+// inline; one with a 16:9 size beside it (w x w * 9 / 16, w 1280 / 1920 / 2560 / 3840) gets the taller screen's height (x k), once, when the screen is made. Panes
+// the layouts pin to their parent's top or bottom edge (the layout editor's parent origin) then follow the edges. Each search is logged: how many objects, where
+// "RootPane" was seen (level, the name's offset, the offsets of 16:9 heights near it). First try (2026-11-15, 3 levels, any pointer): no root pane found
 static uint64_t g_root_done[1024]; static int g_nroot, g_root_on = -1;
-static int root_try(uint64_t obj, float k) {
-    uint8_t b[0x180]; if (!canvas_read(obj, b, sizeof b)) return 0;
-    void *n = memmem(b, sizeof b, "RootPane", 9); if (!n) return 0;
+static int root_try(uint64_t obj, const uint8_t *b, size_t n, float k, int depth, char *note, size_t cap) {
+    const uint8_t *nm = memmem(b, n, "RootPane", 9); if (!nm) return 0;
     for (int i = 0; i < g_nroot; i++) if (g_root_done[i] == obj) return 0;
-    for (size_t o = 0; o + 8 <= sizeof b; o += 4) {
+    size_t no = (size_t)(nm - b), l = strlen(note);
+    l += snprintf(note + l, cap - l, " [L%d name+0x%zx", depth, no);
+    int hit = -1;
+    for (size_t o = 0; o + 8 <= n; o += 4) {
         float w, h; memcpy(&w, b + o, 4); memcpy(&h, b + o + 4, 4);
-        if (!((w == 1920.0f && h == 1080.0f) || (w == 3840.0f && h == 2160.0f))) continue;
-        *(volatile float *)(uintptr_t)(obj + o + 4) = h * k;
-        if (g_nroot < 1024) g_root_done[g_nroot++] = obj;
-        return 1;
+        if (h == 720.0f || h == 1080.0f || h == 1440.0f || h == 2160.0f) l += snprintf(note + l, cap - l, " %.0fx%.0f+0x%zx", w, h, o);
+        if (hit < 0 && (w == 1280.0f || w == 1920.0f || w == 2560.0f || w == 3840.0f) && h == w * 9.0f / 16.0f) hit = (int)o;
+        if (l > cap - 40) break;
     }
-    return 0;
+    snprintf(note + l, cap - l, "]");
+    if (hit < 0) return 0;
+    float h; memcpy(&h, b + hit + 4, 4);
+    *(volatile float *)(uintptr_t)(obj + hit + 4) = h * k;
+    if (g_nroot < 1024) g_root_done[g_nroot++] = obj;
+    return 1;
 }
-static int ui_roots(uint64_t screen, float k) {   // root panes made taller under this screen
+static int ui_roots(uint64_t screen, const char *names, float k) {   // root panes made taller under this screen
     if (g_root_on < 0) { const char *e = getenv("DM_UI_ROOT"); g_root_on = !(e && e[0] == '0'); LOG("[dm] UI roots: %s", g_root_on ? "on (DM_UI_ROOT=0 turns them off)" : "off"); }
-    if (!g_root_on) return 0;
-    uint64_t l0[64], l1[32], l2[32]; int got = 0;
-    if (!canvas_read(screen, l0, sizeof l0)) return 0;
-    for (int i = 0; i < 64; i++) {
-        if (l0[i] < 0x100000000ull || (l0[i] & 7)) continue;
-        got += root_try(l0[i], k);
-        if (!canvas_read(l0[i], l1, sizeof l1)) continue;
-        for (int j = 0; j < 32; j++) {
-            if (l1[j] < 0x100000000ull || (l1[j] & 7) || l1[j] == l0[i]) continue;
-            got += root_try(l1[j], k);
-            if (!canvas_read(l1[j], l2, sizeof l2)) continue;
-            for (int m = 0; m < 32; m++) if (l2[m] >= 0x100000000ull && !(l2[m] & 7) && l2[m] != l1[j]) got += root_try(l2[m], k);
+    if (!g_root_on || !names[0]) return 0;
+    const char *scan = getenv("DM_UI_ROOT_SCAN"); if (!scan) scan = "SystemSaveLoad_00,SystemLoadList_00,MenuBG_00,MenuOverlay_00,PlusMenu_00,ImportantMenu_00,MapMenu_00,ShortCut_00,CtrlGuide_00";
+    size_t own = strcspn(names, " "); char key[72]; snprintf(key, sizeof key, "%.*s", (int)own, names);
+    const char *f = strstr(scan, key); if (!f || (f > scan && f[-1] != ',') || (f[own] && f[own] != ',')) return 0;
+    static uint64_t q[8192]; static uint8_t qd[8192]; static uint64_t seen[16384];
+    memset(seen, 0, sizeof seen);
+    int head = 0, tail = 0, got = 0, rp = 0; char note[600] = "";
+    q[tail] = screen; qd[tail++] = 0;
+    while (head < tail) {
+        uint64_t o = q[head]; int d = qd[head++]; uint8_t b[0x200]; size_t n = sizeof b;
+        if (!canvas_read(o, b, n)) { n = 0x80; if (!canvas_read(o, b, n)) continue; }
+        int r = root_try(o, b, n, k, d, note, sizeof note); got += r; rp += memmem(b, n, "RootPane", 9) != NULL;
+        if (d >= 6) continue;
+        for (size_t i = 0; i + 8 <= n && tail < 8192; i += 8) {
+            uint64_t p; memcpy(&p, b + i, 8);
+            if (p < 0x7000000000ull || p >= 0x7500000000ull || (p & 7)) continue;
+            uint32_t hsh = (uint32_t)((p >> 3) * 2654435761u) & 16383; int dup = 0;
+            while (seen[hsh]) { if (seen[hsh] == p) { dup = 1; break; } hsh = (hsh + 1) & 16383; }
+            if (dup) continue; seen[hsh] = p;
+            q[tail] = p; qd[tail++] = (uint8_t)(d + 1);
         }
     }
+    LOG("[dm] UI roots: %s: %d objects searched, \"RootPane\" in %d, %d made taller:%s", key, head, rp, got, note[0] ? note : " none");
     return got;
 }
 static void ui_edges_tick(void) {
@@ -1971,8 +1987,9 @@ static void ui_edges_tick(void) {
         int i = 0; while (i < g_nui && g_ui[i].cv != cv) i++;
         if (i == g_nui) { if (g_nui == 256) continue; g_nui++; g_ui[i].cv = cv; g_ui[i].names[0] = 0; g_ui[i].mode = -1; }
         if (g_ui[i].mode == -1 || g_ui[i].mode > 0) {   // new, or placed: named (again; some small canvases are made every frame, and are named once)
-            if (g_ui[i].mode == -1) g_ui[i].roots = ui_roots(cv - 0x1b8, k);
+            int fresh = g_ui[i].mode == -1;
             canvas_names_all(cv - 0x1b8, g_ui[i].names, sizeof g_ui[i].names);
+            if (fresh) g_ui[i].roots = ui_roots(cv - 0x1b8, g_ui[i].names, k);
             g_ui[i].mode = ui_match(g_ui[i].names);
         }
         g_ui[i].done = 0;
