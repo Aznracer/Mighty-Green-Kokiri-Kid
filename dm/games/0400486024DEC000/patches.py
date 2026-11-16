@@ -214,13 +214,13 @@ _SS_RENDER_VIEW = [
 
 # The full-screen canvases, logged (while DM_SCREEN_ASPECT is on): each canvas loads its projection at main+0x774368 (ldp q1, q4, [x2]; its screen at x0 - 0x1b8, per
 # seedds/nxnative pull request 2795). For the HUD's edges, which screens are which: a canvas of the 3840x2160 projection (x scale 2/3840 exactly) has its screen's
-# vtable kept, the first 15 different (+0x600, 16 bytes: vtable, y scale, 0, count; +0x6f0 how many, +0x6f4 loads, +0x6f8 'NVCS'), logged by hle_nvn.c every 300
-# frames. x9..x14 saved, x16 / x17 free there
+# vtable kept with its latest screen, the first 24 different (+0x600, 32 bytes: vtable, screen, y scale, count; +0x900 how many, +0x904 loads, +0x908 'NVCS'), logged by
+# hle_nvn.c every 300 frames with the strings each screen points to (its layout's name). x9..x14 saved, x16 / x17 free there
 _SS_CANVAS_LOG = [
-    0xad401041, 0xd4200020, 0xb9404a11, 0x34000531, 0xb946f611, 0x11000631, 0xb906f611, 0x1e260031, 0xa9bd2be9, 0xa90133eb, 0xa9023bed, 0x52911129, 0x72a74109,
-    0x6b09023f, 0x54000361, 0x528ac9d1, 0x72aa6871, 0xb906fa11, 0xd106e009, 0xf9400129, 0x0e0c3c8a, 0xb946f20c, 0x9118020d, 0x5280000e, 0x6b0c01df, 0x540000ea,
-    0xf94001ab, 0xeb09017f, 0x54000140, 0x910041ad, 0x110005ce, 0x17fffff9, 0x71003d9f, 0x5400010a, 0xf90001a9, 0x29017daa, 0x1100058c, 0xb906f20c, 0xb9400dab,
-    0x1100056b, 0xb9000dab, 0xa9423bed, 0xa94133eb, 0xa8c32be9, 0xd4200040]
+    0xad401041, 0xd4200020, 0xb9404a11, 0x34000551, 0xb9490611, 0x11000631, 0xb9090611, 0x1e260031, 0xa9bd2be9, 0xa90133eb, 0xa9023bed, 0x52911129, 0x72a74109,
+    0x6b09023f, 0x54000381, 0x528ac9d1, 0x72aa6871, 0xb9090a11, 0xd106e00a, 0xf9400149, 0xb949020c, 0x9118020d, 0x5280000e, 0x6b0c01df, 0x540000ea, 0xf94001ab,
+    0xeb09017f, 0x54000160, 0x910081ad, 0x110005ce, 0x17fffff9, 0x7100619f, 0x5400014a, 0xa90029a9, 0x0e0c3c8b, 0x29027dab, 0x1100058c, 0xb909020c, 0xf90005aa,
+    0xb94015ab, 0x1100056b, 0xb90015ab, 0xa9423bed, 0xa94133eb, 0xa8c32be9, 0xd4200040]
 
 
 def screen_shape(ctx):

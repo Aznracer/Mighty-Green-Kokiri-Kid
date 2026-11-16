@@ -1857,6 +1857,32 @@ static void power_line(uint64_t frame) {
     else { char yt[192], rs[400], tc[400]; dm_yield_top(yt, sizeof yt); mtl_res_stats(rs, sizeof rs); dm_thread_cpu(tc, sizeof tc, 1); }   // the first call only takes the baselines
     pt = t; pe = e; pcpu = cpu; pp = p; piw = iw; ppw = idw; pg = g; pf = frame; mtl_bw(&pld, &pst, &pfu); pudc = mtl_udc_saved_bytes();
 }
+// Strings a guest object points to (safe reads of the process's own memory): the names of a screen's layout, for the canvas log above. Two levels of pointers from the
+// object's first 0x300 bytes; a string is 6+ printable bytes with a letter, a '/' or '_' preferred; at most 3
+static int canvas_read(uint64_t a, void *buf, size_t n) {
+    vm_size_t got = 0;   // vm_read_overwrite: a bad address fails instead of faulting (mach_vm.h is not in the iOS SDK)
+    return a >= 0x100000000ull && a < 0x800000000000ull && vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)(uintptr_t)buf, &got) == KERN_SUCCESS && got == n;
+}
+static int canvas_str(uint64_t a, char *out, size_t cap) {
+    char b[64]; if (!canvas_read(a, b, sizeof b)) return 0;
+    size_t n = 0; int alpha = 0, mark = 0;
+    while (n < sizeof b && b[n] >= 32 && b[n] < 127) { alpha |= (b[n] >= 'A' && b[n] <= 'z'); mark |= b[n] == '/' || b[n] == '_'; n++; }
+    if (n < 6 || n == sizeof b || b[n] || !alpha || !mark) return 0;
+    snprintf(out, cap, "%.*s", (int)n, b); return 1;
+}
+static void canvas_names(uint64_t obj, char *out, size_t cap) {
+    uint64_t w[96], w2[32]; size_t o = 0; int found = 0; out[0] = 0;
+    if (!canvas_read(obj, w, sizeof w)) { snprintf(out, cap, "unreadable"); return; }
+    for (int i = 0; i < 96 && found < 3; i++) {
+        char s[72];
+        if (canvas_str(w[i], s, sizeof s)) { o += snprintf(out + o, cap - o, "%s+%#x=%s", found ? " " : "", i * 8, s); found++; continue; }
+        if (!canvas_read(w[i], w2, sizeof w2)) continue;
+        for (int j = 0; j < 32 && found < 3; j++)
+            if (canvas_str(w2[j], s, sizeof s)) { o += snprintf(out + o, cap - o, "%s+%#x>+%#x=%s", found ? " " : "", i * 8, j * 8, s); found++; break; }
+        if (o >= cap - 80) break;
+    }
+}
+
 static void tsummary(uint64_t frame) {
     char line[1024]; size_t o = 0;
     for (int k = 0; k < 6; k++) {
@@ -1879,15 +1905,16 @@ static void tsummary(uint64_t frame) {
         }
         LOG("[dm] projections up to frame %llu: %u updates (sites %#x, k %.3f, fovy widened %u, game camera 16:9 aspects made the screen's %u, render views %u); m0/m5 (ratio):%s", frame, calls, mask, k, fov, cam, rv, o ? pl : " none");
     }
-    if (dm_fps_state && !memcmp(dm_fps_state + 0x6f8, "NVCS", 4)) {   // the full-screen canvases' screens (Ocarina of Time patches.py _SS_CANVAS_LOG): vtable, y scale, loads
-        uint32_t used, loads; char pl[1024]; size_t o = 0;
-        memcpy(&used, dm_fps_state + 0x6f0, 4); memcpy(&loads, dm_fps_state + 0x6f4, 4);
-        for (uint32_t i = 0; i < used && i < 15 && o < sizeof pl - 64; i++) {
-            uint64_t vt; float y; uint32_t h; const uint8_t *e = dm_fps_state + 0x600 + 16 * i;
-            memcpy(&vt, e, 8); memcpy(&y, e + 8, 4); memcpy(&h, e + 12, 4);
-            o += snprintf(pl + o, sizeof pl - o, " %#llx y %.4g x%u;", (unsigned long long)vt, y, h);
+    if (dm_fps_state && !memcmp(dm_fps_state + 0x908, "NVCS", 4)) {   // the full-screen canvases' screens (Ocarina of Time patches.py _SS_CANVAS_LOG): vtable, loads and the names they point to
+        uint32_t used, loads; char pl[4096]; size_t o = 0;
+        memcpy(&used, dm_fps_state + 0x900, 4); memcpy(&loads, dm_fps_state + 0x904, 4);
+        for (uint32_t i = 0; i < used && i < 24 && o < sizeof pl - 256; i++) {
+            uint64_t vt, scr; uint32_t h; const uint8_t *e = dm_fps_state + 0x600 + 32 * i;
+            memcpy(&vt, e, 8); memcpy(&scr, e + 8, 8); memcpy(&h, e + 20, 4);
+            char names[200]; canvas_names(scr, names, sizeof names);
+            o += snprintf(pl + o, sizeof pl - o, " %#llx x%u {%s};", (unsigned long long)vt, h, names);
         }
-        LOG("[dm] canvases up to frame %llu: %u projection loads; screens (vtable, y scale, loads):%s", frame, loads, o ? pl : " none");
+        LOG("[dm] canvases up to frame %llu: %u projection loads; screens (vtable, loads, names):%s", frame, loads, o ? pl : " none");
     }
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
