@@ -1856,12 +1856,22 @@ __attribute__((constructor)) static void nvn_nops_register(void) {
         if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && nvn_slot[i].fn != (void *)nvn_nop && strncmp(nvn_names[i], "nvnCommandBuffer", 16)) {
             nvn_big_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_big_entry; nbig++;
         }
-    // DM_NVN_PROF=1: implemented functions (except unimplemented stubs and present: present includes the display-link wait and is counted separately) get a timing wrapper, used to break down the time spent in the "translation layer recording phase"
-    if (getenv("DM_NVN_PROF"))
-        for (unsigned i = 0; i < NVN_NFUNC; i++)
-            if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_prof_entry; }
+    // DM_NVN_PROF=1: implemented functions (except unimplemented stubs and present: present includes the display-link wait and is counted separately) get a timing wrapper, used to break down the time spent in the "translation layer recording phase".
+    // Installed by nvn_prof_install at the first present: this constructor runs before an iPhone app's env.txt is read, so its getenv would never see the switch there
     LOG("[nvn] null device: %u names, %u implemented (%u semantic + %u empty, %u of them on the large host stack), the other %u go to the red-reporting stub",
         NVN_NFUNC, g_nsem + nnop, g_nsem, nnop, nbig, NVN_NFUNC - g_nsem - nnop);
+}
+
+static int g_nvn_prof;   // DM_NVN_PROF installed (nvn_prof_install)
+static void nvn_prof_install(void) {   // at the first present, after env.txt: each wrapper's real function is stored before its slot points at the wrapper
+    if (!getenv("DM_NVN_PROF")) return;
+    unsigned n = 0;
+    for (unsigned i = 0; i < NVN_NFUNC; i++)
+        if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && nvn_slot[i].fn != (void *)nvn_prof_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) {
+            nvn_real[i] = nvn_slot[i].fn; atomic_thread_fence(memory_order_release); nvn_slot[i].fn = (void *)nvn_prof_entry; n++;
+        }
+    g_nvn_prof = 1;
+    LOG("[nvn] DM_NVN_PROF: %u functions timed; the five that take longest are listed every 300 frames (translation layer top 5)", n);
 }
 
 // ---------- Window / present ----------
@@ -2125,6 +2135,159 @@ static void power_line(uint64_t frame) {
     else { char yt[192], rs[400], tc[400]; dm_yield_top(yt, sizeof yt); mtl_res_stats(rs, sizeof rs); dm_thread_cpu(tc, sizeof tc, 1); }   // the first call only takes the baselines
     pt = t; pe = e; pcpu = cpu; pp = p; piw = iw; ppw = idw; pg = g; pf = frame; mtl_bw(&pld, &pst, &pfu); pudc = mtl_udc_saved_bytes();
 }
+// Strings a guest object points to (safe reads of the process's own memory): the names of a screen's layout, for the canvas log above. Two levels of pointers from the
+// object's first 0x300 bytes; a string is 6+ printable bytes with a letter, a '/' or '_' preferred; at most 3
+static int canvas_read(uint64_t a, void *buf, size_t n) {
+    vm_size_t got = 0;   // vm_read_overwrite: a bad address fails instead of faulting (mach_vm.h is not in the iOS SDK)
+    return a >= 0x100000000ull && a < 0x800000000000ull && vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)(uintptr_t)buf, &got) == KERN_SUCCESS && got == n;
+}
+static int canvas_str(uint64_t a, char *out, size_t cap) {
+    char b[64]; if (!canvas_read(a, b, sizeof b)) return 0;
+    size_t n = 0; int alpha = 0, mark = 0;
+    while (n < sizeof b && b[n] >= 32 && b[n] < 127) { alpha |= (b[n] >= 'A' && b[n] <= 'z'); mark |= b[n] == '/' || b[n] == '_'; n++; }
+    if (n < 6 || n == sizeof b || b[n] || !alpha || !mark) return 0;
+    snprintf(out, cap, "%.*s", (int)n, b); return 1;
+}
+static void canvas_names(uint64_t obj, char *out, size_t cap) {
+    uint64_t w[96], w2[32]; size_t o = 0; int found = 0; out[0] = 0;
+    if (!canvas_read(obj, w, sizeof w)) { snprintf(out, cap, "unreadable"); return; }
+    for (int i = 0; i < 96 && !found; i++) {   // the first name that is a layout's (not a .baglmf file every screen points to)
+        char s[72];
+        if (canvas_str(w[i], s, sizeof s) && !strstr(s, ".")) { o += snprintf(out + o, cap - o, "%s", s); found++; continue; }
+        if (!canvas_read(w[i], w2, sizeof w2)) continue;
+        for (int j = 0; j < 32 && !found; j++)
+            if (canvas_str(w2[j], s, sizeof s) && !strstr(s, ".")) { o += snprintf(out + o, cap - o, "%s", s); found++; }
+    }
+    if (!found) snprintf(out, cap, "?");
+}
+
+// UI edges (Ocarina of Time's screen shape, patches.py _SS_CANVAS_LOG): every canvas the game makes is queued in the state page (+0xd00, a ring of 64; +0xffc the count).
+// Each new one is named by the strings its screen points to (canvas - 0x1b8, read safely), and one whose names match DM_UI_EDGE is moved to the taller screen's top or
+// bottom edge by writing its matrix (made once by main+0x774330: canvas +8 for row vectors, y column at +4 of each row, the y translation at +0x3c; a y-flipped
+// copy at +0x48, translation at +0x7c) by 1 - 1/k in clip space. DM_UI_EDGE: rules "name[!exclude]:up|down", comma-separated; name is the screen's own (the first
+// of its names: a screen also points to its neighbours'), exclude any of them; none by default (the pause menus and the minimap are not drawn through these canvases,
+// iPhone Duo 2026-11-15). A canvas whose matrix the game makes again is moved again; one whose names no longer match (freed
+// and reused) is dropped. Logged every 300 frames with tsummary
+typedef struct { uint64_t cv; char names[240]; int mode; float t1, t2; int done, roots; } ui_cv_t;
+static ui_cv_t g_ui[256]; static int g_nui; static uint32_t g_ui_seen;
+static struct { char inc[64], exc[64]; int mode; } g_ui_rule[16]; static int g_ui_nrule = -1;
+static void canvas_names_all(uint64_t obj, char *out, size_t cap) {   // up to 4 different layout names (no '.' files), space-separated
+    uint64_t w[96], w2[32]; size_t o = 0; int found = 0; out[0] = 0;
+    if (!canvas_read(obj, w, sizeof w)) return;
+    for (int i = 0; i < 96 && found < 4; i++) {
+        char s[72]; int got = canvas_str(w[i], s, sizeof s);
+        if (!got && canvas_read(w[i], w2, sizeof w2)) for (int j = 0; j < 32 && !got; j++) got = canvas_str(w2[j], s, sizeof s);
+        if (!got || strchr(s, '.') || strstr(out, s)) continue;
+        o += snprintf(out + o, cap - o, "%s%s", found ? " " : "", s); found++;
+        if (o >= cap - 72) break;
+    }
+}
+static void ui_rules_load(void) {
+    const char *e = getenv("DM_UI_EDGE"); if (!e) e = "";
+    g_ui_nrule = 0;
+    while (*e && g_ui_nrule < 16) {
+        const char *end = strchr(e, ','); size_t n = end ? (size_t)(end - e) : strlen(e); char r[160];
+        snprintf(r, sizeof r, "%.*s", (int)n, e); e += n + (end ? 1 : 0);
+        char *colon = strrchr(r, ':'); if (!colon) continue; *colon = 0;
+        int mode = !strcmp(colon + 1, "up") ? 1 : !strcmp(colon + 1, "down") ? 2 : 0; if (!mode) continue;
+        char *bang = strchr(r, '!'); if (bang) *bang = 0;
+        snprintf(g_ui_rule[g_ui_nrule].inc, 64, "%s", r); snprintf(g_ui_rule[g_ui_nrule].exc, 64, "%s", bang ? bang + 1 : "");
+        g_ui_rule[g_ui_nrule++].mode = mode;
+    }
+    LOG("[dm] UI edges: %d rule(s)%s", g_ui_nrule, getenv("DM_UI_EDGE") ? " from DM_UI_EDGE" : " (none by default; DM_UI_EDGE)");
+}
+static int ui_match(const char *names) {   // the include must be the screen's own name, its first (the others are its neighbours': ChallengeMenu_00 points to CtrlGuide_00)
+    size_t own = strcspn(names, " ");
+    for (int i = 0; i < g_ui_nrule; i++)
+        if (g_ui_rule[i].inc[0] && strlen(g_ui_rule[i].inc) == own && !strncmp(names, g_ui_rule[i].inc, own) && !(g_ui_rule[i].exc[0] && strstr(names, g_ui_rule[i].exc))) return g_ui_rule[i].mode;
+    return 0;
+}
+// Taller layout roots (DM_UI_ROOT=1; off by default): a menu screen's objects (breadth first through guest heap pointers, 0x7000000000 up, read safely; up to 6
+// levels and 8000 objects; screens named in DM_UI_ROOT_SCAN, default the menus') are searched for its layouts' root panes, an object holding the name "RootPane"
+// inline; one with a 16:9 size beside it (w x w * 9 / 16, w 1280 / 1920 / 2560 / 3840) gets the taller screen's height (x k), once, when the screen is made. Panes
+// the layouts pin to their parent's top or bottom edge (the layout editor's parent origin) then follow the edges. Each search is logged: how many objects, where
+// "RootPane" was seen (level, the name's offset, the offsets of 16:9 heights near it). iPhone Duo, 2026-11-16: "RootPane" in 60-139 objects per menu, never
+// beside a 16:9 size (name tables and layout files, not the live root panes), so nothing moved; off by default: each menu screen cost 8192 reads
+static uint64_t g_root_done[1024]; static int g_nroot, g_root_on = -1;
+static int root_try(uint64_t obj, const uint8_t *b, size_t n, float k, int depth, char *note, size_t cap) {
+    const uint8_t *nm = memmem(b, n, "RootPane", 9); if (!nm) return 0;
+    for (int i = 0; i < g_nroot; i++) if (g_root_done[i] == obj) return 0;
+    size_t no = (size_t)(nm - b), l = strlen(note);
+    l += snprintf(note + l, cap - l, " [L%d name+0x%zx", depth, no);
+    int hit = -1;
+    for (size_t o = 0; o + 8 <= n; o += 4) {
+        float w, h; memcpy(&w, b + o, 4); memcpy(&h, b + o + 4, 4);
+        if (h == 720.0f || h == 1080.0f || h == 1440.0f || h == 2160.0f) l += snprintf(note + l, cap - l, " %.0fx%.0f+0x%zx", w, h, o);
+        if (hit < 0 && (w == 1280.0f || w == 1920.0f || w == 2560.0f || w == 3840.0f) && h == w * 9.0f / 16.0f) hit = (int)o;
+        if (l > cap - 40) break;
+    }
+    snprintf(note + l, cap - l, "]");
+    if (hit < 0) return 0;
+    float h; memcpy(&h, b + hit + 4, 4);
+    *(volatile float *)(uintptr_t)(obj + hit + 4) = h * k;
+    if (g_nroot < 1024) g_root_done[g_nroot++] = obj;
+    return 1;
+}
+static int ui_roots(uint64_t screen, const char *names, float k) {   // root panes made taller under this screen
+    if (g_root_on < 0) { const char *e = getenv("DM_UI_ROOT"); g_root_on = e && e[0] == '1'; LOG("[dm] UI roots: %s", g_root_on ? "on (DM_UI_ROOT=1)" : "off (DM_UI_ROOT=1 turns them on)"); }
+    if (!g_root_on || !names[0]) return 0;
+    const char *scan = getenv("DM_UI_ROOT_SCAN"); if (!scan) scan = "SystemSaveLoad_00,SystemLoadList_00,MenuBG_00,MenuOverlay_00,PlusMenu_00,ImportantMenu_00,MapMenu_00,ShortCut_00,CtrlGuide_00";
+    size_t own = strcspn(names, " "); char key[72]; snprintf(key, sizeof key, "%.*s", (int)own, names);
+    const char *f = strstr(scan, key); if (!f || (f > scan && f[-1] != ',') || (f[own] && f[own] != ',')) return 0;
+    static uint64_t q[8192]; static uint8_t qd[8192]; static uint64_t seen[16384];
+    memset(seen, 0, sizeof seen);
+    int head = 0, tail = 0, got = 0, rp = 0; char note[600] = "";
+    q[tail] = screen; qd[tail++] = 0;
+    while (head < tail) {
+        uint64_t o = q[head]; int d = qd[head++]; uint8_t b[0x200]; size_t n = sizeof b;
+        if (!canvas_read(o, b, n)) { n = 0x80; if (!canvas_read(o, b, n)) continue; }
+        int r = root_try(o, b, n, k, d, note, sizeof note); got += r; rp += memmem(b, n, "RootPane", 9) != NULL;
+        if (d >= 6) continue;
+        for (size_t i = 0; i + 8 <= n && tail < 8192; i += 8) {
+            uint64_t p; memcpy(&p, b + i, 8);
+            if (p < 0x7000000000ull || p >= 0x7500000000ull || (p & 7)) continue;
+            uint32_t hsh = (uint32_t)((p >> 3) * 2654435761u) & 16383; int dup = 0;
+            while (seen[hsh]) { if (seen[hsh] == p) { dup = 1; break; } hsh = (hsh + 1) & 16383; }
+            if (dup) continue; seen[hsh] = p;
+            q[tail] = p; qd[tail++] = (uint8_t)(d + 1);
+        }
+    }
+    LOG("[dm] UI roots: %s: %d objects searched, \"RootPane\" in %d, %d made taller:%s", key, head, rp, got, note[0] ? note : " none");
+    return got;
+}
+static void ui_edges_tick(void) {
+    if (!dm_fps_state) return;
+    uint32_t idx; memcpy(&idx, dm_fps_state + 0xffc, 4); if (!idx) return;
+    float k; memcpy(&k, dm_fps_state + 0x5c, 4); if (!(k > 1.0f && k < 4.0f)) return;
+    if (g_ui_nrule < 0) ui_rules_load();
+    if (idx - g_ui_seen > 64) g_ui_seen = idx - 64;
+    for (; g_ui_seen != idx; g_ui_seen++) {
+        uint64_t cv; memcpy(&cv, dm_fps_state + 0xd00 + 8 * (g_ui_seen & 63), 8);
+        int i = 0; while (i < g_nui && g_ui[i].cv != cv) i++;
+        if (i == g_nui) { if (g_nui == 256) continue; g_nui++; g_ui[i].cv = cv; g_ui[i].names[0] = 0; g_ui[i].mode = -1; }
+        if (g_ui[i].mode == -1 || g_ui[i].mode > 0) {   // new, or placed: named (again; some small canvases are made every frame, and are named once)
+            int fresh = g_ui[i].mode == -1;
+            canvas_names_all(cv - 0x1b8, g_ui[i].names, sizeof g_ui[i].names);
+            if (fresh) g_ui[i].roots = ui_roots(cv - 0x1b8, g_ui[i].names, k);
+            g_ui[i].mode = ui_match(g_ui[i].names);
+        }
+        g_ui[i].done = 0;
+    }
+    float d = 1.0f - 1.0f / k;
+    for (int i = 0; i < g_nui; i++) {
+        ui_cv_t *u = &g_ui[i]; float a, b;
+        if (u->mode <= 0 || !canvas_read(u->cv + 0x3c, &a, 4) || !canvas_read(u->cv + 0x7c, &b, 4)) continue;
+        if (u->done && a == u->t1 && b == u->t2) continue;   // still where it was put
+        if (u->done) {   // the game wrote it again, or the canvas is gone: only a canvas with the same names is placed again
+            char now[240]; canvas_names_all(u->cv - 0x1b8, now, sizeof now);
+            if (strcmp(now, u->names)) { u->mode = 0; continue; }
+        }
+        if (a != -b) { u->mode = 0; continue; }   // not this function's pair of matrices
+        float s = u->mode == 1 ? d : -d;
+        *(volatile float *)(uintptr_t)(u->cv + 0x3c) = a + s; *(volatile float *)(uintptr_t)(u->cv + 0x7c) = b - s;
+        u->t1 = a + s; u->t2 = b - s; u->done = 1;
+    }
+}
 static void tsummary(uint64_t frame) {
     char line[1024]; size_t o = 0;
     for (int k = 0; k < 6; k++) {
@@ -2134,6 +2297,37 @@ static void tsummary(uint64_t frame) {
     }
     LOG("[nvn] timing up to frame %llu:%s", frame, line);
     { void mtl_pso_line(char *, size_t); char pl[1024]; mtl_pso_line(pl, sizeof pl); LOG("[nvn] pipelines up to frame %llu: %s", frame, pl); }
+    if (dm_fps_state && !memcmp(dm_fps_state + 0x5f8, "PORJ", 4)) {   // a screen-shape profile's projection table (Ocarina of Time patches.py _SS_PROJ_X0): m0, m5, their ratio, whether its y row was divided, updates of each
+        uint32_t used, calls, fov, mask, cam, rv; float k; char pl[1024]; size_t o = 0;
+        memcpy(&cam, dm_fps_state + 0x5ec, 4); memcpy(&rv, dm_fps_state + 0x5e8, 4); memcpy(&used, dm_fps_state + 0x5f0, 4); memcpy(&calls, dm_fps_state + 0x5f4, 4); memcpy(&fov, dm_fps_state + 0x300, 4); memcpy(&mask, dm_fps_state + 0x54, 4); memcpy(&k, dm_fps_state + 0x5c, 4);
+        for (uint32_t i = 0; i < used && i < 14 && o < sizeof pl - 64; i++) {
+            float m0, m5; uint32_t d, h; const uint8_t *e = dm_fps_state + 0x500 + 16 * i;
+            memcpy(&m0, e, 4); memcpy(&m5, e + 4, 4); memcpy(&d, e + 8, 4); memcpy(&h, e + 12, 4);
+            o += snprintf(pl + o, sizeof pl - o, " %.4g/%.4g (%.3f)%s x%u;", m0, m5, m0 != 0.0f ? (m5 / m0 < 0 ? -m5 / m0 : m5 / m0) : 0.0f, d ? " divided" : "", h);
+        }
+        LOG("[dm] projections up to frame %llu: %u updates (sites %#x, k %.3f, fovy widened %u, game camera 16:9 aspects made the screen's %u, render views %u); m0/m5 (ratio):%s", frame, calls, mask, k, fov, cam, rv, o ? pl : " none");
+    }
+    if (dm_fps_state && !memcmp(dm_fps_state + 0xc08, "NVCS", 4)) {   // the full-screen canvases' screens (Ocarina of Time patches.py _SS_CANVAS_LOG): vtable, loads and the names they point to
+        uint32_t used, loads; static char pl[12288]; size_t o = 0;
+        memcpy(&used, dm_fps_state + 0xc00, 4); memcpy(&loads, dm_fps_state + 0xc04, 4);
+        for (uint32_t i = 0; i < used && i < 48 && o < sizeof pl - 256; i++) {
+            uint64_t vt, scr; uint32_t h; const uint8_t *e = dm_fps_state + 0x600 + 32 * i;
+            memcpy(&vt, e, 8); memcpy(&scr, e + 8, 8); memcpy(&h, e + 20, 4);
+            char names[200]; canvas_names(scr, names, sizeof names);
+            o += snprintf(pl + o, sizeof pl - o, " %#llx x%u %s;", (unsigned long long)(vt - (module_of(dm_fps_state) ? (uint64_t)(uintptr_t)module_of(dm_fps_state)->base : 0)), h, names);
+        }
+        LOG("[dm] canvases up to frame %llu: %u projection loads; screens (main+vtable, loads, name):%s", frame, loads, o ? pl : " none");
+    }
+    if (g_nui) {   // every canvas ui_edges_tick has seen: its names, its placement (U up, D down) and its y translation
+        static char pl[16384]; size_t o = 0;
+        for (int i = 0; i < g_nui && o < sizeof pl - 300; i++) {
+            float a = 0; canvas_read(g_ui[i].cv + 0x3c, &a, 4);
+            if (!g_ui[i].names[0]) continue;
+            o += snprintf(pl + o, sizeof pl - o, " [%s]%s %.3f", g_ui[i].names, g_ui[i].mode == 1 ? " U" : g_ui[i].mode == 2 ? " D" : "", a);
+            o += g_ui[i].roots ? snprintf(pl + o, sizeof pl - o, " R%d;", g_ui[i].roots) : snprintf(pl + o, sizeof pl - o, ";");
+        }
+        LOG("[dm] UI canvases up to frame %llu (%d seen, %d root panes taller; names, placement, y translation, R roots):%s", frame, g_nui, g_nroot, o ? pl : " none");
+    }
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > tgt;
@@ -2711,7 +2905,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
       if (fin) nvn_queue_finish((queue_t *)q); }
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
-    if (nvn_real[0] || nvn_real[1]) {   // DM_NVN_PROF: record phase = time of all implemented functions except submit; submit phase = QueueSubmitCommands
+    { static int pi; if (!pi) { pi = 1; nvn_prof_install(); } }
+    if (g_nvn_prof) {   // DM_NVN_PROF: record phase = time of all implemented functions except submit; submit phase = QueueSubmitCommands
         static unsigned isub = ~0u; static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
         if (isub == ~0u) for (isub = 0; isub < NVN_NFUNC && strcmp(nvn_names[isub], "nvnQueueSubmitCommands"); isub++) {}
         uint64_t rec = 0, sub = 0;
@@ -2787,6 +2982,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();
     { void dm_vi_frame_queued(uint64_t); dm_vi_frame_queued(g_frame); }   // the layer's frame history (hle_vi.c), numbered as GetLatestFrameNumber
+    ui_edges_tick();   // the UI canvases the screen-shape stubs queue (Ocarina of Time): placed at the taller screen's edges by name
     if (g_frame % TWIN == 0) tsummary(g_frame);
     // GPU replay carries the submitted frame, even when a later CPU frame is already queued.
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)

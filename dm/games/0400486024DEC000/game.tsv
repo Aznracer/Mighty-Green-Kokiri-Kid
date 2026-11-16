@@ -10,7 +10,6 @@ program_id	0400486024DEC000
 name	The Legend of Zelda: Ocarina of Time
 ipa	ZeldaOcarinaOfTime.ipa
 app_category	public.app-category.adventure-games
-pad_layout	full
 
 # ---- Versions ----
 build	v131072	v131072	main=e0f3ccfaf50065ae4ea01eb5aeb13b1a	subsdk0=b0110087a7b339ef74588d3bd0b4dd5d	sdk=1643a838814f9c10c696f930ed681e7f
@@ -46,3 +45,14 @@ draw_barriers	game
 # As Tears of the Kingdom: the terrain's height, blend and hole maps are written by the CPU into textures after they are created. Without these keys they stay zero: holes in the ground and the wrong materials
 tex_flush_upload	on
 tex_dirty_upload	on
+# Touch controls from cheemu21/kid-with-sword-remake: the Native layout (a mobile game's layout in very transparent glass) in the Forest colours; DM_PAD_THEME=0 in env.txt gives the Classic colours
+pad_layout	native
+pad_theme	forest
+# cheemu21 V17: present snapshots
+present_snap	on
+# The game submits a frame's commands behind an event its CPU signals once the frame before has left the GPU, so the GPU starts each frame with nothing queued and waits for the
+# replay: with Metal encoding on its own thread a GPU-bound Hyrule Field scene went 55.3-55.8 -> 56.5-56.9 fps (Apple M4 Pro, three runs a side, interleaved)
+enc_thread	on
+# Screen shape (patches.py screen_shape): DM_SCREEN_ASPECT renders the iPhone Duo's 1.43:1 screen in its own shape, the display size's height from the screen's ratio
+# (2560x1792 docked) and the views' vertical angle widened so 16:9's sides stay in view (more above and below); the iOS launcher offers it (Picture shape)
+screen_aspect	on
