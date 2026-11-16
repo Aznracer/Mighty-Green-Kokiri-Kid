@@ -1886,8 +1886,9 @@ static void canvas_names(uint64_t obj, char *out, size_t cap) {
 // UI edges (Ocarina of Time's screen shape, patches.py _SS_CANVAS_LOG): every canvas the game makes is queued in the state page (+0xd00, a ring of 64; +0xffc the count).
 // Each new one is named by the strings its screen points to (canvas - 0x1b8, read safely), and one whose names match DM_UI_EDGE is moved to the taller screen's top or
 // bottom edge by writing its matrix (made once by main+0x774330: canvas +8 for row vectors, y column at +4 of each row, the y translation at +0x3c; a y-flipped
-// copy at +0x48, translation at +0x7c) by 1 - 1/k in clip space. DM_UI_EDGE: rules "include[!exclude]:up|down", comma-separated (default: the pause menus' button
-// guide, CtrlGuide_00 but not the save list's, SystemSaveLoad_00). A canvas whose matrix the game makes again is moved again; one whose names no longer match (freed
+// copy at +0x48, translation at +0x7c) by 1 - 1/k in clip space. DM_UI_EDGE: rules "name[!exclude]:up|down", comma-separated; name is the screen's own (the first
+// of its names: a screen also points to its neighbours'), exclude any of them; none by default (the pause menus and the minimap are not drawn through these canvases,
+// iPhone Duo 2026-11-15). A canvas whose matrix the game makes again is moved again; one whose names no longer match (freed
 // and reused) is dropped. Logged every 300 frames with tsummary
 typedef struct { uint64_t cv; char names[240]; int mode; float t1, t2; int done; } ui_cv_t;
 static ui_cv_t g_ui[256]; static int g_nui; static uint32_t g_ui_seen;
@@ -1904,7 +1905,7 @@ static void canvas_names_all(uint64_t obj, char *out, size_t cap) {   // up to 4
     }
 }
 static void ui_rules_load(void) {
-    const char *e = getenv("DM_UI_EDGE"); if (!e) e = "CtrlGuide_00!SystemSaveLoad_00:down";
+    const char *e = getenv("DM_UI_EDGE"); if (!e) e = "";
     g_ui_nrule = 0;
     while (*e && g_ui_nrule < 16) {
         const char *end = strchr(e, ','); size_t n = end ? (size_t)(end - e) : strlen(e); char r[160];
@@ -1915,11 +1916,12 @@ static void ui_rules_load(void) {
         snprintf(g_ui_rule[g_ui_nrule].inc, 64, "%s", r); snprintf(g_ui_rule[g_ui_nrule].exc, 64, "%s", bang ? bang + 1 : "");
         g_ui_rule[g_ui_nrule++].mode = mode;
     }
-    LOG("[dm] UI edges: %d rule(s) from %s", g_ui_nrule, getenv("DM_UI_EDGE") ? "DM_UI_EDGE" : "the default (CtrlGuide_00!SystemSaveLoad_00:down)");
+    LOG("[dm] UI edges: %d rule(s)%s", g_ui_nrule, getenv("DM_UI_EDGE") ? " from DM_UI_EDGE" : " (none by default; DM_UI_EDGE)");
 }
-static int ui_match(const char *names) {
+static int ui_match(const char *names) {   // the include must be the screen's own name, its first (the others are its neighbours': ChallengeMenu_00 points to CtrlGuide_00)
+    size_t own = strcspn(names, " ");
     for (int i = 0; i < g_ui_nrule; i++)
-        if (g_ui_rule[i].inc[0] && strstr(names, g_ui_rule[i].inc) && !(g_ui_rule[i].exc[0] && strstr(names, g_ui_rule[i].exc))) return g_ui_rule[i].mode;
+        if (g_ui_rule[i].inc[0] && strlen(g_ui_rule[i].inc) == own && !strncmp(names, g_ui_rule[i].inc, own) && !(g_ui_rule[i].exc[0] && strstr(names, g_ui_rule[i].exc))) return g_ui_rule[i].mode;
     return 0;
 }
 static void ui_edges_tick(void) {
