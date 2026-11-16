@@ -3065,6 +3065,14 @@ static nvn_hmap g_alias_lseen = {.klen = sizeof(alias_key)};   // key → g_fenc
 static nvn_hmap g_alias_gone = {.klen = sizeof(alias_key)};   // keys alias_retire_idle retired: a finalized descriptor over one resolves to nothing instead of a new texture
 static nvn_hmap g_alias_wb = {.klen = sizeof(alias_key)};     // keys whose texture's content was written back into its storage before it was let go: the next texture over it, live or not, is made again from the storage (tex_init_fill again)
 static int alias_storage_gpu_only(const alias_key *k); static int alias_wb_mark(const alias_key *k, void *tex);   // below
+// Whether a shared texture must stay when memory runs short (the guard's idle eviction, the retirement): the only copy of what the GPU drew is written back into its storage first
+// (alias_wb_mark: it goes once that has landed), or kept when it cannot be and is small. Ocarina of Time's terrain normal maps (260x260 RG8) let go unwritten came back empty: plaid tiles
+// that spread over a long session while the guard evicted every 30 frames. Caller holds g_smu
+static int alias_spare_gpu_only(const alias_key *k, void *tex) {
+    if (!alias_storage_gpu_only(k)) return 0;
+    if (alias_wb_mark(k, tex)) return 1;
+    return ((__bridge id<MTLTexture>)tex).allocatedSize <= (4u << 20);
+}
 // Live GPU-only image descriptions, including those not used yet. A dynamic-resolution family declares its largest image before any particular resolution is used.
 // Keeping only descriptions here lets its first allocation cover that family exactly, without allocating every resolution or rounding to a power of two.
 static nvn_hmap g_image_desc = {.klen = 8};   // serial → malloc'ed tex_t, under g_smu
@@ -3281,8 +3289,16 @@ static void alias_retire_idle(void) {
     static int off = -1; if (off < 0) { const char *e = getenv("DM_NVN_ALIAS_RETIRE"); off = e && !atoi(e); }
     if (off) return;
     pthread_mutex_lock(&g_res_mu); uint64_t held_bytes = g_res ? g_res.allocatedSize : 0; pthread_mutex_unlock(&g_res_mu);
-    uint64_t ws = ws_bytes(), lo_bytes = ws / 100 * ALIAS_LO;
-    if (held_bytes <= ws / 100 * ALIAS_HI) return;
+    uint64_t ws = ws_bytes(), lo_bytes = ws / 100 * ALIAS_LO, need = 0, room = 0;
+#if TARGET_OS_IPHONE
+    // On a phone the system ends the process for its footprint long before the residency set nears the working set: Ocarina of Time on an iPhone Duo was killed with no log after
+    // 54 minutes, 851 MB from the limit and a 6 GB set, at an area change. So under DM_NVN_HEADROOM_MB of room to the limit (os_proc_available_memory; default 1024, 0 turns it off)
+    // the retirement runs too, and lets go until the room is back plus 128 MB
+    static uint64_t want = 1; if (want == 1) { const char *e = getenv("DM_NVN_HEADROOM_MB"); want = (uint64_t)(e && *e ? atoll(e) : 1024) << 20; }
+    if (want) { room = os_proc_available_memory(); if (room && room < want) need = want - room + ((uint64_t)128 << 20); }
+#endif
+    int over = held_bytes > ws / 100 * ALIAS_HI;
+    if (!over && !need) return;
     CFMutableSetRef idheld = treg_held_set();   // before g_smu: g_smu is taken inside g_rmu (alias_sweep), never the other way round
     pthread_mutex_lock(&g_smu);
     if (!g_alias.n) { pthread_mutex_unlock(&g_smu); CFRelease(idheld); return; }
@@ -3297,7 +3313,7 @@ static void alias_retire_idle(void) {
     for (uint32_t i = 0; i < g_alias.cap; i++) {
         if (!g_alias.vals[i] || CFSetContainsValue(held, g_alias.vals[i]) || CFSetContainsValue(idheld, g_alias.vals[i])) continue;   // a registered texture ID still resolves to it
         alias_key k; memcpy(&k, g_alias.keys + (size_t)i * g_alias.klen, sizeof k);
-        if (alias_storage_gpu_only(&k) && alias_wb_mark(&k, g_alias.vals[i])) continue;   // the only copy of GPU content: written back first, let go once that has landed (alias_wb_land)
+        if (alias_spare_gpu_only(&k, g_alias.vals[i])) continue;   // the only copy of GPU content: written back first, let go once that has landed (alias_wb_land), or kept
         uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_lseen, &k);
         if (seen && f + 1 - seen < ALIAS_RETIRE) continue;
         if (n == cap) { cand *nc = realloc(cs, (cap = cap ? cap * 2 : 64) * sizeof *cs); if (!nc) break; cs = nc; }
@@ -3306,7 +3322,7 @@ static void alias_retire_idle(void) {
     CFRelease(held); CFRelease(idheld);
     if (n > 1) qsort_b(cs, n, sizeof *cs, ^int(const void *x, const void *y) { uint64_t a = ((const cand *)x)->seen, b = ((const cand *)y)->seen; return a < b ? -1 : a > b; });
     uint32_t take = 0; uint64_t freed = 0;
-    for (uint32_t j = 0; j < n && held_bytes - freed > lo_bytes; j++) {   // deletion shifts entries: the keys were collected first
+    for (uint32_t j = 0; j < n && ((over && held_bytes > lo_bytes + freed) || freed < need); j++) {   // deletion shifts entries: the keys were collected first
         void *old = nvn_hm_del(&g_alias, &cs[j].k);
         if (!old) continue;
         nvn_hm_del(&g_alias_seen, &cs[j].k); nvn_hm_del(&g_alias_lseen, &cs[j].k); nvn_hm_put(&g_alias_gone, &cs[j].k, (void *)1);
@@ -3318,8 +3334,8 @@ static void alias_retire_idle(void) {
     if (take) { g_ser_gen++; g_alias_retired += take; trc_hold(); trc_flush(); }
     pthread_mutex_unlock(&g_smu);
     free(cs);
-    if (take) { static int lines; if (lines++ < 8) MLOG("shared textures: %u retired (%llu MB), no live object resolved to them in %d submissions (residency set %llu MB of a %llu MB working set)", take,
-                 (unsigned long long)(freed >> 20), ALIAS_RETIRE, (unsigned long long)(held_bytes >> 20), (unsigned long long)(ws >> 20)); }
+    if (take) { static int lines; lines++; if (lines <= 8 || lines % 50 == 0) MLOG("shared textures: %u retired (%llu MB), no live object resolved to them in %d submissions (residency set %llu MB of a %llu MB working set; room to the memory limit %llu MB, %d times so far)", take,
+                 (unsigned long long)(freed >> 20), ALIAS_RETIRE, (unsigned long long)(held_bytes >> 20), (unsigned long long)(ws >> 20), (unsigned long long)(room >> 20), lines); }
 }
 static __unsafe_unretained id serial_get(uint64_t k) { pthread_mutex_lock(&g_smu); __unsafe_unretained id o = hm_get_id(&g_by_serial, &k); pthread_mutex_unlock(&g_smu); return o; }
 static int serial_is_program(id o);
@@ -7398,7 +7414,7 @@ static unsigned alias_evict_idle(void) {
     uint32_t n = 0; alias_key *ks = g_alias.n ? malloc(g_alias.n * sizeof *ks) : NULL;
     for (uint32_t i = 0; ks && i < g_alias.cap; i++) { if (!g_alias.vals[i] || CFSetContainsValue(held, g_alias.vals[i])) continue;
         const void *k = g_alias.keys + (size_t)i * g_alias.klen; uint64_t seen = (uint64_t)(uintptr_t)nvn_hm_get(&g_alias_seen, k);
-        if (!seen || g_fence + 1 - seen >= ALIAS_IDLE) memcpy(&ks[n++], k, sizeof *ks); }
+        if ((!seen || g_fence + 1 - seen >= ALIAS_IDLE) && !alias_spare_gpu_only((const alias_key *)k, g_alias.vals[i])) memcpy(&ks[n++], k, sizeof *ks); }
     CFRelease(held);
     alias_let_go(ks, n);
     if (n) { g_ser_gen++; g_alias_idle += n; }
@@ -7433,8 +7449,9 @@ static void guard_evict(int force) { @autoreleasepool {
     last = f;
     trc_hold(); unsigned entries = alias_evict_idle(), spares = pkg_trim(), staging = up_trim();
     defer_drain(); trc_flush(); res_commit();
-    static uint64_t lines; if (entries + spares + staging && lines++ < 16)
-        MLOG("GPU memory guard: %llu MB (it lets go from %llu MB): %u idle sharing entries, %u spare textures, %u staging blocks let go", (unsigned long long)(guard_used() >> 20), (unsigned long long)(g_guard.evict >> 20), entries, spares, staging);
+    static uint64_t lines; if (entries + spares + staging && (lines++ < 16 || lines % 200 == 0))
+        MLOG("GPU memory guard: %llu MB (it lets go from %llu MB): %u idle sharing entries, %u spare textures, %u staging blocks let go (%llu times; GPU-only textures queued for a write-back %llu, written back %llu)", (unsigned long long)(guard_used() >> 20), (unsigned long long)(g_guard.evict >> 20), entries, spares, staging,
+             (unsigned long long)lines, (unsigned long long)g_awb_queued, (unsigned long long)g_awb_let_go);
 } }
 // On the submit thread, after a submission, with no lock held. The stop level gives the eviction its chance first: this submission's fence, then the sizes again
 static void guard_act(uint64_t fence) {
