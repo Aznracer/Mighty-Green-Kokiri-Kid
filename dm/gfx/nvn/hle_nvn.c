@@ -1586,12 +1586,22 @@ __attribute__((constructor)) static void nvn_nops_register(void) {
         if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && nvn_slot[i].fn != (void *)nvn_nop && strncmp(nvn_names[i], "nvnCommandBuffer", 16)) {
             nvn_big_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_big_entry; nbig++;
         }
-    // DM_NVN_PROF=1: implemented functions (except unimplemented stubs and present: present includes the display-link wait and is counted separately) get a timing wrapper, used to break down the time spent in the "translation layer recording phase"
-    if (getenv("DM_NVN_PROF"))
-        for (unsigned i = 0; i < NVN_NFUNC; i++)
-            if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) { nvn_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_prof_entry; }
+    // DM_NVN_PROF=1: implemented functions (except unimplemented stubs and present: present includes the display-link wait and is counted separately) get a timing wrapper, used to break down the time spent in the "translation layer recording phase".
+    // Installed by nvn_prof_install at the first present: this constructor runs before an iPhone app's env.txt is read, so its getenv would never see the switch there
     LOG("[nvn] null device: %u names, %u implemented (%u semantic + %u empty, %u of them on the large host stack), the other %u go to the red-reporting stub",
         NVN_NFUNC, g_nsem + nnop, g_nsem, nnop, nbig, NVN_NFUNC - g_nsem - nnop);
+}
+
+static int g_nvn_prof;   // DM_NVN_PROF installed (nvn_prof_install)
+static void nvn_prof_install(void) {   // at the first present, after env.txt: each wrapper's real function is stored before its slot points at the wrapper
+    if (!getenv("DM_NVN_PROF")) return;
+    unsigned n = 0;
+    for (unsigned i = 0; i < NVN_NFUNC; i++)
+        if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && nvn_slot[i].fn != (void *)nvn_prof_entry && strcmp(nvn_names[i], "nvnQueuePresentTexture")) {
+            nvn_real[i] = nvn_slot[i].fn; atomic_thread_fence(memory_order_release); nvn_slot[i].fn = (void *)nvn_prof_entry; n++;
+        }
+    g_nvn_prof = 1;
+    LOG("[nvn] DM_NVN_PROF: %u functions timed; the five that take longest are listed every 300 frames (translation layer top 5)", n);
 }
 
 // ---------- Window / present ----------
@@ -2558,7 +2568,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     pthread_mutex_unlock(&g_sub_mu);
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
-    if (nvn_real[0] || nvn_real[1]) {   // DM_NVN_PROF: record phase = time of all implemented functions except submit; submit phase = QueueSubmitCommands
+    { static int pi; if (!pi) { pi = 1; nvn_prof_install(); } }
+    if (g_nvn_prof) {   // DM_NVN_PROF: record phase = time of all implemented functions except submit; submit phase = QueueSubmitCommands
         static unsigned isub = ~0u; static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
         if (isub == ~0u) for (isub = 0; isub < NVN_NFUNC && strcmp(nvn_names[isub], "nvnQueueSubmitCommands"); isub++) {}
         uint64_t rec = 0, sub = 0;
