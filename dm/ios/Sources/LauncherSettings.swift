@@ -118,9 +118,9 @@ final class LauncherModel: ObservableObject {
         let why = style == "auto" ? (pad ? " (controller connected)" : " (no controller)") : ""
         let tf = touch ? (getenv("DM_TOUCH_FPS").map { String(cString: $0) } ?? "30") : ""   // touch_fps.py: 30 (frame generation off), 30fg, 20 or 15 (with it)
         let fg = tf == "30fg" || tf == "20" || tf == "15", rate = tf == "30fg" ? "30" : tf
-        fputs("launcher: play style \(style)\(why): \(fg ? "touch, \(rate) fps with frame generation (DM_TOUCH_FPS=\(tf))" : touch ? "touch, frame generation off" : "controller, settings as set")\n", stderr)
+        fputs("launcher: play style \(style)\(why): \(fg ? "touch, \(rate) fps with frame generation (DM_TOUCH_FPS=\(tf))" : touch ? (tf == "40" ? "touch, 40 fps, frame generation off" : "touch, frame generation off") : "controller, settings as set")\n", stderr)
         if fg { setenv("DM_FPS_TARGET", rate, 1); setenv("DM_FRAMEGEN", "1", 1) }
-        else if touch { setenv("DM_FRAMEGEN", "0", 1) }
+        else if touch { setenv("DM_FRAMEGEN", "0", 1); if tf == "40" { setenv("DM_FPS_TARGET", "40", 1) } }   // 40: real frames, three 120 Hz refreshes each (FRAME_STEP_120 builds)
 #endif
     }
     private func store(_ s: Setting, _ v: String) {
