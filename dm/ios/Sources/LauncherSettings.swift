@@ -1,6 +1,9 @@
 // Launcher settings, validation and persistence. Shared by the iOS UI, the Mac app's settings window (dm/mac/Launcher.swift) and the native storage regression test.
 import Foundation
 import Combine
+#if os(iOS)
+import GameController   // play_style.py
+#endif
 
 struct Setting: Decodable, Identifiable {
     let env, kind, label, note, def: String
@@ -115,6 +118,23 @@ final class LauncherModel: ObservableObject {
             store(s, v)
             setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v)\(s.isDefault(v) ? "" : " (changed)")\n", stderr)
         }
+        applyPlayStyle()
+    }
+    // play_style.py: Controls > Play style (DM_PLAY_STYLE, iOS only). Touch turns frame generation off, over an env file's DM_FRAMEGEN as well:
+    // touch play stuttered with it on. Auto picks Touch when no controller is connected when Play is pressed. Not set (the Mac app): nothing happens
+    func applyPlayStyle() {
+#if os(iOS)
+        guard let p = getenv("DM_PLAY_STYLE") else { return }
+        let style = String(cString: p)
+        let pad = GCController.controllers().contains { $0.extendedGamepad != nil }
+        let touch = style == "touch" || (style == "auto" && !pad)
+        let why = style == "auto" ? (pad ? " (controller connected)" : " (no controller)") : ""
+        let tf = touch ? (getenv("DM_TOUCH_FPS").map { String(cString: $0) } ?? "30") : ""   // touch_fps.py: 30 (frame generation off), 30fg, 20 or 15 (with it)
+        let fg = tf == "30fg" || tf == "20" || tf == "15", rate = tf == "30fg" ? "30" : tf
+        fputs("launcher: play style \(style)\(why): \(fg ? "touch, \(rate) fps with frame generation (DM_TOUCH_FPS=\(tf))" : touch ? (tf == "40" ? "touch, 40 fps, frame generation off" : "touch, frame generation off") : "controller, settings as set")\n", stderr)
+        if fg { setenv("DM_FPS_TARGET", rate, 1); setenv("DM_FRAMEGEN", "1", 1) }
+        else if touch { setenv("DM_FRAMEGEN", "0", 1); if tf == "40" { setenv("DM_FPS_TARGET", "40", 1) } }   // 40: real frames, three 120 Hz refreshes each (FRAME_STEP_120 builds)
+#endif
     }
     private func store(_ s: Setting, _ v: String) {
         if !ignoreSaved { if s.isDefault(v) { defaults.removeObject(forKey: "launcher." + s.env) } else { defaults.set(v, forKey: "launcher." + s.env) } }
@@ -134,5 +154,6 @@ final class LauncherModel: ObservableObject {
             let v = values[s.env] ?? s.def
             if !s.isDefault(v) { setenv(s.env, v, 1); fputs("launcher: \(s.env)=\(v) (saved choice)\n", stderr) }
         }
+        applyPlayStyle()
     }
 }

@@ -33,6 +33,12 @@ static void front_ios_power_watch(void);
 static void screen_refresh(void);
 static void front_ios_audio_watch(void);
 static UILabel *front_ios_fps_label(void);
+// DM_FPS_WIDE (on unless =0): the counter is one line across the top of the screen (fps_wide.py)
+// DM_FPS_POS=top: the one-line counter at the top left of the gear; otherwise below the picture, clear of the touch controls (hud3.py)
+int dm_pad_layout(void);   // DmGamepad.m: 0 2D, 1 3D, 2 Tap, 3 Native
+static int fps_bottom(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FPS_POS"); v = e && !strcmp(e, "bottom"); } return v; }   // native_oot3.py
+static int fps_top(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FPS_POS"); v = e && !strcmp(e, "top"); } return v; }
+static int fps_wide(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_FPS_WIDE"); v = !e || atoi(e); } return v; }
 
 @interface DmGameView : UIView
 @property (nonatomic) CGFloat maxPixelWidth;   // 0: the screen's own pixels; a TV caps the drawable at 1920 across (tv_attach)
@@ -58,6 +64,8 @@ static UILabel *front_ios_fps_label(void);
     UIScreen *screen = self.window.windowScene.screen;
     CGFloat scale = screen ? screen.nativeScale : MAX(self.traitCollection.displayScale, 1);
     if (self.maxPixelWidth > 0) scale = MIN(scale, self.maxPixelWidth / MAX(self.bounds.size.width, 1));
+    else { const char *e = getenv("DM_DRAWABLE_MAX_W"); double mw = e ? atof(e) : 0;   // drawable_cap.py: the phone's picture at most this many pixels across
+        if (mw >= 640) scale = MIN(scale, mw / MAX(self.bounds.size.width, 1)); }
     l.contentsScale = scale;
     screen_refresh();   // an iPad window moved to another display lays out again (the display scale trait above)
     l.drawableSize = CGSizeMake(self.bounds.size.width * l.contentsScale, self.bounds.size.height * l.contentsScale);
@@ -210,7 +218,32 @@ static void launcher_done(void) { [g_root startGame]; }
     if (self.fps) {   // the top row's free stretch: right of DmGamepad.m's L3 key (102 + 17 of its units from the safe edge), level with − / + (22 units down); u is its unit
         CGRect s = CGRectIntersection(layout.controls, UIEdgeInsetsInsetRect(b, gameInsets));
         CGFloat u = layout.separated ? MIN(MIN(s.size.height / 430.0, s.size.width / 700.0), 1.3) : MIN(b.size.height / 430.0, 1.3);
-        self.fps.frame = CGRectMake(floor(CGRectGetMinX(s) + 130 * u), floor(CGRectGetMinY(s) + 22 * u - 11), 64, 22);
+        // as wide as its lines, up to the − key (DmGamepad.m: its centre 52 units left of the midline, 50 wide); two lines (frame rate and thermal state, battery) centred on the row
+        if (fps_wide()) {   // one line, centred across the top (fps_wide.py)
+            // the top bar's left half (hud2.py): from the safe edge to the settings gear in the middle (about 30 points either side of it), two lines, centred in the bar above the picture
+            CGFloat x = CGRectGetMinX(s) + 8, room = CGRectGetMidX(s) - 24 - x;   // native_oot.py: up to just short of the gear
+            CGSize fit = [self.fps sizeThatFits:CGSizeMake(room - 12, 60)];
+            CGFloat w = MIN(MAX(ceil(fit.width) + 12, 64), room), h = ceil(fit.height) + 4;
+            CGFloat above = CGRectGetMinY(layout.game) - CGRectGetMinY(b);
+            CGFloat y = !layout.separated && above >= h + 4 ? CGRectGetMinY(b) + floor((above - h) / 2) : CGRectGetMinY(s) + 2;
+            self.fps.frame = CGRectMake(floor(x), floor(y), w, h);
+            self.fps.textAlignment = NSTextAlignmentLeft;
+            if (!fps_top()) {   // hud3.py: centred in the black bar below the picture
+                CGFloat below = CGRectGetMaxY(b) - CGRectGetMaxY(layout.game);
+                if (!layout.separated && below >= h + 4) { self.fps.frame = CGRectMake(floor(CGRectGetMidX(s) - w / 2), floor(CGRectGetMaxY(layout.game) + (below - h) / 2), w, h); self.fps.textAlignment = NSTextAlignmentCenter; }
+            }
+            if (dm_pad_layout() == 3 && !fps_bottom()) {   // native_oot3.py: Native's top bar has + at the left and … / − at the right, nothing in the middle: the counter goes there
+                CGFloat r2 = s.size.width - 280; CGSize f2 = [self.fps sizeThatFits:CGSizeMake(r2 - 12, 60)];
+                CGFloat w2 = MIN(MAX(ceil(f2.width) + 12, 64), r2), h2 = ceil(f2.height) + 4;
+                CGFloat y2 = !layout.separated && above >= h2 + 4 ? CGRectGetMinY(b) + floor((above - h2) / 2) : CGRectGetMinY(s) + 2;
+                self.fps.frame = CGRectMake(floor(CGRectGetMidX(s) - w2 / 2), floor(y2), w2, h2); self.fps.textAlignment = NSTextAlignmentCenter;
+            }
+        } else {
+            CGFloat x = floor(CGRectGetMinX(s) + 130 * u), room = CGRectGetMidX(s) - 77 * u - 8 - x;
+            CGSize fit = [self.fps sizeThatFits:CGSizeMake(MAX(room - 12, 64), 110)];
+            CGFloat w = MIN(MAX(ceil(fit.width) + 12, 64), MAX(room, 64)), h = ceil(fit.height) + 4;
+            self.fps.frame = CGRectMake(x, floor(CGRectGetMinY(s) + 22 * u - h / 2), w, h);
+        }
     }
 }
 - (void)showFPS:(BOOL)on {   // the frame-rate counter: DM_SHOW_FPS at Play, then the in-game menu
@@ -311,6 +344,24 @@ bool dm_setting_live(const char *env, const char *value) {
 // Thermal state and screen brightness for the power and present rows every 300 frames (hle_nvn.c; its weak defaults return -1 on the Mac). thermalState: 0 nominal, 1 fair, 2 serious, 3 critical.
 // Brightness is read on the main thread at start and on each change; every change of the thermal state and of Low Power Mode (which lowers the CPU clock) is logged with the time since launch
 static _Atomic double g_brightness = -1;
+static _Atomic double g_pmu_c = -1;   // thermal_pmu.py: the hottest PMU die's last reading (sensors_line, every 5 s), -1 until read
+int dm_thermal_now(void);
+int dm_thermal_capped(void);   // hle_nvn.c: the thermal cap holds 30 fps now (counter_power.py)
+// thermal_pmu.py: the state the host's thermal cap acts on. DM_THERMAL_PMU=<degrees>: "serious" (2) from the moment the hottest PMU die reaches it until it is back at
+// DM_THERMAL_PMU_COOL (default 15 degrees lower); iOS's own state when that is higher. The counter keeps showing iOS's state
+int dm_thermal_cap_now(void) {
+    int th = dm_thermal_now();
+    static int hot = -1, cool; static _Atomic int pmu_hot;
+    if (hot < 0) { const char *e = getenv("DM_THERMAL_PMU"), *c = getenv("DM_THERMAL_PMU_COOL"); int h = e ? atoi(e) : 0; cool = c ? atoi(c) : h - 15;
+        if (h > 0) LOG("front end: the thermal cap also starts at a PMU die of %d° and its PMU part ends at %d° (DM_THERMAL_PMU)", h, cool); hot = h; }
+    if (hot > 0) {
+        double p = g_pmu_c;
+        if (p > 0 && p >= hot && !pmu_hot) { pmu_hot = 1; LOG("front end: PMU %.1f° reached %d°: thermal cap on (%.0f s after launch)", p, hot, (now_ns() - g_t0_ns) / 1e9); }
+        else if (p > 0 && p <= cool && pmu_hot) { pmu_hot = 0; LOG("front end: PMU %.1f° back at %d°: the thermal cap ends after its calm time (%.0f s after launch)", p, cool, (now_ns() - g_t0_ns) / 1e9); }
+        if (pmu_hot && th < 2) th = 2;
+    }
+    return th;
+}
 int dm_thermal_now(void) { return (int)NSProcessInfo.processInfo.thermalState; }
 int dm_low_power_now(void) { return NSProcessInfo.processInfo.lowPowerModeEnabled; }   // the frame step does not probe in it (hle_nvn.c fstep_cpu_slowed)
 double dm_brightness_now(void) { return g_brightness; }
@@ -326,22 +377,207 @@ static void front_ios_power_watch(void) {
     LOG("front end: thermal state %d, brightness %.2f, Low Power Mode %s, screen %d Hz", dm_thermal_now(), g_brightness, dm_low_power_now() ? "on" : "off", front_screen_max_fps());
 }
 
-// Frame-rate counter: the frames put on screen in the last second (nvn_mtl.m counts them for NVN and for the Vulkan layer alike; frames the display link merged away are not counted).
+// Frame-rate counter: the frames put on screen in the last second (nvn_mtl.m counts them for NVN and for the Vulkan layer alike; frames the display link merged away are not counted),
+// with the device's thermal state (iOS gives apps no temperature, only NSProcessInfo's four levels), the battery level and the play time it leaves at the rate it has fallen.
 // On when the IPA was built with it (the NSP script's SHOW_FPS / --show-fps → DMShowFPS in Info.plist); DM_SHOW_FPS=0 / 1 (the launcher, Documents/env.txt) overrides that without a rebuild,
 // and the in-game menu turns it on and off ([DmRootVC showFPS:])
 uint64_t mtl_present_count(void);
+// The battery's fall while the game is in front: the level UIKit reports moves in steps (5 % on current iOS: an iPhone Duo went 80 % → 75 % after about 15 minutes of
+// Silksong while its own status bar counted down by 1 %), so the rate is taken from the first step down (a known point of the curve) to the latest one, refined at every later
+// step. Until the second step a rough time is shown ("rough"): the first reading's place inside its step is unknown, so half a step is taken to have fallen between it and the
+// first step down. Charging, a level that rose, and time in the background (the app's own background notification; a late timer tick is not one: the main thread stalls for
+// seconds while a game loads) start the measurement again
+typedef struct { double t0, l0, last, tf, lf; bool armed; } battery_fall_t;
+static void battery_fall_reset(battery_fall_t *b) { b->armed = false; b->last = -1; b->t0 = 0; b->l0 = 0; b->tf = 0; b->lf = -1; }
+static NSString *battery_line(battery_fall_t *b, double now) {
+    UIDevice *d = UIDevice.currentDevice; float level = d.batteryLevel; UIDeviceBatteryState st = d.batteryState;
+    if (level < 0 || st == UIDeviceBatteryStateUnknown) return @"🔋 --";
+    int pct = (int)lround(level * 100);
+    if (st == UIDeviceBatteryStateCharging || st == UIDeviceBatteryStateFull) { battery_fall_reset(b); return [NSString stringWithFormat:@"🔋 %d%% · charging", pct]; }
+    if (level != b->last) LOG("front end: battery %d%% (%s)", pct, st == UIDeviceBatteryStateUnplugged ? "unplugged" : "other");   // its steps, for the estimate's reading
+    if (b->last >= 0 && level > b->last) battery_fall_reset(b);
+    if (b->lf < 0) { b->tf = now; b->lf = level; }   // the first reading: somewhere inside its step
+    if (b->last >= 0 && level < b->last && !b->armed) { b->armed = true; b->t0 = now; b->l0 = level; }   // the first step down: the start of the measurement
+    b->last = level;
+    double fell = b->armed ? b->l0 - level : 0, left; const char *rough = "";
+    if (fell >= 0.005) left = level / (fell / (now - b->t0));   // seconds at the rate so far
+    else if (b->armed && b->t0 - b->tf > 60) { left = level / ((b->lf - b->l0) / 2 / (b->t0 - b->tf)); rough = " (rough)"; }   // half the first step over the time to it
+    else return [NSString stringWithFormat:@"🔋 %d%% · estimating", pct];
+    int m = (int)(left / 60);
+    return m >= 60 ? [NSString stringWithFormat:@"🔋 %d%% · ~%dh %02dm left%s", pct, m / 60, m % 60, rough] : [NSString stringWithFormat:@"🔋 %d%% · ~%dm left%s", pct, m, rough];
+}
+#include <dlfcn.h>
+#include <math.h>
+// The phone's temperature and power sensors (sensors_hud.py), through the private IOHIDEventSystemClient as gregsramblings/ios-charging-monitor reads them: a sandboxed
+// app may create one client; its services are AppleSMCKeysEndpoint sensors whose LocationID is the SMC key in ASCII ("IQ0u"); usage page 0xff08 holds currents (usage 2, A)
+// and voltages (3, V) as power events (25), page 0xff00 usage 5 temperatures (event 15, deg C). iOS 27 publishes each key through two services: their reads are averaged
+typedef CFTypeRef (*sn_create_fn)(CFAllocatorRef);
+typedef void (*sn_match_fn)(CFTypeRef, CFDictionaryRef);
+typedef CFArrayRef (*sn_services_fn)(CFTypeRef);
+typedef CFTypeRef (*sn_prop_fn)(CFTypeRef, CFStringRef);
+typedef CFTypeRef (*sn_event_fn)(CFTypeRef, int64_t, int32_t, int64_t);
+typedef double (*sn_float_fn)(CFTypeRef, int32_t);
+enum { SN_MAX = 96 };
+typedef struct { CFTypeRef ref; char key[5]; char name[40]; int64_t type; } sn_t;
+static sn_t g_sn[SN_MAX]; static int g_nsn; static sn_event_fn g_sn_event; static sn_float_fn g_sn_float;
+static NSString *g_sensor_line;   // written on the main queue
+static int sn_wanted(const char *key, const char *name) {
+    static const char *const K[] = {"TG0B", "TG0C", "TG0H", "TG0V", "TQ0j", "VQ0u", "IQ0u", "IQ0B", "VQ0l", "VQ1u"};
+    for (unsigned k = 0; k < sizeof K / sizeof *K; k++) if (!strcmp(key, K[k])) return 1;
+    return !strncmp(name, "PMU tdie", 8);
+}
+static int sensors_init(void) {
+    void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW); if (!h) return 0;
+    sn_create_fn create = (sn_create_fn)dlsym(h, "IOHIDEventSystemClientCreate");
+    sn_match_fn match = (sn_match_fn)dlsym(h, "IOHIDEventSystemClientSetMatching");
+    sn_services_fn services = (sn_services_fn)dlsym(h, "IOHIDEventSystemClientCopyServices");
+    sn_prop_fn prop = (sn_prop_fn)dlsym(h, "IOHIDServiceClientCopyProperty");
+    g_sn_event = (sn_event_fn)dlsym(h, "IOHIDServiceClientCopyEvent"); g_sn_float = (sn_float_fn)dlsym(h, "IOHIDEventGetFloatValue");
+    if (!create || !match || !services || !prop || !g_sn_event || !g_sn_float) { LOG("front end: sensors: IOKit's HID event functions not found"); return 0; }
+    CFTypeRef client = create(kCFAllocatorDefault);   // kept for the process: a second client reads NaN
+    if (!client) { LOG("front end: sensors: no HID event client (the sandbox refused it)"); return 0; }
+    NSDictionary *m[2] = {@{@"PrimaryUsagePage": @0xff08}, @{@"PrimaryUsagePage": @0xff00, @"PrimaryUsage": @5}}; int64_t type[2] = {25, 15};
+    NSMutableString *found = [NSMutableString string];
+    for (int i = 0; i < 2; i++) {
+        match(client, (__bridge CFDictionaryRef)m[i]);
+        CFArrayRef a = services(client); if (!a) continue;
+        for (CFIndex k = 0; k < CFArrayGetCount(a) && g_nsn < SN_MAX; k++) {
+            CFTypeRef ref = CFArrayGetValueAtIndex(a, k);
+            CFTypeRef loc = prop(ref, CFSTR("LocationID")), prod = prop(ref, CFSTR("Product"));
+            uint32_t lid = 0; if (loc && CFGetTypeID(loc) == CFNumberGetTypeID()) CFNumberGetValue((CFNumberRef)loc, kCFNumberSInt32Type, &lid);
+            char key[5] = {(char)(lid >> 24), (char)(lid >> 16), (char)(lid >> 8), (char)lid, 0}, name[40] = "?";
+            for (int c = 0; c < 4; c++) if (key[c] < 32 || key[c] > 126) key[0] = 0;
+            if (prod && CFGetTypeID(prod) == CFStringGetTypeID()) CFStringGetCString((CFStringRef)prod, name, sizeof name, kCFStringEncodingUTF8);
+            if (loc) CFRelease(loc);
+            if (prod) CFRelease(prod);
+            if (!key[0] || !sn_wanted(key, name)) continue;
+            { int dup = 0; for (int j = 0; j < g_nsn; j++) dup |= !strcmp(g_sn[j].key, key); if (dup) continue; }   // hud2.py: iOS 27's second copy of a key: one read is enough
+            sn_t *s = &g_sn[g_nsn++]; s->ref = CFRetain(ref); memcpy(s->key, key, 5); strlcpy(s->name, name, sizeof s->name); s->type = type[i];
+            [found appendFormat:@" %s(%s)", key, name];
+        }
+        CFRelease(a);
+    }
+    LOG("front end: sensors: %d readable:%s", g_nsn, found.UTF8String);
+    return g_nsn > 0;
+}
+// The mean of a key's copies (n reads of each), or NAN; readings of 1000 or more are dropped (iOS 27's broken PMU rail keys read 14,800 and up)
+static double sn_value(const char *key, int n) {
+    double sum = 0; int cnt = 0;
+    for (int i = 0; i < g_nsn; i++) {
+        if (strcmp(g_sn[i].key, key)) continue;
+        for (int r = 0; r < n; r++) {
+            CFTypeRef ev = g_sn_event(g_sn[i].ref, g_sn[i].type, 0, 0); if (!ev) continue;
+            double v = g_sn_float(ev, (int32_t)(g_sn[i].type << 16)); CFRelease(ev);
+            if (isfinite(v) && fabs(v) < 1000) { sum += v; cnt++; }
+        }
+    }
+    return cnt ? sum / cnt : NAN;
+}
+static int dbl_cmp(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
+// counter_power.py: the battery's power from its IOPMPowerSource registry entry (IOKit is reached through dlsym, as ChargeSpeed does)
+static uint32_t g_bat_svc; static CFTypeRef (*g_io_prop)(uint32_t, CFStringRef, CFAllocatorRef, uint32_t);
+static double g_bat_w_sum; static int g_bat_w_n;   // watts (negative = draining) summed since the last full read, on the sensors queue
+static int g_pmu_hot_i = -1;   // the hottest PMU die's sensor at the last full read
+static void batt_open(void) {
+    static int tried; if (tried++) return;
+    void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_NOW);
+    CFMutableDictionaryRef (*match)(const char *) = h ? (CFMutableDictionaryRef (*)(const char *))dlsym(h, "IOServiceMatching") : NULL;
+    uint32_t (*get)(mach_port_t, CFDictionaryRef) = h ? (uint32_t (*)(mach_port_t, CFDictionaryRef))dlsym(h, "IOServiceGetMatchingService") : NULL;
+    g_io_prop = h ? (CFTypeRef (*)(uint32_t, CFStringRef, CFAllocatorRef, uint32_t))dlsym(h, "IORegistryEntryCreateCFProperty") : NULL;
+    if (match && get && g_io_prop) { CFMutableDictionaryRef m = match("IOPMPowerSource"); if (m) g_bat_svc = get(0, m); }   // IOServiceGetMatchingService consumes m
+    LOG("front end: battery power %s", g_bat_svc ? "read from the IOPMPowerSource registry entry every second" : "not readable here");
+}
+static int batt_num(CFStringRef k, long long *out) {
+    CFTypeRef v = g_io_prop(g_bat_svc, k, kCFAllocatorDefault, 0); if (!v) return 0;
+    int ok = CFGetTypeID(v) == CFNumberGetTypeID(); if (ok) { *out = 0; (void)CFNumberGetValue((CFNumberRef)v, kCFNumberSInt64Type, out); } CFRelease(v);   // counter_power2.py: a lossy conversion still gives the bits
+    if (ok && (*out > INT32_MAX || *out < INT32_MIN)) *out = (int32_t)*out;   // a negative current published as an unsigned 64-bit number
+    return ok;
+}
+static void batt_sample(void) {   // once a second: mV × mA
+    batt_open(); if (!g_bat_svc) return;
+    long long mv, ma; if (!batt_num(CFSTR("Voltage"), &mv) || !batt_num(CFSTR("InstantAmperage"), &ma) || mv <= 0) {   // counter_power3.py: not published to apps
+        LOG("front end: battery voltage and current are not published to this app (iOS filters the IOPMPowerSource entry): no draw on battery"); g_bat_svc = 0; return; }
+    static int shown; if (!shown++) LOG("front end: battery: Voltage %lld mV, InstantAmperage %lld mA (%.2f W; negative = draining)", mv, ma, (double)mv * (double)ma / 1e6);   // counter_power2.py
+    g_bat_w_sum += (double)mv * (double)ma / 1e6; g_bat_w_n++;
+}
+static NSString *sensors_line(void) {
+    double g[4]; int ng = 0; static const char *const G[] = {"TG0B", "TG0C", "TG0H", "TG0V"};
+    for (int i = 0; i < 4; i++) { double v = sn_value(G[i], 1); if (isfinite(v)) g[ng++] = v; }
+    qsort(g, ng, sizeof *g, dbl_cmp);
+    double bat = ng ? (ng & 1 ? g[ng / 2] : (g[ng / 2 - 1] + g[ng / 2]) / 2) : NAN, chg = sn_value("TQ0j", 1), pmu = NAN;
+    for (int i = 0; i < g_nsn; i++) {   // the hottest PMU die key
+        if (strncmp(g_sn[i].name, "PMU tdie", 8)) continue;
+        double v = sn_value(g_sn[i].key, 1); if (isfinite(v) && (!isfinite(pmu) || v > pmu)) { pmu = v; g_pmu_hot_i = i; }
+    }
+    if (isfinite(pmu)) g_pmu_c = pmu;   // thermal_pmu.py
+    double vin = sn_value("VQ0u", 1), iin = sn_value("IQ0u", 4), vb = sn_value("VQ0l", 1), ib = sn_value("IQ0B", 4), vw = sn_value("VQ1u", 1);
+    NSString *(^deg)(double) = ^NSString *(double v) { return isfinite(v) ? [NSString stringWithFormat:@"%.1f°", v] : @"--"; };
+    NSString *temps = [NSString stringWithFormat:@"🔋 %@ · chg %@ · PMU %@", deg(bat), deg(chg), deg(pmu)];
+    NSString *power;
+    if (isfinite(vin) && isfinite(iin) && iin > 0.02 && vin > 1) power = [NSString stringWithFormat:@"⚡ in %.1f W", vin * iin];
+    else if (isfinite(vw) && vw > 5) power = [NSString stringWithFormat:@"⚡ wireless %.1f V", vw];   // native_oot2.py: no readable wireless input current, so its voltage
+    else power = @"⚡ no input";
+    if (isfinite(vb) && isfinite(ib) && (ib > 0.02 || ![power isEqualToString:@"⚡ no input"])) power = [power stringByAppendingFormat:@" · into battery %.1f W", vb * MAX(ib, 0)];   // plugged in: shown even at 0
+    double bw = g_bat_w_n ? g_bat_w_sum / g_bat_w_n : NAN; g_bat_w_sum = 0; g_bat_w_n = 0;   // counter_power.py
+    if ([power isEqualToString:@"⚡ no input"]) power = isfinite(bw) && bw < 0 ? [NSString stringWithFormat:@"⚡ on battery · draw %.1f W", -bw] : @"⚡ on battery";   // iOS has no readable discharge sensor
+    return [NSString stringWithFormat:@"%@\n%@", temps, power];
+}
+static void pmu_fast(void) {   // counter_power.py: between full reads, the hottest PMU die alone, while within 8 degrees of DM_THERMAL_PMU
+    static int thr = -1; if (thr < 0) { const char *e = getenv("DM_THERMAL_PMU"); thr = e ? atoi(e) : 0; }
+    if (thr <= 0 || g_pmu_hot_i < 0) return;
+    double p = g_pmu_c; if (!(p >= thr - 8)) return;
+    double v = sn_value(g_sn[g_pmu_hot_i].key, 1); if (isfinite(v) && v > 0) g_pmu_c = v;
+}
+static void sensors_start(void) {
+    const char *e = getenv("DM_SENSORS"); if (e && !atoi(e)) return;
+    static dispatch_queue_t q; static dispatch_source_t timer;
+    q = dispatch_queue_create("dm.sensors", DISPATCH_QUEUE_SERIAL);
+    dispatch_async(q, ^{
+        if (!sensors_init()) { dispatch_async(dispatch_get_main_queue(), ^{ g_sensor_line = @"🌡 sensors not readable here"; }); return; }
+        timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, q);
+        dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC, 200 * NSEC_PER_MSEC);   // counter_power.py: a 1 s tick, the full read every 5th   // hud2.py: every 5 s (each read is a call into the HID system)
+        dispatch_source_set_event_handler(timer, ^{
+            static unsigned tick; batt_sample();
+            if (tick++ % 5) { pmu_fast(); return; }
+            NSString *line = sensors_line();
+            static int logged; if (logged++ % 2 == 0) LOG("front end: sensors: %s", [line stringByReplacingOccurrencesOfString:@"\n" withString:@" | "].UTF8String);   // every 10 s
+            dispatch_async(dispatch_get_main_queue(), ^{ g_sensor_line = line; });
+        });
+        dispatch_resume(timer);
+    });
+}
 static UILabel *front_ios_fps_label(void) {
     UILabel *l = [UILabel new];
-    l.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = NSTextAlignmentCenter;
+    l.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightSemibold]; l.textColor = UIColor.whiteColor; l.textAlignment = fps_wide() ? NSTextAlignmentLeft : NSTextAlignmentCenter;
+    l.numberOfLines = fps_wide() ? 2 : 4; l.adjustsFontSizeToFitWidth = YES; l.minimumScaleFactor = 0.7;
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
-    l.text = @"-- fps";
-    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime();
-    [NSTimer scheduledTimerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) {
-        (void)t; uint64_t n = mtl_present_count(); double now = CACurrentMediaTime();
-        if (now - t0 < 1.5) l.text = [NSString stringWithFormat:@"%.0f fps", (n - n0) / (now - t0)];   // a longer span is the time in the background: no reading
+    UIDevice.currentDevice.batteryMonitoringEnabled = YES;
+    static NSString *const thermal[] = {@"Nominal", @"Fair", @"Serious", @"Critical"};
+    __block battery_fall_t bat; battery_fall_reset(&bat);
+    __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime(); __block NSString *fps = @"--";
+    void (^update)(void) = ^{
+        double now = CACurrentMediaTime(); uint64_t n = mtl_present_count();
+        if (now - t0 < 1.5) fps = [NSString stringWithFormat:@"%.0f", (n - n0) / (now - t0)];   // a longer span (a stall, the background): no reading
         n0 = n; t0 = now;
-    }];
-    LOG("front end: frame-rate counter on");
+        int th = dm_thermal_now();
+        static int last_th = -1; if (th != last_th) { LOG("front end: thermal state %d (%s)", th, thermal[th >= 0 && th <= 3 ? th : 0].UTF8String); last_th = th; }
+        NSString *text = [NSString stringWithFormat:@"%@ fps · 🌡 %@%@\n%@", fps, thermal[th >= 0 && th <= 3 ? th : 0], dm_thermal_capped() ? @" · ❄ 30 cap" : @"", battery_line(&bat, now)];   // counter_power.py
+        if (g_sensor_line) text = [text stringByAppendingFormat:@"\n%@", g_sensor_line];   // sensors_hud.py
+        if (fps_wide()) {   // hud2.py: two lines, frame rate and battery, then temperatures and power
+            NSArray<NSString *> *p = [text componentsSeparatedByString:@"\n"];
+            text = p.count == 4 ? [NSString stringWithFormat:@"%@  │  %@\n%@  │  %@", p[0], p[1], p[2], p[3]] : [p componentsJoinedByString:@"  │  "];
+        }
+        if (![text isEqualToString:l.text]) { BOOL grew = text.length != l.text.length; l.text = text; if (grew) [l.superview setNeedsLayout]; }
+        { static int lastpl = -2; int pl = dm_pad_layout(); if (pl != lastpl) { lastpl = pl; [l.superview setNeedsLayout]; } }   // native_oot3.py: the layout switched in the menu moves the counter
+    };
+    sensors_start();
+    update();
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(NSNotification *note) { (void)note; battery_fall_reset(&bat); }];   // suspended: the fall is measured again on return
+    // In the common modes: while UIKit tracks a touch (the touch controls) the main run loop runs in its tracking mode, where a timer of the default mode does not fire, and the
+    // label would stop updating while a finger is down
+    [NSRunLoop.mainRunLoop addTimer:[NSTimer timerWithTimeInterval:1.0 repeats:YES block:^(NSTimer *t) { (void)t; update(); }] forMode:NSRunLoopCommonModes];
+    LOG("front end: frame-rate counter on (with thermal state and battery)");
     return l;
 }
 
@@ -517,13 +753,13 @@ void front_save_failed(int err) {
 
 // Audio session: the frames RemoteIO asks for in each callback follow the I/O buffer duration, about 21 ms by default on iOS (1024 frames at 48 kHz). The game keeps only 4 blocks × 5 ms = 20 ms in flight,
 // so every callback came up 1.3 ms short and was zero-filled, about 47 gaps per second (crackling; reproducible on the Mac by forcing 1024-frame callbacks: 1999 underruns in 2000 callbacks). Ask for 5 ms and the system picks the nearest it supports;
-// the category is Playback, as a game's or media app's: the ring / silent switch does not mute it (the default SoloAmbient follows the switch, which silenced the game whenever the phone was on silent) and it still interrupts other apps' audio.
+// The category is Playback, or PlayAndRecord while a microphone stream is active:
+// the ring / silent switch does not mute it, and it still interrupts other apps' audio.
 // Set once at boot and again on return to the foreground (the system may reset it after an interruption)
 static int g_session_off;   // the last activation failed (another app or a call still held the session): tried again when the app becomes active
 void front_ios_audio_session(void) {
     AVAudioSession *s = AVAudioSession.sharedInstance; NSError *e = nil;
     if (![s setCategory:AVAudioSessionCategoryPlayback error:&e]) LOG("[RED] audio session category could not be set: %s", e.localizedDescription.UTF8String);
-    [s setPreferredSampleRate:48000 error:nil];
     if (![s setPreferredIOBufferDuration:0.005 error:&e]) LOG("[RED] audio session I/O buffer duration could not be set: %s", e.localizedDescription.UTF8String);
     g_session_off = ![s setActive:YES error:&e];
     if (g_session_off) LOG("[RED] audio session activation failed: %s", e.localizedDescription.UTF8String);
