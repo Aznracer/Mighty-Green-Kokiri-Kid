@@ -389,6 +389,13 @@ static void res_commit(void) {
     }
     pthread_mutex_unlock(&g_res_mu);
 }
+// The residency commit worker (PR #2868): a serial queue of its own at user-interactive QoS, so no Metal 4 feedback handler commits the residency set on g_feedback_q
+static dispatch_queue_t res_commit_q(void) {
+    static dispatch_once_t once; static dispatch_queue_t q;
+    dispatch_once(&once, ^{ q = dispatch_queue_create("dm.nvn.res-commit", dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE, 0)); });
+    return q;
+}
+static void res_commit_async(dispatch_block_t after) { dispatch_async(res_commit_q(), ^{ @autoreleasepool { res_commit(); if (after) after(); } }); }
 // What the residency set holds: totals by kind and the largest objects. At the first GPU out-of-memory error (the error names none of them), and for DM_CTL "restop" (hle_hid.c). The set holds
 // the game's pools (shared buffers over guest memory), textures, heaps and staging alike
 static int range_cmp(const void *x, const void *y) { uintptr_t a = *(const uintptr_t *)x, b = *(const uintptr_t *)y; return a < b ? -1 : a > b; }
@@ -3913,14 +3920,17 @@ static void up_flush(void) {
         }
         double d = f.GPUEndTime - f.GPUStartTime;
         if (d > 0) atomic_fetch_add(&g_upload_gpu_ns, (uint64_t)(d * 1e9));
+        int retire = staging.count != 0;
         @autoreleasepool {
             for (id<MTLResource> obj in staging) res_remove(obj);
             [staging removeAllObjects];
             [views removeAllObjects];   // upload-only integer views share their targets' residency
-            res_commit();
         }
-        atomic_store(&g_up_alloc_busy[slot], 0);
-        atomic_fetch_sub(&g_up_pending, 1);
+        atomic_store(&g_up_alloc_busy[slot], 0);   // the slot's command buffer and allocator are free
+        // PR #2868: the staging's removal is committed on the residency commit worker, not on the feedback queue, where one long [g_res commit] held back every completion
+        // behind it (presents stopped, audio went on). The batch stays pending until that commit; one with nothing to retire (the usual case) is done now, as before
+        if (retire) res_commit_async(^{ atomic_fetch_sub(&g_up_pending, 1); up_wake(); });
+        else atomic_fetch_sub(&g_up_pending, 1);
         up_wake();
     }];
     res_commit();
@@ -14573,6 +14583,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
         g_sm_nwait++; PD("M %llu slice-merged pass: no amplified pipeline yet for vertex %s fragment %s; split here", g_stat_pass, pr->sh[0] ? pr->sh[0]->key : "-", pr->sh[1] ? pr->sh[1]->key : "-");
         rp_end(); en = rp_begin_ex(mode); if (!en) return;
         cur_ps = pso_get(pr, nil); cur_pull = g_pso_pull; cur_pr = pr; cur_ps_pass = g_pass.serial; g_pso_dirty = !cur_ps || cur_pull; }
+    const uint8_t *lmap0 = g_pso_lmap; id<MTLFunction> fsfn0 = g_pso_fsfn; pso_fz_desc fz0 = g_pso_fz;   // for an encode again below: the merged pass's mapping comes back (PR #2867)
     uint32_t raster_mask = draw_color_writes(pr);   // Capture the physical mapping before resetting the merged pipeline state.
     g_draw_lmap = g_pso_lmap;   // kept for bz_bind, whose word needs the map the pipeline was made with: the reset below ran before it (PR #2463)
     if (g_pso_lmap) { g_pso_lmap = NULL; g_pso_fsfn = nil; memset(&g_pso_fz, 0, sizeof g_pso_fz); g_pso_dirty = 1; }   // The next draw fetches again according to its own situation
@@ -14639,7 +14650,7 @@ static void draw_(const p_draw *dw, const p_draw_idx *di) {
     if (g_enc != en) {
         static int again; if (again) { RED_ONCE(130, "binding a draw's arguments ended its render pass twice; draw skipped"); return; }
         PD("M %llu binding the draw's arguments ended the render pass (texture upgrade); encoded again", g_stat_pass);
-        again = 1; draw(dw, di); again = 0; return;
+        again = 1; if (lmap0) { g_pso_lmap = lmap0; g_pso_fsfn = fsfn0; g_pso_fz = fz0; g_pso_dirty = 1; } draw(dw, di); again = 0; return;   // the mapping this draw's pipeline was fetched by (PR #2867)
     }
     // Parameter binding captures the actual resources under the registry lock; if the version changed between the eligibility check and the binding, split and retry before any GPU draw.
     if (g_rt_range_active && (g_pass.reg_gen != g_reg_gen || g_pass.ser_gen != g_ser_gen || g_pass.range_dirty != nvn_dirty_now())) { rp_end(); draw(dw, di); return; }
