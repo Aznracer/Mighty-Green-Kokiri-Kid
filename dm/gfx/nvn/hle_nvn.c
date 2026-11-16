@@ -2137,10 +2137,26 @@ static void slow_emit(uint64_t f) {
 // DM_RT_COMP=<ms> fixes the declaration; default auto = every 120 frames take the larger of 1.25 × the p90 and 1.1 × the peak of this thread's per-frame CPU time and re-declare if it differs from the declared value by > 15% (capped at 0.9 × period).
 // DM_RT=0 leaves the acquire thread on the standard policy (its QoS only), for power A/B: the real-time declaration is how the performance controller learns the frame deadline, and it may hold the clock up for it
 static int rt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_RT"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[nvn] DM_RT=0: the present thread gets no time-constraint policy (QoS only)"); } return v; }
+// The share of the period a thread may declare (cheemu21 kid-with-sword-remake L4; DM_RT_SHARE=<acquire>,<presenting>, default 0.5,0.3 on iOS, 0.9,0.9 elsewhere). An iPhone has two
+// performance cores: threads each declaring up to 90 % of the frame (22.5 of 25 ms at loads) left the game's own workers, which the main thread waits for every frame, behind them
+static double rt_share(int acq) {
+    static double a = -1, f = -1;
+    if (a < 0) {
+#if TARGET_OS_IPHONE
+        a = 0.5; f = 0.3;
+#else
+        a = 0.9; f = 0.9;
+#endif
+        const char *e = getenv("DM_RT_SHARE"); double x, y;
+        if (e && sscanf(e, "%lf,%lf", &x, &y) == 2 && x > 0 && x <= 0.9 && y > 0 && y <= 0.9) { a = x; f = y; }
+        LOG("[nvn] time-constraint computation capped at %.2f of the period (acquire thread), %.2f (presenting thread) (DM_RT_SHARE)", a, f);
+    }
+    return acq ? a : f;
+}
 static void set_time_constraint_comp(uint64_t period_ns, uint64_t comp_ns) {
     if (!rt_on()) return;
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
-    if (comp_ns < 1000000ull) comp_ns = 1000000ull; if (comp_ns > period_ns * 9 / 10) comp_ns = period_ns * 9 / 10;
+    if (comp_ns < 1000000ull) comp_ns = 1000000ull; if (comp_ns > (uint64_t)(period_ns * rt_share(1))) comp_ns = (uint64_t)(period_ns * rt_share(1));
     thread_time_constraint_policy_data_t p = {
         .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp_ns * tb.denom / tb.numer),
         .constraint = (uint32_t)(period_ns * tb.denom / tb.numer), .preemptible = 1};
@@ -2161,7 +2177,7 @@ static void rt_comp_tick(uint64_t period_ns) {
     double v[120]; memcpy(v, win, sizeof v); qsort(v, 120, sizeof *v, dcmp); n = 0;
     // Also the window's peak: every frame that ran past the declaration stalled the thread for 30–60 ms. Dark Souls Remastered's render thread needs 1.9–2.0 ms a frame with one or
     // two frames in 120 near 4.4 ms; declared at 2.5 ms (p90 × 1.25) it stalled about once a second, at 30 fps and at 60; declared above the peak it held 60 fps at the same CPU energy
-    double p90 = v[107], comp = fmax(p90 * 1.25, v[119] * 1.1), cap = period_ns * 0.9 / 1e6; if (comp > cap) comp = cap; if (comp < 1) comp = 1;
+    double p90 = v[107], comp = fmax(p90 * 1.25, v[119] * 1.1), cap = period_ns * rt_share(1) / 1e6; if (comp > cap) comp = cap; if (comp < 1) comp = 1;
     if (comp > g_rt_comp_ms * 1.15 || comp < g_rt_comp_ms * 0.85) set_time_constraint_comp(period_ns, (uint64_t)(comp * 1e6));
 }
 // The presenting thread's own declaration. A game can acquire the window texture on one guest thread and present on another (Ocarina of Time does; PR #2320 found the
@@ -2181,7 +2197,7 @@ static void rt_present_tick(uint64_t period_ns) {
     win[n++] = (double)(c - last) / 1e6; last = c;
     if (n < 120) return;
     double v[120]; memcpy(v, win, sizeof v); qsort(v, 120, sizeof *v, dcmp); n = 0;
-    double comp = fmax(v[107] * 1.25, v[119] * 1.1), cap = period_ns * 0.9 / 1e6; if (comp > cap) comp = cap; if (comp < 1) comp = 1;
+    double comp = fmax(v[107] * 1.25, v[119] * 1.1), cap = period_ns * rt_share(0) / 1e6; if (comp > cap) comp = cap; if (comp < 1) comp = 1;
     if (declared && comp <= declared * 1.15 && comp >= declared * 0.85) return;
     thread_time_constraint_policy_data_t p = {
         .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp * 1e6 * tb.denom / tb.numer),

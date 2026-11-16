@@ -28,7 +28,10 @@ mem_reserve	0x468000000
 mem_alias	0x200000000
 # A map that would take the process past the application pool fails with ResultLimitReached, as on Horizon: the SDK's allocator keeps freed pages mapped until a map fails,
 # then gives them back. Without it PR #1444 reports crashes entering Hyrule Castle, Kakariko Village and Death Mountain and a black screen leaving the Deku Tree
-mem_map_limit	on
+# cheemu21 kid-with-sword-remake L6.1: off. With the check, a 38 MB map at the Master Sword cutscene was refused ("2.73 GB mapped, the application pool is full"), the SDK
+# retried and the cutscene stayed on a white screen (nxnative issue #2407); here the refusals came right before the freeze flying from Lake Hylia to Hyrule Castle. The 8 GB
+# alias region above holds what the game maps past the pool, and guest memory is in files, so pages it maps and does not touch cost nothing
+mem_map_limit	off
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x3000000
