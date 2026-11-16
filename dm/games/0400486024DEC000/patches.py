@@ -239,6 +239,19 @@ _SS_CANVAS_LOG = [
     0xa94133eb, 0xa8c32be9, 0xd4200040]
 
 
+# Speech bubbles over characters (bit 21). main+0x20b900 places a bubble from its speaker's screen point (main+0x20d890: x, y at sp+0xf0, centred, -0.5..0.5 of the
+# picture) in 1920x1080 layout units (x 1920.0, y 1080.0 at main+0x20c2b0..+0x20c2cc). The layouts keep their shape on the taller screen and show 1080 x k units up
+# and down, so y takes 1080 x k (state +0x5c) after main+0x20c2c0 (fmov s1, w8): the bubble stays over its speaker. The x anchor needs nothing (the sides are 16:9's).
+# From seedds/nxnative pull request 2795, which compensates the x anchor for wider screens. s3 is free there (after the bl)
+_SS_BUBBLE = [0x1e270101, 0xd4200020, 0xb9405611, 0x36a800b1, 0xbd405e03, 0x1e202068, 0x54000040, 0x1e230821, 0xd4200040]
+# fmov s1, w8; adrp x16, state; ldr w17, [x16, #0x54]; tbz w17, #21, 9f; ldr s3, [x16, #0x5c]; fcmp s3, #0.0; b.eq 9f; fmul s1, s1, s3; 9: b back
+# Pre-rendered movies (bit 22: the title's, cutscenes). main+0x3b5c710 draws a movie into the viewport main+0x9cc020 has just filled at x29 - 0x28 (left +8, top +0xc,
+# right +0x10, bottom +0x14, per pull request 2795, which narrows it at the sides for wider screens); here its top and bottom come in by (1 - 1/k) / 2 of its height,
+# so the 16:9 movie keeps its shape, with bars above and below. x16 / x17 and s16..s19 are free after the bl
+_SS_MOVIE = [0xd4200020, 0xb9405611, 0x36b00251, 0xbd405e10, 0x1e202208, 0x540001e0, 0x1e2e1011, 0x1e301a30, 0x1e303a30, 0x1e2c1011, 0x1e310a10, 0xd100a3b1,
+             0xbd400e31, 0xbd401632, 0x1e313a53, 0x1e300a73, 0x1e332a31, 0x1e333a52, 0xbd000e31, 0xbd001632, 0xa941a269, 0xd4200040]
+
+
 def screen_shape(ctx):
     here, emit, fs_site, fs_put, STATE = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
     def stub(site, orig_word, words, back, why, subst=None):
@@ -259,6 +272,8 @@ def screen_shape(ctx):
     stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
     stub(0x25d770, 0x1e221821, _SS_RENDER_VIEW, 0x25d774, 'render view aspect: a 16:9 view takes the screen\'s ratio (bit 19)')
     stub(0x774368, 0xad401041, _SS_CANVAS_LOG, 0x77436c, 'full-screen canvas projection: its screen logged, and placed for the taller screen by _SS_UI_RULES (bit 20)')
+    stub(0x20c2c0, 0x1e270101, _SS_BUBBLE, 0x20c2c4, 'speech bubble: its y anchor in 1080 x k layout units, over its speaker on the taller screen (bit 21)')
+    stub(0x3b5c758, 0xa941a269, _SS_MOVIE, 0x3b5c75c, 'movie viewport: a 16:9 movie with bars above and below on the taller screen (bit 22)')
     for site, n, what in _SS_PROJ_SITES:
         stub(site, 0x52802008, _proj_words(n), site + 4, f'sead::Projection matrix update inlined in {what}: a 16:9 matrix keeps its shape on the taller screen, y row / k (bit 17)')
     for site, orig, off, apply, bit, what in _SS_LAYOUT:
