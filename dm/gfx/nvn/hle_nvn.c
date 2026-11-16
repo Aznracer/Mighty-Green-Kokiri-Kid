@@ -1916,17 +1916,6 @@ static void tsummary(uint64_t frame) {
         }
         LOG("[dm] canvases up to frame %llu: %u projection loads; screens (main+vtable, loads, name):%s", frame, loads, o ? pl : " none");
     }
-    if (dm_fps_state && !memcmp(dm_fps_state + 0xc08, "NVCS", 4)) {   // every canvas (_SS_CANVAS_LOG's second table): the layout size its projection draws (2 / scale), its screen (canvas - 0x1b8, read safely) and name
-        uint32_t used; static char pl[8192]; size_t o = 0; uint64_t base = module_of(dm_fps_state) ? (uint64_t)(uintptr_t)module_of(dm_fps_state)->base : 0;
-        memcpy(&used, dm_fps_state + 0xfe0, 4);
-        for (uint32_t i = 0; i < used && i < 40 && o < sizeof pl - 256; i++) {
-            uint64_t cv, vt = 0; float xs, ys; uint32_t h; const uint8_t *e = dm_fps_state + 0xc10 + 24 * i;
-            memcpy(&cv, e, 8); memcpy(&xs, e + 8, 4); memcpy(&ys, e + 12, 4); memcpy(&h, e + 16, 4);
-            char names[200]; canvas_names(cv - 0x1b8, names, sizeof names); canvas_read(cv - 0x1b8, &vt, 8);
-            o += snprintf(pl + o, sizeof pl - o, " %.0fx%.0f %#llx x%u %s;", xs != 0 ? 2 / xs : 0, ys != 0 ? 2 / ys : 0, (unsigned long long)(vt - base), h, names);
-        }
-        LOG("[dm] all canvases: (layout size, main+vtable, loads, name):%s", o ? pl : " none");
-    }
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > tgt;
