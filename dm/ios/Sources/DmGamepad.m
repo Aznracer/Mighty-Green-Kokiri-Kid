@@ -415,27 +415,35 @@ static void pad_cache(CALayer *l, CGFloat scale) { if (l && pad_raster()) { l.sh
 static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPointMake(right ? CGRectGetMaxX(s) - dx : CGRectGetMinX(s) + dx, y); }
 // Native: 1 = an 874 x 402 point landscape screen (iPhone 18 Pro), the size the mock-up was drawn for
 - (CGFloat)gu { CGRect s = self.corner; return MIN(MIN(s.size.width / 437.0, s.size.height / 402.0), 1.3); }
+// Native, vertical: the distances from the bottom edge. On a screen taller than the mock-up at the scale gu (the iPhone Duo's inner screen, 951 x 669 points: gu stops at 1.3 while
+// the height would allow 1.66) the keys and the stick sit lower, nearer the bottom edge and the thumbs, at DM_PAD_NATIVE_Y of their distance (default 0.75; 1 = as drawn; 0.6 to 1).
+// The D-pad comes down with them; the top keys (+, −, the menu) stay. Sizes and the horizontal places are unchanged
+- (CGFloat)gv {
+    static double f = -1; if (f < 0) { const char *e = getenv("DM_PAD_NATIVE_Y"); f = e && atof(e) > 0 ? atof(e) : 0.75; if (f < 0.6) f = 0.6; if (f > 1) f = 1; }
+    CGRect s = self.corner; CGFloat g = self.gu;
+    return s.size.height / 402.0 > g * 1.1 ? g * f : g;
+}
 - (void)nat:(int)b centre:(CGPoint *)c radius:(CGFloat *)r {   // a Native key's centre and radius
-    CGRect s = self.corner; CGFloat g = self.gu, R = CGRectGetMaxX(s), L = CGRectGetMinX(s), T = CGRectGetMinY(s), Bt = CGRectGetMaxY(s);
+    CGRect s = self.corner; CGFloat g = self.gu, v = self.gv, R = CGRectGetMaxX(s), L = CGRectGetMinX(s), T = CGRectGetMinY(s), Bt = CGRectGetMaxY(s);
     CGFloat x = 0, y = 0, rr = 0;
     switch (b) {
-        case B_Y: x = R - 92 * g; y = Bt - 88 * g; rr = 44; break;   // native_oot.py: Ocarina of Time's sword is Y, so Y takes the big key and B (put away) the small one
-        case B_A: x = R - 180 * g; y = Bt - 74 * g; rr = 30; break;
-        case B_R: x = R - 226 * g; y = Bt - 196 * g; rr = 25; break;   // native_oot4.py: R (quick select) and ZR (the active item) swapped
-        case B_ZL: x = R - 106 * g; y = Bt - 188 * g; rr = 25; break;
-        case B_X: x = R - 40 * g; y = Bt - 172 * g; rr = 23; break;
-        case B_B: x = R - 40 * g; y = Bt - 238 * g; rr = 21; break;
-        case B_ZR: x = R - 164 * g; y = Bt - 154 * g; rr = 25; break;   // the active item (bow, slingshot)
-        case B_UP: x = L + 120 * g; y = Bt - 340 * g; rr = 17; break;   // native_oot4.py: the D-pad's middle in line with the stick's ring   // native_oot3.py: higher, just below the game's item icons    // native_oot2.py: the D-pad above the left stick's ring (its top at Bt - 167), in line with it,
-        case B_DOWN: x = L + 120 * g; y = Bt - 272 * g; rr = 17; break;   // clear of the game's hearts and item icons at the top left; up / down the context swaps (boots)
-        case B_LEFT: x = L + 86 * g; y = Bt - 306 * g; rr = 17; break;    // the ocarina
-        case B_RIGHT: x = L + 154 * g; y = Bt - 306 * g; rr = 17; break;  // Navi
+        case B_Y: x = R - 92 * g; y = Bt - 88 * v; rr = 44; break;   // native_oot.py: Ocarina of Time's sword is Y, so Y takes the big key and B (put away) the small one
+        case B_A: x = R - 180 * g; y = Bt - 74 * v; rr = 30; break;
+        case B_R: x = R - 226 * g; y = Bt - 196 * v; rr = 25; break;   // native_oot4.py: R (quick select) and ZR (the active item) swapped
+        case B_ZL: x = R - 106 * g; y = Bt - 188 * v; rr = 25; break;
+        case B_X: x = R - 40 * g; y = Bt - 172 * v; rr = 23; break;
+        case B_B: x = R - 40 * g; y = Bt - 238 * v; rr = 21; break;
+        case B_ZR: x = R - 164 * g; y = Bt - 154 * v; rr = 25; break;   // the active item (bow, slingshot)
+        case B_UP: x = L + 120 * g; y = Bt - 340 * v; rr = 17; break;   // native_oot4.py: the D-pad's middle in line with the stick's ring   // native_oot3.py: higher, just below the game's item icons    // native_oot2.py: the D-pad above the left stick's ring (its top at Bt - 167), in line with it,
+        case B_DOWN: x = L + 120 * g; y = Bt - 272 * v; rr = 17; break;   // clear of the game's hearts and item icons at the top left; up / down the context swaps (boots)
+        case B_LEFT: x = L + 86 * g; y = Bt - 306 * v; rr = 17; break;    // the ocarina
+        case B_RIGHT: x = L + 154 * g; y = Bt - 306 * v; rr = 17; break;  // Navi
         case B_PLUS: x = L + 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;
         default: x = R - 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // −
     }
     *c = CGPointMake(x, y); *r = rr * g;
 }
-- (CGPoint)natStickHome { CGRect s = self.corner; CGFloat g = self.gu; return CGPointMake(CGRectGetMinX(s) + N_STICK_X * g, CGRectGetMaxY(s) - N_STICK_Y * g); }
+- (CGPoint)natStickHome { CGRect s = self.corner; CGFloat g = self.gu; return CGPointMake(CGRectGetMinX(s) + N_STICK_X * g, CGRectGetMaxY(s) - N_STICK_Y * self.gv); }
 - (BOOL)portraitControls { return _layout.separated && self.bounds.size.height > self.bounds.size.width; }
 - (CGPoint)portraitThumbCenter:(BOOL)right {
     CGRect s = self.safe;
