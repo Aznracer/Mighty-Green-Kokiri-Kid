@@ -275,6 +275,7 @@ static void read_layout(module_t *m, const char *dir) {
         else if (!strcmp(key, "RO_OFF")) m->ro_off = v;
         else if (!strcmp(key, "DATA_OFF")) m->data_off = v;
         else if (!strcmp(key, "FPS_STATE_OFF")) m->fps_state_off = v;
+        else if (!strcmp(key, "FRAME_STEP_120")) m->fstep_t120 = v != 0;
         else if (!strcmp(key, "UE_MALLOC_VT")) m->ue_malloc_vt = v;
         else if (!strcmp(key, "UE_MALLOC_SLOT")) m->ue_malloc_slot = (unsigned)v;
         else if (!strcmp(key, "FPS_TARGET_PTR")) m->fps_target_ptr = v;
@@ -306,17 +307,21 @@ static void read_layout(module_t *m, const char *dir) {
 // (hle_nvn.c fstep_tick)
 uint8_t *dm_fps_state;
 static const char *g_fps_mod;   // the module holding the state page (for the log)
+static int g_fps_t120_able;   // its stub takes ticks of 1/120 s (FRAME_STEP_120)
 static void install_fps_state(module_t *m) {
     if (m->fps_state_off + 0x40 > m->size || m->fps_state_off < m->key_page_off + m->key_page_size) die("%s: frame step state page out of range", m->name);
-    dm_fps_state = m->base + m->fps_state_off; g_fps_mod = m->name;
+    dm_fps_state = m->base + m->fps_state_off; g_fps_mod = m->name; g_fps_t120_able = m->fstep_t120;
 }
 // The settings in the state page, written when the game starts (main.c, after host loading): on iOS the loading runs at app launch, before the launcher has set DM_FPS_TARGET and
 // DM_RENDER_SCALE (Launcher.swift), and nothing reads the page before the game runs
 void dm_fps_state_apply(void) {
     if (!dm_fps_state) return;
     const char *e = getenv("DM_FPS_TARGET"); int t = e ? atoi(e) : DM_GAME_FPS_TARGET;
-    if (t != 0 && t != 15 && t != 20 && t != 30 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 15, 20, 30 or 60; using the game's own frame step", e); t = 0; }
+    if (t == 40 && !g_fps_t120_able) { LOG("[RED] DM_FPS_TARGET=40: this main's frame step stub takes whole vsyncs only (no FRAME_STEP_120); capped at 30"); t = 30; }
+    if (t != 0 && t != 15 && t != 20 && t != 30 && t != 40 && t != 60) { LOG("[RED] DM_FPS_TARGET=%s: must be 0, 15, 20, 30, 40 or 60; using the game's own frame step", e); t = 0; }
     float f = (float)t; memcpy(dm_fps_state, &f, sizeof f);
+    // 40 fps (PR #2840): the step in ticks of 1/120 s for the whole run (the stub divides by the unit at +0x40; 0 = 60), so 2 / 3 / 4 ticks are 60 / 40 / 30 fps (hle_nvn.c fstep_t120)
+    if (t == 40) { uint32_t unit = 120; memcpy(dm_fps_state + 0x40, &unit, 4); LOG("%s: frame step in ticks of 1/120 s (40 fps on a 120 Hz screen; 30 and 60 can be picked while the game runs)", g_fps_mod); }
     // Render scale of the 3D views (the stubs at Tears of the Kingdom's main+0xd5cc0, Breath of the Wild's main+0x1266880): 1.0 keeps the game's own size and dynamic resolution;
     // another factor fixes the size at that fraction (DM_RENDER_SCALE, 0.5 to 1.0). Independent of the frame step: written at target 0 too
     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f;
@@ -362,6 +367,22 @@ void dm_fps_state_apply(void) {
     }
     char cap[32]; snprintf(cap, sizeof cap, ", capped at %d fps", t);
     LOG("%s: frame step %s%s (%s)", g_fps_mod, !t ? "as the game sets it" : "in whole vsyncs decided by the host", t ? cap : "", e ? "DM_FPS_TARGET" : "game profile fps_target");
+}
+// The frame rate chosen while the game runs (PR #2837: the in-game menu, front_ios.m dm_setting_live; DM_CTL fps). A game the host steps through its state page reads the target at
+// every present (hle_nvn.c fps_step_cap), so a change takes effect at the next frame. 30 and 60 always; 40 only in a run started at 40, whose step is in ticks of 1/120 s (the unit
+// is fixed for the run). Returns the target in force, 0 when the game does not take a change at once
+int dm_fps_target_live(void) {
+    if (!dm_fps_state) return 0;
+    uint32_t b = __atomic_load_n((uint32_t *)dm_fps_state, __ATOMIC_RELAXED); float t; memcpy(&t, &b, sizeof t);
+    return t <= 0 ? 0 : t <= 15 ? 15 : t <= 20 ? 20 : t <= 30 ? 30 : t <= 40 ? 40 : 60;
+}
+int dm_fps_target_set(int fps) {
+    int was = dm_fps_target_live(), ticks = was && __atomic_load_n((uint32_t *)(dm_fps_state + 0x40), __ATOMIC_RELAXED) == 120;
+    if (!was) { LOG("[RED] frame rate %d fps refused: %s", fps, !dm_fps_state ? "this game has no frame step state page; it takes the frame rate at the next start" : "the game sets its own frame step"); return 0; }
+    if (fps != 30 && fps != 60 && !(fps == 40 && ticks)) { LOG("[RED] frame rate %d fps refused: %s", fps, fps == 40 ? "40 needs the game started at 40 (DM_FPS_TARGET=40 on the start screen)" : "must be 30, 40 or 60"); return 0; }
+    float f = (float)fps; uint32_t b; memcpy(&b, &f, sizeof b); __atomic_store_n((uint32_t *)dm_fps_state, b, __ATOMIC_RELAXED);
+    if (was != fps) LOG("%s: frame step capped at %d fps (was %d), set while the game runs", g_fps_mod, fps, was);
+    return 1;
 }
 static void install_key_page(module_t *m) {
     if (m->key_page_off + m->key_page_size > m->size) die("%s: key page out of range", m->name);

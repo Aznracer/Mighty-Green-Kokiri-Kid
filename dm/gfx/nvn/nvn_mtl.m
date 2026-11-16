@@ -17487,7 +17487,7 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     tex_t gt; int gen = it.gen && g_fg_tick > 0 && it.period >= 1.5 * g_fg_tick;
     if (gen) { memset(&gt, 0, sizeof gt); gt.magic = MAGIC('T', 'E', 'X', 0); gt.serial = it.gen; }
     @autoreleasepool { submitted = present_now(gen ? &gt : &it.t, it.period, it.frame, ticket, it.crop, update.drawable, update.targetPresentationTimestamp); }
-    g_link_hold_until = submitted && it.period > 0.025 ? update.targetPresentationTimestamp + it.period : 0;
+    g_link_hold_until = submitted && it.period > 0.020 ? update.targetPresentationTimestamp + it.period : 0;   // over 20 ms (was 25): a 40 fps frame, 25 ms, stays its three 120 Hz ticks (PR #2840)
     link_slow_note(gen ? "a generated frame" : "a present", p0 - s0, now_ns() - p0, g_present_alloc_wait_ns - a0, g_present_res_ns - r0);
     if (submitted && gen) { pthread_mutex_lock(&g_pq_mu); g_fg_owe = it; g_fg_owe_tk = ticket; g_fg_owe_at = update.targetPresentationTimestamp + it.period / 2; g_fg_owed = 1; pthread_mutex_unlock(&g_pq_mu); }
     if (!submitted) {

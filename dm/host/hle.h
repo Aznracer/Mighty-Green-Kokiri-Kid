@@ -67,6 +67,8 @@ static inline void dm_applet_leave_(const char *const *name) { (void)name; dm_ap
 #define DM_APPLET(name) const char *const dm_applet_ __attribute__((cleanup(dm_applet_leave_))) = (name); dm_applet_enter(dm_applet_)
 // Audio pause / resume following the lifecycle (called by the front end on going to background / returning to foreground)
 extern uint8_t *dm_fps_state;   // frame step state page (loader.c install_fps_state): +0 float target fps, +4 movie flag (dm_movie_playing, written by the host at each present: Tears of the Kingdom's step stub caps its first, undecided steps by it), +0x10 float render scale, +0x18 double game seconds stepped; NULL when the build has none
+int dm_fps_target_live(void);   // loader.c: the frame rate target in force (15 / 20 / 30 / 40 / 60) when the running game takes a change at once (a state page the host steps), else 0
+int dm_fps_target_set(int fps);   // loader.c: 30 or 60, or 40 in a run started at 40 (ticks of 1/120 s), into the state page while the game runs; 1 = taken, 0 = refused (logged)
 int dm_movie_playing(void);   // hle_movie.c: a video decoder of the SDK's movie library handed out a picture in the last half second (the frame step then holds 30 fps)
 void dm_audio_suspend(int on);
 uint64_t dm_audio_render_calls(void);   // Cumulative sound card callback count (the silent sink is not counted)

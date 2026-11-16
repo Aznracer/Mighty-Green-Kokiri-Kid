@@ -16,19 +16,23 @@ def frame_step(ctx):
     fs_site(site, '2818201e')   # fdiv s8,s1,s0
     start = here(); emit(ADRP(16, here(), FS_STATE_OFF))
     for w in (0xb9400211,   # ldr w17,[x16]          target fps (0 = off)
-              0x34000271,   # cbz w17,orig (+19)
-              0xb9402211,   # ldr w17,[x16,#0x20]    step in vsyncs
-              0x34000231,   # cbz w17,orig (+17)     not decided yet
+              0x340002d1,   # cbz w17,orig (+22)
+              0xb9402211,   # ldr w17,[x16,#0x20]    step in vsyncs, or ticks of 1/120 s (+0x40)
+              0x34000291,   # cbz w17,orig (+20)     not decided yet
               0x1e230220,   # ucvtf s0,w17
               0xf9401a10,   # ldr x16,[x16,#0x30]
               0x8b110210):  # add x16,x16,x17
         emit(w)
     emit(ADRP(17, here(), FS_STATE_OFF))
-    for w in (0xf9001a30,   # str x16,[x17,#0x30]    vsyncs stepped
-              0x1e210808,   # fmul s8,s0,s1          step × base rate
-              0x52a84e10,   # mov w16,#0x42700000    60.0
-              0x1e270200,   # fmov s0,w16
-              0x1e201908):  # fdiv s8,s8,s0          / 60
+    for w in (0xf9001a30,   # str x16,[x17,#0x30]    units stepped
+              0x1e210808):  # fmul s8,s0,s1          step × base rate
+        emit(w)
+    emit(ADRP(16, here(), FS_STATE_OFF))   # the page again (x17 after its store: see below)
+    for w in (0xb9404210,   # ldr w16,[x16,#0x40]    the step's ticks a second (120 at 40 fps, PR #2840; 0 = 60)
+              0x35000050,   # cbnz w16,+2
+              0x52800790,   # mov w16,#60
+              0x1e230200,   # ucvtf s0,w16
+              0x1e201908):  # fdiv s8,s8,s0          / the unit
         emit(w)
     emit(ADRP(16, here(), FS_STATE_OFF))   # the page again: x17 did not survive the store above on an iPhone (seedds/nxnative PR #1543, a fault at x17 + 0x3c with x17 = 0)
     for w in (0xbd403a00,   # ldr s0,[x16,#0x38]     seconds; 0 = at the target
@@ -39,12 +43,13 @@ def frame_step(ctx):
         emit(w)
     emit(B(here(), site + 4))
     emit(0x1e201828); emit(B(here(), site + 4))   # orig: fdiv s8,s1,s0; back
-    fs_put(site, [B(site, start)], 'frame ratio: the host\'s step × base rate / 60, or base rate × the measured frame time when that is longer (state +0x38), instead of base rate / the game\'s frame rate (state page target fps; 0 = the game\'s ratio)')
+    fs_put(site, [B(site, start)], 'frame ratio: the host\'s step × base rate / its unit (state +0x40: 120 = ticks of 1/120 s at 40 fps, else 60), or base rate × the measured frame time when that is longer (state +0x38), instead of base rate / the game\'s frame rate (state page target fps; 0 = the game\'s ratio)')
     heap_retry(ctx)   # a full model heap (PR #2497)
     screen_shape(ctx)   # DM_SCREEN_ASPECT: the iPhone Duo's 1.43:1 picture
 
 
 FRAME_STEP = {'e0f3ccfaf50065ae4ea01eb5aeb13b1a': frame_step}
+CAPABILITIES = {'e0f3ccfaf50065ae4ea01eb5aeb13b1a': ('FRAME_STEP_120',)}   # the ratio stub divides by the unit at state +0x40: the loader takes DM_FPS_TARGET=40 (ticks of 1/120 s)
 
 # The movie player's pictures per frame. Once a frame the player's update (main+0x3b5ca60 on v131072) adds the frame's time (the time object's +0x18, the frame ratio / 60 s, times
 # 60) to a count at +0x8, takes its whole pictures (the movie's rate at the player's +0x324; the title's and the opening's are 60 fps) and advances that many (main+0x3b61ea0 pops them from its
