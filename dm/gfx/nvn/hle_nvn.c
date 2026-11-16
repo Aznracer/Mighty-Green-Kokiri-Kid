@@ -1924,11 +1924,12 @@ static int ui_match(const char *names) {   // the include must be the screen's o
         if (g_ui_rule[i].inc[0] && strlen(g_ui_rule[i].inc) == own && !strncmp(names, g_ui_rule[i].inc, own) && !(g_ui_rule[i].exc[0] && strstr(names, g_ui_rule[i].exc))) return g_ui_rule[i].mode;
     return 0;
 }
-// Taller layout roots (DM_UI_ROOT, on unless 0): a menu screen's objects (breadth first through guest heap pointers, 0x7000000000 up, read safely; up to 6
+// Taller layout roots (DM_UI_ROOT=1; off by default): a menu screen's objects (breadth first through guest heap pointers, 0x7000000000 up, read safely; up to 6
 // levels and 8000 objects; screens named in DM_UI_ROOT_SCAN, default the menus') are searched for its layouts' root panes, an object holding the name "RootPane"
 // inline; one with a 16:9 size beside it (w x w * 9 / 16, w 1280 / 1920 / 2560 / 3840) gets the taller screen's height (x k), once, when the screen is made. Panes
 // the layouts pin to their parent's top or bottom edge (the layout editor's parent origin) then follow the edges. Each search is logged: how many objects, where
-// "RootPane" was seen (level, the name's offset, the offsets of 16:9 heights near it). First try (2026-11-15, 3 levels, any pointer): no root pane found
+// "RootPane" was seen (level, the name's offset, the offsets of 16:9 heights near it). iPhone Duo, 2026-11-16: "RootPane" in 60-139 objects per menu, never
+// beside a 16:9 size (name tables and layout files, not the live root panes), so nothing moved; off by default: each menu screen cost 8192 reads
 static uint64_t g_root_done[1024]; static int g_nroot, g_root_on = -1;
 static int root_try(uint64_t obj, const uint8_t *b, size_t n, float k, int depth, char *note, size_t cap) {
     const uint8_t *nm = memmem(b, n, "RootPane", 9); if (!nm) return 0;
@@ -1950,7 +1951,7 @@ static int root_try(uint64_t obj, const uint8_t *b, size_t n, float k, int depth
     return 1;
 }
 static int ui_roots(uint64_t screen, const char *names, float k) {   // root panes made taller under this screen
-    if (g_root_on < 0) { const char *e = getenv("DM_UI_ROOT"); g_root_on = !(e && e[0] == '0'); LOG("[dm] UI roots: %s", g_root_on ? "on (DM_UI_ROOT=0 turns them off)" : "off"); }
+    if (g_root_on < 0) { const char *e = getenv("DM_UI_ROOT"); g_root_on = e && e[0] == '1'; LOG("[dm] UI roots: %s", g_root_on ? "on (DM_UI_ROOT=1)" : "off (DM_UI_ROOT=1 turns them on)"); }
     if (!g_root_on || !names[0]) return 0;
     const char *scan = getenv("DM_UI_ROOT_SCAN"); if (!scan) scan = "SystemSaveLoad_00,SystemLoadList_00,MenuBG_00,MenuOverlay_00,PlusMenu_00,ImportantMenu_00,MapMenu_00,ShortCut_00,CtrlGuide_00";
     size_t own = strcspn(names, " "); char key[72]; snprintf(key, sizeof key, "%.*s", (int)own, names);
