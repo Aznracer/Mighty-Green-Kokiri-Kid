@@ -212,15 +212,21 @@ _SS_RENDER_VIEW = [
     0x1e270230, 0x1e302220, 0x540000ac, 0xbd405a01, 0xb945ea11, 0x11000631, 0xb905ea11, 0xd4200040]
 
 
-# The full-screen canvases, logged (while DM_SCREEN_ASPECT is on): each canvas loads its projection at main+0x774368 (ldp q1, q4, [x2]; its screen at x0 - 0x1b8, per
-# seedds/nxnative pull request 2795). For the HUD's edges, which screens are which: a canvas of the 3840x2160 projection (x scale 2/3840 exactly) has its screen's
-# vtable kept with its latest screen, the first 24 different (+0x600, 32 bytes: vtable, screen, y scale, count; +0x900 how many, +0x904 loads, +0x908 'NVCS'), logged by
-# hle_nvn.c every 300 frames with the strings each screen points to (its layout's name). x9..x14 saved, x16 / x17 free there
+# The full-screen canvases (logged while DM_SCREEN_ASPECT is on; their placement, bit 20). Each screen (the game's layouts: HUD pieces, menus) owns a canvas, at screen
+# +0x1b8 (seedds/nxnative pull request 2795), and loads its projection once, when it is made, at main+0x774368 (ldp q1, q4, [x2]: rows 0 and 1). A canvas of the
+# 3840x2160 projection (x scale 2/3840 exactly; its y row divided by k by bit 17, so it keeps its shape, centred) has its screen's vtable kept with its latest screen,
+# the first 48 different (+0x600, 32 bytes: vtable, screen, y scale, count; +0xc00 how many, +0xc04 loads, +0xc08 'NVCS'), logged by hle_nvn.c every 300 frames
+# with the layout names each screen points to (iPhone Duo, 2026-11-15: CtrlGuide_00, Location_00, MapMenu_00, ...). Then the screens of _SS_UI_RULES are placed
+# for the taller screen: 'down' / 'up' move the whole screen to the bottom / top edge (row 1's translation -/+ (1 - 1/k)), 'fill' stretches it to the full height
+# (row 1 x k). x9..x14 saved, x16 / x17 and s17 / s18 free there
+_SS_UI_RULES = [('down', 79581976), ('down', 79593160)]   # (placement, the screen's vtable): CtrlGuide_00 (menus' button guides), Location_00 (an area's name, bottom left)
 _SS_CANVAS_LOG = [
-    0xad401041, 0xd4200020, 0xb9404a11, 0x34000551, 0xb9490611, 0x11000631, 0xb9090611, 0x1e260031, 0xa9bd2be9, 0xa90133eb, 0xa9023bed, 0x52911129, 0x72a74109,
-    0x6b09023f, 0x54000381, 0x528ac9d1, 0x72aa6871, 0xb9090a11, 0xd106e00a, 0xf9400149, 0xb949020c, 0x9118020d, 0x5280000e, 0x6b0c01df, 0x540000ea, 0xf94001ab,
-    0xeb09017f, 0x54000160, 0x910081ad, 0x110005ce, 0x17fffff9, 0x7100619f, 0x5400014a, 0xa90029a9, 0x0e0c3c8b, 0x29027dab, 0x1100058c, 0xb909020c, 0xf90005aa,
-    0xb94015ab, 0x1100056b, 0xb90015ab, 0xa9423bed, 0xa94133eb, 0xa8c32be9, 0xd4200040]
+    0xad401041, 0xd4200020, 0xb9404a11, 0x34000911, 0xb94c0611, 0x11000631, 0xb90c0611, 0x1e260031, 0xa9bd2be9, 0xa90133eb, 0xa9023bed, 0x52911129, 0x72a74109,
+    0x6b09023f, 0x54000741, 0x528ac9d1, 0x72aa6871, 0xb90c0a11, 0xd106e00a, 0xf9400149, 0xb94c020c, 0x9118020d, 0x5280000e, 0x6b0c01df, 0x540000ea, 0xf94001ab,
+    0xeb09017f, 0x54000160, 0x910081ad, 0x110005ce, 0x17fffff9, 0x7100c19f, 0x5400014a, 0xa90029a9, 0x0e0c3c8b, 0x29027dab, 0x1100058c, 0xb90c020c, 0xf90005aa,
+    0xb94015ab, 0x1100056b, 0xb90015ab, 0xb9405611, 0x36a003b1, 0xbd405e11, 0x1e202228, 0x54000340, 0xd4200300, 0xd4200320, 0xeb11013f, 0x540001a0, 0xd4200301,
+    0xd4200321, 0xeb11013f, 0x54000120, 0x14000011, 0x1e2e1012, 0x1e311a51, 0x1e313a51, 0x5e1c0492, 0x1e312a52, 0x6e1c0644, 0x1400000a, 0x1e2e1012, 0x1e311a51,
+    0x1e313a51, 0x5e1c0492, 0x1e313a52, 0x6e1c0644, 0x14000003, 0x4e040631, 0x6e31dc84, 0xa9423bed, 0xa94133eb, 0xa8c32be9, 0xd4200040]
 
 
 def screen_shape(ctx):
@@ -235,12 +241,14 @@ def screen_shape(ctx):
             elif w == 0xd4200200: w = BL(here(), _TANF)
             elif w == 0xd4200220: w = BL(here(), _ATANF)
             elif w == 0xd4200240: w = BL(here(), _SINF)
+            elif 0xd4200300 <= w < 0xd4200300 + len(_SS_UI_RULES): w = ADRP(17, here(), _SS_UI_RULES[w - 0xd4200300][1])   # adrp x17, a placed screen's vtable
+            elif 0xd4200320 <= w < 0xd4200320 + len(_SS_UI_RULES): w = ADDI(17, 17, _SS_UI_RULES[w - 0xd4200320][1] & 0xfff)
             emit(w)
         fs_put(site, [B(site, start)], why)
     stub(0x1087f44, 0x29402c2a, _SS_SIZE_CMP, 0x1087f48, 'display size compared in the screen\'s shape (bit 0)')
     stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
     stub(0x25d770, 0x1e221821, _SS_RENDER_VIEW, 0x25d774, 'render view aspect: a 16:9 view takes the screen\'s ratio (bit 19)')
-    stub(0x774368, 0xad401041, _SS_CANVAS_LOG, 0x77436c, 'full-screen canvas projection: the screens drawn with it, logged')
+    stub(0x774368, 0xad401041, _SS_CANVAS_LOG, 0x77436c, 'full-screen canvas projection: its screen logged, and placed for the taller screen by _SS_UI_RULES (bit 20)')
     for site, n, what in _SS_PROJ_SITES:
         stub(site, 0x52802008, _proj_words(n), site + 4, f'sead::Projection matrix update inlined in {what}: a 16:9 matrix keeps its shape on the taller screen, y row / k (bit 17)')
     for site, orig, off, apply, bit, what in _SS_LAYOUT:
