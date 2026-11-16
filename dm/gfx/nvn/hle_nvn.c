@@ -1870,14 +1870,14 @@ static void tsummary(uint64_t frame) {
     LOG("[nvn] timing up to frame %llu:%s", frame, line);
     { void mtl_pso_line(char *, size_t); char pl[1024]; mtl_pso_line(pl, sizeof pl); LOG("[nvn] pipelines up to frame %llu: %s", frame, pl); }
     if (dm_fps_state && !memcmp(dm_fps_state + 0x5f8, "PORJ", 4)) {   // a screen-shape profile's projection table (Ocarina of Time patches.py _SS_PROJ_X0): m0, m5, their ratio, whether its y row was divided, updates of each
-        uint32_t used, calls, fov, mask, cam; float k; char pl[1024]; size_t o = 0;
-        memcpy(&cam, dm_fps_state + 0x5ec, 4); memcpy(&used, dm_fps_state + 0x5f0, 4); memcpy(&calls, dm_fps_state + 0x5f4, 4); memcpy(&fov, dm_fps_state + 0x300, 4); memcpy(&mask, dm_fps_state + 0x54, 4); memcpy(&k, dm_fps_state + 0x5c, 4);
+        uint32_t used, calls, fov, mask, cam, rv, bg; float k; char pl[1024]; size_t o = 0;
+        memcpy(&cam, dm_fps_state + 0x5ec, 4); memcpy(&rv, dm_fps_state + 0x5e8, 4); memcpy(&bg, dm_fps_state + 0x5e4, 4); memcpy(&used, dm_fps_state + 0x5f0, 4); memcpy(&calls, dm_fps_state + 0x5f4, 4); memcpy(&fov, dm_fps_state + 0x300, 4); memcpy(&mask, dm_fps_state + 0x54, 4); memcpy(&k, dm_fps_state + 0x5c, 4);
         for (uint32_t i = 0; i < used && i < 15 && o < sizeof pl - 64; i++) {
             float m0, m5; uint32_t d, h; const uint8_t *e = dm_fps_state + 0x500 + 16 * i;
             memcpy(&m0, e, 4); memcpy(&m5, e + 4, 4); memcpy(&d, e + 8, 4); memcpy(&h, e + 12, 4);
             o += snprintf(pl + o, sizeof pl - o, " %.4g/%.4g (%.3f)%s x%u;", m0, m5, m0 != 0.0f ? (m5 / m0 < 0 ? -m5 / m0 : m5 / m0) : 0.0f, d ? " divided" : "", h);
         }
-        LOG("[dm] projections up to frame %llu: %u updates (sites %#x, k %.3f, fovy widened %u, game camera 16:9 aspects made the screen's %u); m0/m5 (ratio):%s", frame, calls, mask, k, fov, cam, o ? pl : " none");
+        LOG("[dm] projections up to frame %llu: %u updates (sites %#x, k %.3f, fovy widened %u, game camera 16:9 aspects made the screen's %u, render views %u, full-height backgrounds %u); m0/m5 (ratio):%s", frame, calls, mask, k, fov, cam, rv, bg, o ? pl : " none");
     }
     double tgt = 1000.0 / mtl_fps_target();   // milliseconds one frame should take: 16.7 at 60 fps, 33.3 when the game itself asks for 30 (the over-time / dropped-frame counts below use it)
     { unsigned n = g_tn[0] < TWIN ? g_tn[0] : TWIN, over = 0; double v[TWIN];   // frame interval gets its own line (M1 baseline): number of frames longer than one frame period in this window and p99

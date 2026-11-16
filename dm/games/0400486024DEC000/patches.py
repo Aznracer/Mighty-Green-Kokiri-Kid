@@ -1,5 +1,5 @@
 """Simulation step for the v131072 Ocarina of Time main build."""
-from nso_asm import ADRP, B
+from nso_asm import ADRP, ADDI, B
 
 # The game's frame ratio. Once a frame the function at main+0x6e6be0 (v131072) divides its base rate (60.0, or 30.0 while bit 0 of [x21+0x24f] is set) by the int frame rate at
 # [x21+0x2c8] (fdiv s8,s1,s0 at +0xe4) and hands the result to the time object (main+0x3b4e300: ratio at +0x10, 1 / ratio at +0x14, round(60 / ratio) at +0x1c), which the game
@@ -204,6 +204,25 @@ def _proj_words(n):   # the same with the projection in xN: its ldr / str s at [
     return [w | n << 5 if w & 0xffc00000 in (0xbd400000, 0xbd000000) and (w >> 5) & 31 == 0 else w for w in _SS_PROJ_X0]
 
 
+# The render view's aspect (bit 19). main+0x25d76c..+0x25d770 (scvtf s1, w21; fdiv s1, s1, s2) computes the render view's width / height, which shaders and view-dependent
+# effects read besides the camera; a view still 16:9 there (within 0.01) takes the screen's ratio (state +0x58), as the game camera does (bit 18). Counted at +0x5e8.
+# Found by seedds/nxnative pull request 2795 (the same site for wider screens, with craftycorvid/oot-mod's analysis); s16 / s17 and x16 / x17 are free there
+_SS_RENDER_VIEW = [
+    0x1e221821, 0xd4200020, 0xb9405611, 0x36980231, 0xbd405a10, 0x1e202208, 0x540001c0, 0x5291c731, 0x72a7fc71, 0x1e270231, 0x7eb1d431, 0x529ae151, 0x72a78471,
+    0x1e270230, 0x1e302220, 0x540000ac, 0xbd405a01, 0xb945ea11, 0x11000631, 0xb905ea11, 0xd4200040]
+# Full-screen menu backgrounds (bit 20). Each canvas loads its projection at main+0x774368 (ldp q1, q4, [x2]: rows 0 and 1; the canvas's owner, a screen, at x0 - 0x1b8).
+# The full-screen canvases use the 3840x2160 orthographic projection, whose y row bit 17 divided by k so menus keep their shape; a canvas whose screen is one of the
+# four background screens (their vtables, from pull request 2795, which keeps them at full size while it narrows the HUD) has its y row multiplied back by k there,
+# so the background fills the taller screen (iPhone Duo, 2026-11-15: a black strip below the map). Matched by x scale 2/3840 exactly and |y| x k = 2/2160 within 64
+# ulps; counted at +0x5e4. s17 / s18 / v17 and x16 / x17 are free there (the pull request's own stub uses them)
+_SS_BG_VT = (0x4bed098, 0x4be4fb0, 0x4be7b30, 0x4be61c8)
+_SS_BG = [
+    0xad401041, 0xd4200020, 0xb9405611, 0x36a005b1, 0xbd405e11, 0x1e202228, 0x54000540, 0x1e260030, 0x52911131, 0x72a74111, 0x6b11021f, 0x540004a1, 0x0e0c3c90,
+    0x12007a10, 0x1e270212, 0x1e310a52, 0x1e260250, 0x52973ad1, 0x72a74e51, 0x4b110210, 0x11010210, 0x7102021f, 0x54000342, 0xd106e011, 0xf9400230, 0xd4200300,
+    0xd4200320, 0xeb11021f, 0x540001c0, 0xd4200301, 0xd4200321, 0xeb11021f, 0x54000140, 0xd4200302, 0xd4200322, 0xeb11021f, 0x540000c0, 0xd4200303, 0xd4200323,
+    0xeb11021f, 0x54000040, 0x14000007, 0x4e040631, 0x6e31dc84, 0xd4200020, 0xb945e611, 0x11000631, 0xb905e611, 0xd4200040]
+
+
 def screen_shape(ctx):
     here, emit, fs_site, fs_put, STATE = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
     def stub(site, orig_word, words, back, why, subst=None):
@@ -216,10 +235,14 @@ def screen_shape(ctx):
             elif w == 0xd4200200: w = BL(here(), _TANF)
             elif w == 0xd4200220: w = BL(here(), _ATANF)
             elif w == 0xd4200240: w = BL(here(), _SINF)
+            elif 0xd4200300 <= w < 0xd4200300 + len(_SS_BG_VT): w = ADRP(17, here(), _SS_BG_VT[w - 0xd4200300])   # adrp x17, a background screen's vtable
+            elif 0xd4200320 <= w < 0xd4200320 + len(_SS_BG_VT): w = ADDI(17, 17, _SS_BG_VT[w - 0xd4200320] & 0xfff)   # add x17, x17, its low 12 bits
             emit(w)
         fs_put(site, [B(site, start)], why)
     stub(0x1087f44, 0x29402c2a, _SS_SIZE_CMP, 0x1087f48, 'display size compared in the screen\'s shape (bit 0)')
     stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
+    stub(0x25d770, 0x1e221821, _SS_RENDER_VIEW, 0x25d774, 'render view aspect: a 16:9 view takes the screen\'s ratio (bit 19)')
+    stub(0x774368, 0xad401041, _SS_BG, 0x77436c, 'full-screen canvas projection: the menu backgrounds\' screens keep the full height (bit 20)')
     for site, n, what in _SS_PROJ_SITES:
         stub(site, 0x52802008, _proj_words(n), site + 4, f'sead::Projection matrix update inlined in {what}: a 16:9 matrix keeps its shape on the taller screen, y row / k (bit 17)')
     for site, orig, off, apply, bit, what in _SS_LAYOUT:
