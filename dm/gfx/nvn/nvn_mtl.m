@@ -12284,7 +12284,7 @@ static int rt_same(const p_set_rt *a, const p_set_rt *b) {   // Same set of targ
 }
 // rt_same_mtl.py: DM_NVN_RT_SAME_MTL=1, the same targets also when their serials differ but they are the same Metal textures (a target
 // initialized again over the same storage, which the sharing table gives the same Metal texture); views, counts and depth presence as rt_same
-static int rt_same_mtl_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_RT_SAME_MTL"); v = e && atoi(e) > 0; } return v; }
+static int rt_same_mtl_on(void) { static int m = -1; if (m < 0) { m = sw_mode("DM_NVN_RT_SAME_MTL", 0); if (m) MLOG("DM_NVN_RT_SAME_MTL: render targets set again on the same Metal textures under new serials go on in the pass (%s)", m == 1 ? "on" : "A/B"); } return m && sw_on(m); }
 static int rt_same_tex(const tex_t *x, const tex_t *y) {
     if (!x != !y) return 0;
     if (!x || x->serial == y->serial) return 1;
