@@ -217,21 +217,25 @@ _SS_RENDER_VIEW = [
 # 3840x2160 projection (x scale 2/3840 exactly; its y row divided by k by bit 17, so it keeps its shape, centred) has its screen's vtable kept with its latest screen,
 # the first 48 different (+0x600, 32 bytes: vtable, screen, y scale, count; +0xc00 how many, +0xc04 loads, +0xc08 'NVCS'), logged by hle_nvn.c every 300 frames
 # with the layout names each screen points to (iPhone Duo, 2026-11-15: CtrlGuide_00, Location_00, MapMenu_00, ...). Then the screens of _SS_UI_RULES are placed
-# for the taller screen: 'down' / 'up' move the whole screen to the bottom / top edge (row 1's translation -/+ (1 - 1/k)), 'fill' stretches it to the full height
-# (row 1 x k). x9..x14 saved, x16 / x17 and s17 / s18 free there
+# for the taller screen. The function (main+0x774330) multiplies the view (x1) by the projection (x2, rows q1 q4 q5 q6, for row vectors: column 1 is the output's y),
+# so 'down' / 'up' move the whole screen to the bottom / top edge (the y translation, q6 lane 1, -/+ (1 - 1/k)) and 'fill' stretches it to the full height (column 1 x k:
+# q4 and q6 lane 1). Lane 3 of q4 is the y input's weight in w: the first try changed it and the screens vanished (2026-11-15). x9..x14 saved, x16 / x17 and s17 / s18 free there
 _SS_UI_RULES = [   # (placement, the screen's vtable); _SS_CANVAS_LOG's compares are assembled for this list (one per rule, in order)
-    ('up', 0x4beb710),     # PlayerStatus_00: the hearts, top left
-    ('down', 0x4be5318),   # CtrlGuide_00: the menus' button guides
+    ('up', 0x4beb710),     # PlayerStatus_00: the hearts and the item buttons, top left
     ('down', 0x4be7ec8),   # Location_00: an area's name, bottom left
+    ('down', 0x4be5318),   # CtrlGuide_00: button guides (not the pause menus', 2026-11-15)
+    ('fill', 0x4be7b30),   # LoadingFade_00: the black fade between areas (a 16:9 box with the scene above and below it, 2026-11-15)
+    ('fill', 0x4be61c8),   # EventSkipFade_00: the fade of a skipped scene
 ]
 _SS_CANVAS_LOG = [
-    0xad401041, 0xd4200020, 0xb9404a11, 0x34000991, 0xb94c0611, 0x11000631, 0xb90c0611, 0x1e260031, 0xa9bd2be9, 0xa90133eb, 0xa9023bed, 0x52911129, 0x72a74109,
-    0x6b09023f, 0x540007c1, 0x528ac9d1, 0x72aa6871, 0xb90c0a11, 0xd106e00a, 0xf9400149, 0xb94c020c, 0x9118020d, 0x5280000e, 0x6b0c01df, 0x540000ea, 0xf94001ab,
+    0xad401041, 0xd4200020, 0xb9404a11, 0x34000b11, 0xb94c0611, 0x11000631, 0xb90c0611, 0x1e260031, 0xa9bd2be9, 0xa90133eb, 0xa9023bed, 0x52911129, 0x72a74109,
+    0x6b09023f, 0x54000941, 0x528ac9d1, 0x72aa6871, 0xb90c0a11, 0xd106e00a, 0xf9400149, 0xb94c020c, 0x9118020d, 0x5280000e, 0x6b0c01df, 0x540000ea, 0xf94001ab,
     0xeb09017f, 0x54000160, 0x910081ad, 0x110005ce, 0x17fffff9, 0x7100c19f, 0x5400014a, 0xa90029a9, 0x0e0c3c8b, 0x29027dab, 0x1100058c, 0xb90c020c, 0xf90005aa,
-    0xb94015ab, 0x1100056b, 0xb90015ab, 0xb9405611, 0x36a00431, 0xbd405e11, 0x1e202228, 0x540003c0, 0xd4200300, 0xd4200320, 0xeb11013f, 0x54000140, 0xd4200301,
-    0xd4200321, 0xeb11013f, 0x540001a0, 0xd4200302, 0xd4200322, 0xeb11013f, 0x54000120, 0x14000011, 0x1e2e1012, 0x1e311a51, 0x1e313a51, 0x5e1c0492, 0x1e312a52,
-    0x6e1c0644, 0x1400000a, 0x1e2e1012, 0x1e311a51, 0x1e313a51, 0x5e1c0492, 0x1e313a52, 0x6e1c0644, 0x14000003, 0x4e040631, 0x6e31dc84, 0xa9423bed, 0xa94133eb,
-    0xa8c32be9, 0xd4200040]
+    0xb94015ab, 0x1100056b, 0xb90015ab, 0xb9405611, 0x36a005b1, 0xbd405e11, 0x1e202228, 0x54000540, 0xd4200300, 0xd4200320, 0xeb11013f, 0x54000240, 0xd4200301,
+    0xd4200321, 0xeb11013f, 0x540002a0, 0xd4200302, 0xd4200322, 0xeb11013f, 0x54000220, 0xd4200303, 0xd4200323, 0xeb11013f, 0x54000280, 0xd4200304, 0xd4200324,
+    0xeb11013f, 0x54000200, 0x14000015, 0x1e2e1012, 0x1e311a51, 0x1e313a51, 0x5e0c04d2, 0x1e312a52, 0x6e0c0646, 0x1400000e, 0x1e2e1012, 0x1e311a51, 0x1e313a51,
+    0x5e0c04d2, 0x1e313a52, 0x6e0c0646, 0x14000007, 0x5e0c0492, 0x1e310a52, 0x6e0c0644, 0x5e0c04d2, 0x1e310a52, 0x6e0c0646, 0xa9423bed, 0xa94133eb, 0xa8c32be9,
+    0xd4200040]
 
 
 def screen_shape(ctx):
