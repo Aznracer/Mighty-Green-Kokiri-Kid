@@ -2530,8 +2530,24 @@ static const int *present_crop(const int win[4], int tw, int th, int lc[4]) {
     }
     return lc;
 }
+// A game that stops presenting while in focus (Ocarina of Time froze flying from Lake Hylia to Hyrule Castle: no present, its threads idle, audio still running): the iOS app has
+// no no-progress watchdog (crash.c), so after 6 s without a present in focus the state dump (what each guest thread waits on, the graphics wait points) goes to the log, at most 3 times
+__attribute__((weak)) int dm_focus_now(void) { return 1; }   // hle_oe.c; graphics unit tests have none
+static _Atomic uint64_t g_present_last_ns;
+static void *present_watch(void *arg) {
+    (void)arg; int dumps = 0; uint64_t dumped_for = 0;
+    for (;;) {
+        sleep(1);
+        uint64_t last = atomic_load(&g_present_last_ns), now = now_ns();
+        if (last && now > last + 6000000000ull && last != dumped_for && dm_focus_now() == 1 && dumps < 3) {
+            dumps++; dumped_for = last; LOG("[RED] [nvn] no present for %.1f s while in focus: state dump follows", (now - last) / 1e9); crash_dump_now("no present for 6 s");
+        }
+    }
+    return NULL;
+}
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    { static int started; if (!started) { started = 1; pthread_t th; if (!pthread_create(&th, NULL, present_watch, NULL)) pthread_detach(th); } atomic_store(&g_present_last_ns, now_ns()); }
     if (!dm_detclock_enabled() && g_rt_period_ms > 0) rt_present_tick((uint64_t)(g_rt_period_ms * 1e6));   // the presenting thread's own deadline (rt_present_tick)
     dm_ue_cvar_tick();
     if (fps_high()) high_cap_tick();
