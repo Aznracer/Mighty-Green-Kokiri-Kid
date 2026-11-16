@@ -186,13 +186,13 @@ _SS_FOV_SITES = [
 # flags: main+0x23ba44 with the projection in x0, main+0x4f0ac with it in x21), a matrix of 16:9's shape (|m5| / |m0| within 0.05 of 16/9; perspective m5 / m0 is
 # its aspect, orthographic its width / height) has its y row (+0x1c..+0x28) divided by k (state +0x5c, (16/9) / ratio): its picture keeps its shape and 16:9's
 # sides, centred, with more above and below. Once divided it is no longer 16:9's shape, so a matrix copied into another projection is not divided twice; the game's
-# own view (the screen's ratio, bit 5) is not 16:9 either. The other inlined copies (the menus' layouts did not follow the first two) join the same way. While DM_SCREEN_ASPECT is on each update is counted (state +0x5f4) and the first 15 different m0 / m5
-# pairs kept (+0x500, 16 bytes: m0, m5, divided, count; +0x5f0 how many, +0x5f8 'PORJ'), which hle_nvn.c logs every 300 frames. x9..x14 and q0..q7 are saved
+# own view (the screen's ratio, bit 5) is not 16:9 either. The other inlined copies (the menus' layouts did not follow the first two) join the same way. While DM_SCREEN_ASPECT is on each update is counted (state +0x5f4) and the first 14 different m0 / m5
+# pairs kept (+0x500..+0x5df, 16 bytes: m0, m5, divided, count; +0x5f0 how many, +0x5f8 'PORJ'; +0x5e0..+0x5ef are the other counters), which hle_nvn.c logs every 300 frames. x9..x14 and q0..q7 are saved
 _SS_PROJ_X0 = [
     0xd4200020, 0xb9404a11, 0x34000a31, 0xa9b52be9, 0xa90133eb, 0xa9023bed, 0xad0187e0, 0xad028fe2, 0xad0397e4, 0xad049fe6, 0xbd400c00, 0xbd402001, 0x1e20c002,
     0x1e20c023, 0x1e202048, 0x540007a0, 0x1e221864, 0x5291c731, 0x72a7fc71, 0x1e270225, 0x7ea5d486, 0x529999b1, 0x72a7a991, 0x1e270227, 0x1e2720c0, 0x1a9f87e9,
     0xb9405611, 0x53114631, 0x0a110129, 0x5289ea11, 0x72a94a51, 0xb905fa11, 0xb945f611, 0x11000631, 0xb905f611, 0x1e26000a, 0x1e26002b, 0xb945f20c, 0x9114020d,
-    0x5280000e, 0x6b0c01df, 0x5400014a, 0xb94001b1, 0x6b0a023f, 0x54000081, 0xb94005b1, 0x6b0b023f, 0x54000140, 0x910041ad, 0x110005ce, 0x17fffff6, 0x71003d9f,
+    0x5280000e, 0x6b0c01df, 0x5400014a, 0xb94001b1, 0x6b0a023f, 0x54000081, 0xb94005b1, 0x6b0b023f, 0x54000140, 0x910041ad, 0x110005ce, 0x17fffff6, 0x7100399f,
     0x5400010a, 0x29002daa, 0x29017da9, 0x1100058c, 0xb905f20c, 0xb9400db1, 0x11000631, 0xb9000db1, 0x34000209, 0xbd405e05, 0x1e2020a8, 0x540001a0, 0xbd401c00,
     0x1e251800, 0xbd001c00, 0xbd402000, 0x1e251800, 0xbd002000, 0xbd402400, 0x1e251800, 0xbd002400, 0xbd402800, 0x1e251800, 0xbd002800, 0xad449fe6, 0xad4397e4,
     0xad428fe2, 0xad4187e0, 0xa9423bed, 0xa94133eb, 0xa8cb2be9, 0x52802008, 0xd4200040]
@@ -210,17 +210,6 @@ def _proj_words(n):   # the same with the projection in xN: its ldr / str s at [
 _SS_RENDER_VIEW = [
     0x1e221821, 0xd4200020, 0xb9405611, 0x36980231, 0xbd405a10, 0x1e202208, 0x540001c0, 0x5291c731, 0x72a7fc71, 0x1e270231, 0x7eb1d431, 0x529ae151, 0x72a78471,
     0x1e270230, 0x1e302220, 0x540000ac, 0xbd405a01, 0xb945ea11, 0x11000631, 0xb905ea11, 0xd4200040]
-# Full-screen menu backgrounds (bit 20). Each canvas loads its projection at main+0x774368 (ldp q1, q4, [x2]: rows 0 and 1; the canvas's owner, a screen, at x0 - 0x1b8).
-# The full-screen canvases use the 3840x2160 orthographic projection, whose y row bit 17 divided by k so menus keep their shape; a canvas whose screen is one of the
-# four background screens (their vtables, from pull request 2795, which keeps them at full size while it narrows the HUD) has its y row multiplied back by k there,
-# so the background fills the taller screen (iPhone Duo, 2026-11-15: a black strip below the map). Matched by x scale 2/3840 exactly and |y| x k = 2/2160 within 64
-# ulps; counted at +0x5e4. s17 / s18 / v17 and x16 / x17 are free there (the pull request's own stub uses them)
-_SS_BG_VT = (0x4bed098, 0x4be4fb0, 0x4be7b30, 0x4be61c8)
-_SS_BG = [
-    0xad401041, 0xd4200020, 0xb9405611, 0x36a005b1, 0xbd405e11, 0x1e202228, 0x54000540, 0x1e260030, 0x52911131, 0x72a74111, 0x6b11021f, 0x540004a1, 0x0e0c3c90,
-    0x12007a10, 0x1e270212, 0x1e310a52, 0x1e260250, 0x52973ad1, 0x72a74e51, 0x4b110210, 0x11010210, 0x7102021f, 0x54000342, 0xd106e011, 0xf9400230, 0xd4200300,
-    0xd4200320, 0xeb11021f, 0x540001c0, 0xd4200301, 0xd4200321, 0xeb11021f, 0x54000140, 0xd4200302, 0xd4200322, 0xeb11021f, 0x540000c0, 0xd4200303, 0xd4200323,
-    0xeb11021f, 0x54000040, 0x14000007, 0x4e040631, 0x6e31dc84, 0xd4200020, 0xb945e611, 0x11000631, 0xb905e611, 0xd4200040]
 
 
 def screen_shape(ctx):
@@ -235,14 +224,11 @@ def screen_shape(ctx):
             elif w == 0xd4200200: w = BL(here(), _TANF)
             elif w == 0xd4200220: w = BL(here(), _ATANF)
             elif w == 0xd4200240: w = BL(here(), _SINF)
-            elif 0xd4200300 <= w < 0xd4200300 + len(_SS_BG_VT): w = ADRP(17, here(), _SS_BG_VT[w - 0xd4200300])   # adrp x17, a background screen's vtable
-            elif 0xd4200320 <= w < 0xd4200320 + len(_SS_BG_VT): w = ADDI(17, 17, _SS_BG_VT[w - 0xd4200320] & 0xfff)   # add x17, x17, its low 12 bits
             emit(w)
         fs_put(site, [B(site, start)], why)
     stub(0x1087f44, 0x29402c2a, _SS_SIZE_CMP, 0x1087f48, 'display size compared in the screen\'s shape (bit 0)')
     stub(0x1087f64, 0xf9000808, _SS_SIZE_STORE, 0x1087f68, 'display size stored in the screen\'s shape, the mode index from the 16:9 request (bit 0)')
     stub(0x25d770, 0x1e221821, _SS_RENDER_VIEW, 0x25d774, 'render view aspect: a 16:9 view takes the screen\'s ratio (bit 19)')
-    stub(0x774368, 0xad401041, _SS_BG, 0x77436c, 'full-screen canvas projection: the menu backgrounds\' screens keep the full height (bit 20)')
     for site, n, what in _SS_PROJ_SITES:
         stub(site, 0x52802008, _proj_words(n), site + 4, f'sead::Projection matrix update inlined in {what}: a 16:9 matrix keeps its shape on the taller screen, y row / k (bit 17)')
     for site, orig, off, apply, bit, what in _SS_LAYOUT:
