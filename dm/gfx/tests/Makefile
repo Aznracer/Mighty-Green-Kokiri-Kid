@@ -90,6 +90,13 @@ t_rt_comp: t_rt_comp.c ../nvn/hle_nvn.c ../nvn/nvn_rt.h ../../host/crash.c ../..
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_comp.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
 t_dirty_slots: t_dirty_slots.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_slots.c ../../host/crash.c ../nvn/nvn_dirty.c
+t_dirty_ahead: t_dirty_ahead.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
+	clang $(CFLAGS) -o $@ t_dirty_ahead.c ../../host/crash.c ../nvn/nvn_dirty.c
+check_t_dirty_ahead: t_dirty_ahead
+	./t_dirty_ahead
+	DM_NVN_FAULT_AHEAD=0 ./t_dirty_ahead
+b_dirty_fill: b_dirty_fill.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
+	clang $(CFLAGS) -O2 -o $@ b_dirty_fill.c ../../host/crash.c ../nvn/nvn_dirty.c
 t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
 	clang $(CFLAGS) -o $@ t_dirty_race.c ../../host/crash.c
 t_dirty_init: t_dirty_init.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
@@ -180,6 +187,7 @@ check_t_perf_order: t_perf_order
 	MTL_DEBUG_LAYER=1 ./t_perf_order
 	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_perf_order
 	DM_NVN_FAST_WAKE=0 DM_NVN_SLICE_MERGE=0 DM_NVN_CS_HOIST=0 MTL_DEBUG_LAYER=1 ./t_perf_order
+	DM_NVN_FACE_MERGE=0 MTL_DEBUG_LAYER=1 ./t_perf_order
 t_link_ticks: t_link_ticks.m t_link_ticks_screen.c $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_link_ticks.m t_link_ticks_screen.c $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 t_cpu_tex: t_cpu_tex.m $(MTL_T_DEP)
@@ -335,7 +343,7 @@ t_dispatch_barrier: t_dispatch_barrier.m $(MTL_T_DEP)
 check_t_dispatch_barrier: t_dispatch_barrier
 	@set -e; for mode in full game; do for enc in 0 1; do \
 	    DM_NVN_DISPATCH_BARRIER=$$mode DM_NVN_ENC_THREAD=$$enc MTL_DEBUG_LAYER=1 ./t_dispatch_barrier; \
-	done; done
+	done; done; for r in 0 1; do DM_NVN_DISPATCH_RANGELESS=$$r MTL_DEBUG_LAYER=1 ./t_dispatch_barrier; done
 t_args_gen: t_args_gen.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_args_gen.m $(MTL_T_SRC) $(FW)
 check_t_args_gen: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -352,6 +360,12 @@ t_feedback: t_feedback.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_feedback.m $(MTL_T_SRC) $(FW)
 t_rast_discard: t_rast_discard.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rast_discard.m $(MTL_T_SRC) $(FW)
+t_empty_sub: t_empty_sub.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_empty_sub.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_empty_sub
+check_t_empty_sub: t_empty_sub
+	MTL_DEBUG_LAYER=1 ./t_empty_sub
+	DM_NVN_EMPTY_SUB=0 MTL_DEBUG_LAYER=1 ./t_empty_sub
 t_queue_origin: t_queue_origin.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_queue_origin.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 .PHONY: check_t_queue_origin
@@ -416,7 +430,7 @@ check_t_geometry_mesh: t_geometry_mesh
 	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_geometry.py --fixture "$$work"; MTL_DEBUG_LAYER=1 ./t_geometry_mesh "$$work"; DM_NVN_GEO_MESH_RUN=0 MTL_DEBUG_LAYER=1 ./t_geometry_mesh "$$work"; DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_geometry_mesh "$$work"
 .PHONY: check_t_feedback
 check_t_feedback: t_feedback
-	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_fetch.py --fixture "$$work"; MTL_DEBUG_LAYER=1 ./t_feedback "$$work"; DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_feedback "$$work"; DM_NVN_ENC_THREAD=1 DM_NVN_SUB_IDLE_FB=1 MTL_DEBUG_LAYER=1 ./t_feedback "$$work"
+	@set -e; work=$$(mktemp -d); trap 'rm -rf "$$work"' EXIT; python3 test_dmsh_fetch.py --fixture "$$work"; MTL_DEBUG_LAYER=1 ./t_feedback "$$work"; DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_feedback "$$work"; DM_NVN_ENC_THREAD=1 DM_NVN_SUB_MERGE=1 MTL_DEBUG_LAYER=1 ./t_feedback "$$work"; DM_NVN_ENC_THREAD=1 DM_NVN_SUB_MERGE=1 DM_NVN_SUB_IDLE_FB=1 MTL_DEBUG_LAYER=1 ./t_feedback "$$work"
 t_mip_extent: t_mip_extent.m ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_mip_extent.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
 .PHONY: check_t_mip_extent
@@ -578,6 +592,11 @@ check_t_clear_ds: RUN_ENV = MTL_DEBUG_LAYER=1
 t_lazy_clear_order: t_lazy_clear_order.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_lazy_clear_order.m $(MTL_T_SRC) $(FW)
 check_t_lazy_clear_order: RUN_ENV = MTL_DEBUG_LAYER=1
+t_lazy_clear_layers: t_lazy_clear_layers.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_lazy_clear_layers.m $(MTL_T_SRC) $(FW)
+check_t_lazy_clear_layers: t_lazy_clear_layers
+	MTL_DEBUG_LAYER=1 ./t_lazy_clear_layers
+	MTL_DEBUG_LAYER=1 DM_NVN_LC_LAYERS=0 ./t_lazy_clear_layers
 t_zero_depth: t_zero_depth.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_zero_depth.m $(MTL_T_SRC) $(FW)
 check_t_zero_depth: RUN_ENV = MTL_DEBUG_LAYER=1
@@ -604,6 +623,9 @@ t_image_primitive_id: t_image_primitive_id.m $(MTL_T_DEP)
 t_unwritten_store: t_unwritten_store.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_unwritten_store.m $(MTL_T_SRC) $(FW)
 check_t_unwritten_store: RUN_ENV = MTL_DEBUG_LAYER=1
+t_ds_idle: t_ds_idle.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_ds_idle.m $(MTL_T_SRC) $(FW)
+check_t_ds_idle: RUN_ENV = MTL_DEBUG_LAYER=1
 t_upgrade_alias: t_upgrade_alias.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_upgrade_alias.m $(MTL_T_SRC) $(FW)
 check_t_upgrade_alias: RUN_ENV = MTL_DEBUG_LAYER=1

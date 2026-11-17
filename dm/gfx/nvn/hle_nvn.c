@@ -1787,10 +1787,12 @@ static uint64_t thr_instr(void) { uint64_t c[2] = {0, 0}; thread_selfcounts(1, c
 // Supplementary readings for the submit path (on a real device Metal 4 instruction count is -18% while submit CPU time is +49%; need to tell apart kernel mode, execution efficiency, or frequency throttling):
 // this thread's cycle count (the second item of the same interface), kernel-mode CPU time (THREAD_BASIC_INFO), wall clock
 static void thr_counts(uint64_t *instr, uint64_t *cyc) { uint64_t c[2] = {0, 0}; thread_selfcounts(1, c, sizeof c); *instr = c[0]; *cyc = c[1]; }
+// The thread's own port from pthread: mach_thread_self took a port reference and mach_port_deallocate dropped it, two more kernel calls each time (780 → 445 ns a call on an
+// M3 Max, dev/tools/thrsys.c); the replay reads this twice per job (nq_cost_begin / nq_cost_end), about 6,000 times a second in Mario Kart World at its 60 fps cap
 static uint64_t thr_sys_ns(void) {
-    thread_basic_info_data_t bi; mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT; mach_port_t me = mach_thread_self(); uint64_t r = 0;
-    if (thread_info(me, THREAD_BASIC_INFO, (thread_info_t)&bi, &n) == KERN_SUCCESS) r = (uint64_t)bi.system_time.seconds * 1000000000ull + (uint64_t)bi.system_time.microseconds * 1000ull;
-    mach_port_deallocate(mach_task_self(), me); return r;
+    thread_basic_info_data_t bi; mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT; uint64_t r = 0;
+    if (thread_info(pthread_mach_thread_np(pthread_self()), THREAD_BASIC_INFO, (thread_info_t)&bi, &n) == KERN_SUCCESS) r = (uint64_t)bi.system_time.seconds * 1000000000ull + (uint64_t)bi.system_time.microseconds * 1000ull;
+    return r;
 }
 static _Atomic uint64_t g_cum_sub_cyc, g_cum_sub_sys_ns, g_cum_sub_wall_ns;
 static int frame_rec(void);
@@ -1857,10 +1859,36 @@ __attribute__((constructor)) static void nvn_nops_register(void) {
         nvn_slot[i].fn = (void *)nvn_nop;
     }
     unsigned nnop = sizeof g_nops / sizeof *g_nops;
+    // Leaf getters and setters of handles, buffers and state objects (g_nvn_leaf) run on the caller's stack too: each only reads or writes a few fields (a line it logs goes to the big
+    // stack by itself, dm_log). Mario Kart World makes about 17,000 such calls a frame (texture handles, channel masks, blend and depth state, texture views), and the switch to the big
+    // stack and back took about 0.2 ms of its threads' CPU a frame at the 60 fps cap. A name that is not an implemented function stops the start, as for g_nops
+    static const char *const g_nvn_leaf[] = {
+        "nvnDeviceGetTextureHandle", "nvnDeviceGetImageHandle", "nvnDeviceGetSeparateTextureHandle", "nvnDeviceGetSeparateSamplerHandle",
+        "nvnBufferGetAddress", "nvnBufferMap", "nvnBufferGetSize", "nvnBufferFinalize", "nvnBufferBuilderSetDefaults", "nvnBufferBuilderSetDevice", "nvnBufferBuilderSetStorage",
+        "nvnMemoryPoolGetFlags", "nvnMemoryPoolInvalidateMappedRange", "nvnTextureGetFlags",
+        "nvnChannelMaskStateSetDefaults", "nvnChannelMaskStateSetChannelMask",
+        "nvnColorStateSetDefaults", "nvnColorStateSetBlendEnable", "nvnColorStateSetLogicOp", "nvnColorStateSetAlphaTest",
+        "nvnBlendStateSetDefaults", "nvnBlendStateSetBlendTarget", "nvnBlendStateSetBlendFunc", "nvnBlendStateSetBlendEquation",
+        "nvnDepthStencilStateSetDefaults", "nvnDepthStencilStateSetDepthTestEnable", "nvnDepthStencilStateSetDepthWriteEnable", "nvnDepthStencilStateSetDepthFunc",
+        "nvnDepthStencilStateSetStencilTestEnable", "nvnDepthStencilStateSetStencilFunc", "nvnDepthStencilStateSetStencilOp",
+        "nvnPolygonStateSetDefaults", "nvnPolygonStateSetCullFace", "nvnPolygonStateSetFrontFace", "nvnPolygonStateSetPolygonMode", "nvnPolygonStateSetPolygonOffsetEnables",
+        "nvnMultisampleStateSetDefaults", "nvnMultisampleStateSetMultisampleEnable", "nvnMultisampleStateSetSamples", "nvnMultisampleStateSetAlphaToCoverageEnable",
+        "nvnTextureViewSetDefaults", "nvnTextureViewSetLevels", "nvnTextureViewSetLayers", "nvnTextureViewSetTarget", "nvnTextureViewSetFormat", "nvnTextureViewSetSwizzle",
+        "nvnTextureViewSetDepthStencilMode",
+        "nvnTextureBuilderSetDefaults", "nvnTextureBuilderSetDevice", "nvnTextureBuilderSetFlags", "nvnTextureBuilderSetTarget", "nvnTextureBuilderSetWidth",
+        "nvnTextureBuilderSetHeight", "nvnTextureBuilderSetDepth", "nvnTextureBuilderSetLevels", "nvnTextureBuilderSetFormat", "nvnTextureBuilderSetSamples",
+        "nvnTextureBuilderSetSwizzle", "nvnTextureBuilderSetDepthStencilMode" };
+    static uint8_t leaf[NVN_NFUNC];
+    for (unsigned k = 0; k < sizeof g_nvn_leaf / sizeof *g_nvn_leaf; k++) {
+        unsigned i = 0;
+        while (i < NVN_NFUNC && strcmp(nvn_names[i], g_nvn_leaf[k])) i++;
+        if (i == NVN_NFUNC || nvn_slot[i].fn == (void *)nvn_unimpl_entry || nvn_slot[i].fn == (void *)nvn_nop) die("NVN %s is listed as a leaf (g_nvn_leaf) but is not an implemented function", g_nvn_leaf[k]);
+        leaf[i] = 1;
+    }
     // Implemented functions other than command recording (nvnCommandBuffer*, tens of thousands per frame, where the host only appends records) run on the big host stack: submit / present / object creation do Metal work, and a game thread's stack may be too small (see nvn_entry.S nvn_big_entry)
     unsigned nbig = 0;
     for (unsigned i = 0; i < NVN_NFUNC; i++)
-        if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && nvn_slot[i].fn != (void *)nvn_nop && strncmp(nvn_names[i], "nvnCommandBuffer", 16)) {
+        if (nvn_slot[i].fn != (void *)nvn_unimpl_entry && nvn_slot[i].fn != (void *)nvn_nop && strncmp(nvn_names[i], "nvnCommandBuffer", 16) && !leaf[i]) {
             nvn_big_real[i] = nvn_slot[i].fn; nvn_slot[i].fn = (void *)nvn_big_entry; nbig++;
         }
     // DM_NVN_PROF=1: implemented functions (except unimplemented stubs and present: present includes the display-link wait and is counted separately) get a timing wrapper, used to break down the time spent in the "translation layer recording phase".
@@ -1935,6 +1963,7 @@ __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *
 int mtl_probe_ramp_on(void);   // nvn_mtl.m: DM_FSTEP_PROBE_RAMP (default on; ab with DM_AB)
 __attribute__((weak)) void dm_yield_top(char *out, size_t n) { if (n) snprintf(out, n, "-"); }   // hle_thread.c: the threads that yielded most since the last call; none in graphics unit tests
 __attribute__((weak)) void dm_thread_cpu(char *out, size_t n, double secs) { (void)secs; if (n) snprintf(out, n, "-"); }   // hle_thread.c: guest-thread CPU by Switch priority band since the last call
+__attribute__((weak)) void dm_gpu_power_request(uint64_t frame) { (void)frame; }   // memstat.m: the GPU power line's next read (Mac); none in graphics unit tests
 void mtl_res_stats(char *out, size_t n);
 void mtl_barrier_stats(uint64_t *skip, uint64_t *full);
 extern uint32_t mtl_present_qos(void);
@@ -2124,12 +2153,13 @@ static void power_line(uint64_t frame) {
     uint64_t e = 0;
 #endif
     uint64_t iw = pw.cpu_energy.task_interrupt_wakeups, idw = pw.cpu_energy.task_platform_idle_wakeups, g = pw.gpu_energy.task_gpu_utilisation;
+    dm_gpu_power_request(frame);   // the GPU's energy and this process's GPU time over the same window, logged by a helper thread ("GPU power up to frame")
     if (pt && t > pt) { double s = (t - pt) / 1e9; char yt[192]; dm_yield_top(yt, sizeof yt);
         double nf = frame > pf ? (double)(frame - pf) : 1;   // per frame: the fair comparison when one build holds the frame rate better than another
         LOG("[nvn] power up to frame %llu: CPU energy %.2f W, %.1f mJ per frame (%.1f fps); CPU %.0f%% (100 = one core), %.0f%% of it on performance cores; wakeups %.0f/s (out of platform idle %.0f); GPU %.1f ms/s; thermal %d; top yielders: %s", frame,
             (e - pe) / 1e9 / s, (e - pe) / 1e6 / nf, nf / s, (cpu - pcpu) / 1e7 / s, cpu > pcpu ? 100.0 * (double)(p - pp) / (double)(cpu - pcpu) : 0, (iw - piw) / s, (idw - ppw) / s, (g - pg) / 1e6 / s, dm_thermal_now(), yt);
         void mtl_dispatch_barrier_stats(uint64_t *, uint64_t *, uint64_t *, uint64_t *); static uint64_t pdg, pdc, pdu, pdn; uint64_t dg, dc, du, dn; mtl_dispatch_barrier_stats(&dg, &dc, &du, &dn);
-        if (dg + dc + du + dn != pdg + pdc + pdu + pdn) LOG("[nvn] compute dispatches up to frame %llu: %llu after a barrier of the game's, %llu after a copy's range, %llu in the full order (a binding with no range), %llu with no barrier (DM_NVN_DISPATCH_BARRIER)", frame,
+        if (dg + dc + du + dn != pdg + pdc + pdu + pdn) LOG("[nvn] compute dispatches up to frame %llu: %llu after a barrier of the game's, %llu after a copy's range, %llu with a binding of no range after a barrier (each of them without dispatch_rangeless game), %llu with no barrier (DM_NVN_DISPATCH_BARRIER)", frame,
             (unsigned long long)(dg - pdg), (unsigned long long)(dc - pdc), (unsigned long long)(du - pdu), (unsigned long long)(dn - pdn));
         pdg = dg; pdc = dc; pdu = du; pdn = dn;
         { void mtl_tf_stats(uint64_t v[4]); static uint64_t ptf[4]; uint64_t tf[4]; mtl_tf_stats(tf);
@@ -2176,9 +2206,9 @@ static void power_line(uint64_t frame) {
         if (gn != pgn) LOG("[nvn] GPU texture storage up to frame %llu: %llu regions, %.1f MB written into their storage on the GPU (%.2f regions, %.2f MB per frame)",
             frame, (unsigned long long)(gn - pgn), (gb - pgb) / 1048576.0, (gn - pgn) / nf, (gb - pgb) / 1048576.0 / nf);
         pgn = gn; pgb = gb;
-        char tc[400]; dm_thread_cpu(tc, sizeof tc, s);
+        char tc[512]; dm_thread_cpu(tc, sizeof tc, s);
         LOG("[nvn] threads up to frame %llu: CPU %s", frame, tc); }
-    else { char yt[192], rs[400], tc[400]; dm_yield_top(yt, sizeof yt); mtl_res_stats(rs, sizeof rs); dm_thread_cpu(tc, sizeof tc, 1); }   // the first call only takes the baselines
+    else { char yt[192], rs[400], tc[512]; dm_yield_top(yt, sizeof yt); mtl_res_stats(rs, sizeof rs); dm_thread_cpu(tc, sizeof tc, 1); }   // the first call only takes the baselines
     pt = t; pe = e; pcpu = cpu; pp = p; piw = iw; ppw = idw; pg = g; pf = frame; mtl_bw(&pld, &pst, &pfu); pudc = mtl_udc_saved_bytes();
 }
 // Strings a guest object points to (safe reads of the process's own memory): the names of a screen's layout, for the canvas log above. Two levels of pointers from the
@@ -2404,8 +2434,8 @@ static void tsummary(uint64_t frame) {
             LOG("[nvn] thread policy: %s; %u guest worker threads QoS %#x; present QoS %#x", rl, wn, wq, mtl_present_qos()); }
         py = cy; pk = ck; pw = cw; }
       pi = ci; pc = cc; pd = dr_; pf = frame; }
-    uint64_t up, re, es = mtl_pkg_edge_skips(), fa, pr, op, oc; mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr); nvn_dirty_open_stats(&op, &oc);
-    LOG("[nvn] packaged textures: first uploads %llu, re-uploads on pool content change %llu, writes beside a texture only (not re-uploaded) %llu; write-protection faults %llu, pages unprotected before host writes %llu, opened for pool buffers %llu (changed while open %llu); missed %llu (cumulative); CPU-written textures alive %u", up, re, es, fa, pr, op, oc, mtl_pkg_miss(), mtl_cpu_tex_count());
+    uint64_t up, re, es = mtl_pkg_edge_skips(), fa, pr, op, oc, fap, far_; mtl_pkg_stats(&up, &re); nvn_dirty_stats(&fa, &pr); nvn_dirty_open_stats(&op, &oc); nvn_dirty_ahead_stats(&fap, &far_);
+    LOG("[nvn] packaged textures: first uploads %llu, re-uploads on pool content change %llu, writes beside a texture only (not re-uploaded) %llu; write-protection faults %llu (pages released ahead of sequential writes %llu in %llu runs), pages unprotected before host writes %llu, opened for pool buffers %llu (changed while open %llu); missed %llu (cumulative); CPU-written textures alive %u", up, re, es, fa, fap, far_, pr, op, oc, mtl_pkg_miss(), mtl_cpu_tex_count());
     memset(g_tn, 0, sizeof g_tn);
 }
 // DM_SLOWFRAME=1 (test switch, read over the log port on a real device): per-frame timings are first stored in a ring of the last 16 frames; dropped frames are judged 8 frames late (GPU / on-screen present times are back by then),
@@ -2451,11 +2481,20 @@ static void slow_emit(uint64_t f) {
 // DM_RT=0 leaves every thread on its QoS (for power A/B); DM_RT_FRAME=0 declares on the acquire thread only; DM_RT_COMP=<ms> fixes the acquire thread's computation
 // (default auto). The acquire thread declares 2 ms at its first period, before any window, as it always has.
 static int rt_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_RT"); v = !(e && !strcmp(e, "0")); if (!v) LOG("[nvn] DM_RT=0: no thread gets a time-constraint policy (QoS only)"); } return v; }
-static int rt_frame_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_RT_FRAME"); v = !(e && !strcmp(e, "0")); if (!v && rt_on()) LOG("[nvn] DM_RT_FRAME=0: only the acquire thread declares a time-constraint policy"); } return v; }
+// DM_RT_FRAME: 0 / 1, or ab (the graphics library's switches, nvn_mtl.m sw_mode): a frame thread whose phase turns it off goes back to the standard policy at its next tick (rt_tick)
+// and declares again at the first tick of a phase that turns it on. Graphics tests that include this file without the library read 0 / 1 only
+__attribute__((weak)) int mtl_sw_mode(const char *name, int dflt);
+__attribute__((weak)) int mtl_sw_on(int m);
+static int rt_frame_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_RT_FRAME"); v = mtl_sw_mode ? mtl_sw_mode("DM_RT_FRAME", 1) : !(e && !strcmp(e, "0")); if (!v && rt_on()) LOG("[nvn] DM_RT_FRAME=0: only the acquire thread declares a time-constraint policy"); }
+    return mtl_sw_on ? mtl_sw_on(v) : v == 1;
+}
 static int rt_comp_fixed_ms(void) { static int v = -2; if (v == -2) { const char *e = getenv("DM_RT_COMP"); v = e && *e && strcmp(e, "auto") ? atoi(e) : -1; } return v; }   // −1 = auto
 #define RT_THREADS 8
 typedef struct {
-    const char *name; mach_port_t port; uint64_t tid; int acq;   // tid: the thread's ID (pthread_threadid_np), which the port is checked against before another thread acts on it; acq: an acquire thread
+    const char *name; char tname[48]; mach_port_t port; uint64_t tid; int acq;   // tname: the thread's name; tid: the thread's ID (pthread_threadid_np), which the port is checked against before another thread acts on it; acq: an acquire thread
+    int base0;   // the thread's timeshare base priority when it took its slot (its QoS's), given back when it leaves the time-constraint policy (rt_standard); 0 = unknown
     nvn_rt r; uint64_t cyc;   // the thread's cycles at its last sample
     _Atomic uint64_t period_ns, comp_us;   // the period and computation declared (0: none), read by the thread policy line
     unsigned ndecl; int retired;   // retired: an acquire thread that stopped acquiring, put back on the standard policy (rt_retire); the slot may go to the next acquire thread
@@ -2466,8 +2505,15 @@ typedef struct {
 static rt_thr g_rtt[RT_THREADS]; static _Atomic int g_rtt_n;
 static _Atomic uint64_t g_rt_frame_ns;   // the period the acquire thread declares; the frame threads follow it
 static pthread_mutex_t g_rt_mu = PTHREAD_MUTEX_INITIALIZER;   // the acquire threads' slots (rt_acquire): several threads may acquire, and one retires another's
+static int rt_base_pri(mach_port_t p, int *policy) {   // a thread's base priority (and policy), -1 if unknown
+    thread_extended_info_data_t xi; mach_msg_type_number_t xc = THREAD_EXTENDED_INFO_COUNT;
+    if (thread_info(p, THREAD_EXTENDED_INFO, (thread_info_t)&xi, &xc) != KERN_SUCCESS) return -1;
+    if (policy) *policy = xi.pth_policy;
+    return xi.pth_priority;
+}
 static void rt_init(rt_thr *t, const char *name, int acq, uint64_t tid) {   // on the thread itself
-    t->name = name; t->acq = acq; t->tid = tid; t->port = pthread_mach_thread_np(pthread_self());
+    t->name = name; t->acq = acq; t->tid = tid; t->port = pthread_mach_thread_np(pthread_self()); t->tname[0] = 0; pthread_getname_np(pthread_self(), t->tname, sizeof t->tname);
+    { int pol = 0, b = rt_base_pri(t->port, &pol); t->base0 = b > 0 && pol == POLICY_TIMESHARE ? b : 0; }
     memset(&t->r, 0, sizeof t->r); t->cyc = 0; t->ndecl = 0; t->retired = 0; atomic_store(&t->period_ns, 0); atomic_store(&t->comp_us, 0);
     atomic_store(&t->frames, 0); atomic_store(&t->demoted, 0); atomic_store(&t->cpu_ns, 0); atomic_store(&t->cycles, 0); atomic_store(&t->ready, 1);
 }
@@ -2489,9 +2535,21 @@ static void rt_declare(rt_thr *t, uint64_t period_ns, double comp_ms) {
     if (++t->ndecl <= 20 || kr != KERN_SUCCESS)
         LOG("[nvn] %s time-constraint policy (period %.3f ms, computation %.3f ms) %s%s", t->name, period_ns / 1e6, comp_ms, kr == KERN_SUCCESS ? "set" : "failed to set", t->ndecl == 20 ? "; further declarations of this thread only in the thread policy line" : "");
 }
+// Back to the standard (timeshare) policy at the priority the thread had before it declared. Declaring took the thread's QoS away, and the standard policy alone left it at the
+// task's default priority: on the Mac 31, where its QoS user-interactive had given it 47, below every other guest thread (Mario Kart World's main thread, the acquire thread of the
+// menus, once the race's frames came from another thread). Setting the QoS class again, or pthread_set_timeshare_self, left it at 31; a precedence importance of the difference
+// gives the priority back (31 → 47; the kernel refuses the QoS policy flavour). Works on another thread too (rt_retire)
+static void rt_standard(const rt_thr *t) {
+    thread_standard_policy_data_t st = {0}; thread_policy_set(t->port, THREAD_STANDARD_POLICY, (thread_policy_t)&st, THREAD_STANDARD_POLICY_COUNT);
+    int b = rt_base_pri(t->port, NULL);
+    if (t->base0 > 0 && b > 0 && t->base0 > b) { thread_precedence_policy_data_t pr = {.importance = t->base0 - b}; thread_policy_set(t->port, THREAD_PRECEDENCE_POLICY, (thread_policy_t)&pr, THREAD_PRECEDENCE_POLICY_COUNT); }
+}
 // On the thread itself, before each piece of its work: one sample a presented frame (its CPU and cycles, its priority), and the declaration when the period or the need moved
 static void rt_tick(rt_thr *t, uint64_t period_ns) {
     uint64_t f = atomic_load_explicit(&g_frame, memory_order_relaxed), declared = atomic_load_explicit(&t->period_ns, memory_order_relaxed);
+    if (!t->acq && declared && rt_on() && !rt_frame_on()) {   // a DM_RT_FRAME=ab phase that turns the frame threads' declarations off
+        rt_standard(t); atomic_store(&t->period_ns, 0); atomic_store(&t->comp_us, 0); declared = 0;
+    }
     int period_moved = period_ns && period_ns != declared && (t->acq || t->r.comp_ms > 0);
     if (f == t->r.frame && !period_moved) return;
     if (f != t->r.frame) {
@@ -2521,8 +2579,9 @@ static void rt_retire(const rt_thr *self) {
     for (int i = 0; i < nt; i++) { rt_thr *o = &g_rtt[i];
         if (o == self || !o->acq || o->retired || !atomic_load(&o->ready) || f < o->r.frame + RT_WIN) continue;
         thread_identifier_info_data_t ii; mach_msg_type_number_t ic = THREAD_IDENTIFIER_INFO_COUNT; int same = thread_info(o->port, THREAD_IDENTIFIER_INFO, (thread_info_t)&ii, &ic) == KERN_SUCCESS && ii.thread_id == o->tid;
-        if (same && atomic_load(&o->period_ns)) { thread_standard_policy_data_t st = {0}; thread_policy_set(o->port, THREAD_STANDARD_POLICY, (thread_policy_t)&st, THREAD_STANDARD_POLICY_COUNT); }
-        LOG("[nvn] acquire thread %llu stopped acquiring %llu frames ago%s", (unsigned long long)o->tid, (unsigned long long)(f - o->r.frame), same ? (atomic_load(&o->period_ns) ? ": back to the standard policy" : "") : " and has ended");
+        int back = same && atomic_load(&o->period_ns), pri = 0; if (back) { rt_standard(o); pri = rt_base_pri(o->port, NULL); }
+        char at[48] = ""; if (back) snprintf(at, sizeof at, ": back to the standard policy at priority %d", pri);
+        LOG("[nvn] acquire thread %llu (%s) stopped acquiring %llu frames ago%s", (unsigned long long)o->tid, o->tname, (unsigned long long)(f - o->r.frame), same ? at : " and has ended");
         o->retired = 1; atomic_store(&o->period_ns, 0); atomic_store(&o->comp_us, 0);
     }
 }
@@ -2986,6 +3045,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         static uint64_t pl, pst, pf, pudc; uint64_t l, st, fu; mtl_bw(&l, &st, &fu);
         trow(f, "@rt_load_mb", (l - pl) / 1048576.0); trow(f, "@rt_store_mb", (st - pst) / 1048576.0); trow(f, "@pass_full_rw", (double)(fu - pf));
         uint64_t udc = mtl_udc_saved_bytes(); trow(f, "@unwritten_dc_mb", (udc - pudc) / 1048576.0);
+        { void mtl_dsi_stats(uint64_t *, uint64_t *, uint64_t *); static uint64_t pdb, pdp, pdf; uint64_t db, dp, df; mtl_dsi_stats(&db, &dp, &df);   // DM_NVN_DS_IDLE: idle planes' load bytes saved, passes, fallbacks
+          if (db | dp | df) { trow(f, "@ds_idle_mb", (db - pdb) / 1048576.0); trow(f, "@ds_idle_planes", (double)(dp - pdp)); trow(f, "@ds_idle_fallback", (double)(df - pdf)); }
+          pdb = db; pdp = dp; pdf = df; }
         pl = l; pst = st; pf = fu; pudc = udc;
         static uint64_t pae, par, pap; uint64_t ae_, ar_, ap_; mtl_args_stats(&ae_, &ar_, &ap_);
         trow(f, "@args_enc", (double)(ae_ - pae)); trow(f, "@args_reuse", (double)(ar_ - par)); trow(f, "@args_patch", (double)(ap_ - pap)); pae = ae_; par = ar_; pap = ap_;
@@ -3144,6 +3206,27 @@ enum { VLOG_N = 4096 };
 static struct vpool **g_vp; static int g_nvp, g_cvp;   // the pools with a range of their own, under g_vp_mu
 static pthread_mutex_t g_vp_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic uint64_t g_vp_gen;   // bumped per mapping request
+// The pools' own ranges, sorted, for readers that take no lock: nvn_sparse_alias and nvn_host_readable search them (they never overlap: each is its own mmap). The replay asks
+// nvn_sparse_alias for every texture a draw samples against each attachment and for every compute access: it took g_vp_mu, which the game's mapping threads take too, and walked
+// every pool, about 1.7 % of the replay thread at Mario Kart World's 60 fps cap. Rewritten under g_vp_mu between two steps of g_vpr_seq (odd while it is written), as a seqlock:
+// a reader that sees the count move or an odd count asks again, and past VPR_MAX ranges (g_vpr_n -1) or after a few tries takes the lock as before
+enum { VPR_MAX = 1024 };
+static struct { _Atomic uint64_t lo, hi; } g_vpr[VPR_MAX];
+static _Atomic uint32_t g_vpr_seq; static _Atomic int g_vpr_n;
+static int vpr_cmp(const void *a, const void *b) { uint64_t x = ((const uint64_t *)a)[0], y = ((const uint64_t *)b)[0]; return (x > y) - (x < y); }
+static void vpr_rebuild(void);   // after g_vp changes, under g_vp_mu
+// 1 = [lo, hi) meets a pool's own range, 0 = it meets none, -1 = not known without the lock
+static int vpr_meets(uint64_t lo, uint64_t hi) {
+    for (int tries = 0; tries < 4; tries++) {
+        uint32_t s = atomic_load_explicit(&g_vpr_seq, memory_order_acquire); if (s & 1) continue;
+        int n = atomic_load_explicit(&g_vpr_n, memory_order_relaxed); if (n < 0) return -1;
+        int a = 0, b = n; while (a < b) { int m = (a + b) / 2; if (atomic_load_explicit(&g_vpr[m].hi, memory_order_relaxed) <= lo) a = m + 1; else b = m; }   // the first range that ends past lo
+        int r = a < n && atomic_load_explicit(&g_vpr[a].lo, memory_order_relaxed) < hi;
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&g_vpr_seq, memory_order_relaxed) == s) return r;
+    }
+    return -1;
+}
 // Every mapping request's host range [lo, hi), by its generation: the replay turns the requests since its last look into notes for the textures they overlap (nvn_sparse_notes)
 enum { VNOTE_N = 8192 };
 static struct { uint64_t gen, lo, hi; } g_vnote[VNOTE_N];   // under g_vp_mu
@@ -3169,7 +3252,7 @@ static uint8_t *vpool_reserve(pool_t *o) {   // → the reserved range, or NULL
     v->pool = o; v->base = a; v->len = len; v->size = o->size;
     pthread_mutex_lock(&g_vp_mu);
     if (g_nvp == g_cvp && !(g_vp = realloc(g_vp, (g_cvp = g_cvp ? 2 * g_cvp : 64) * sizeof *g_vp))) die("sparse pool table allocation failed");
-    g_vp[g_nvp++] = v; o->vp = v;
+    g_vp[g_nvp++] = v; o->vp = v; vpr_rebuild();
     o->vmode = o->size > DM_GAME_APP_POOL ? 2 : 0;
     pthread_mutex_unlock(&g_vp_mu);
     if (o->vmode == 2) LOG("[nvn] virtual pool %p (%#llx bytes, flags %#x): sparse, own address range %p+%#llx, physical pages are remapped into it", (const void *)o, (unsigned long long)o->size, o->flags, a, (unsigned long long)len);
@@ -3181,6 +3264,7 @@ static void vpool_drop(pool_t *o) {   // caller holds g_vp_mu
     munmap(v->base, v->len);
     for (uint64_t l = 0; l < (v->size + (2u << 20) - 1) >> 21; l++) free(v->pt[l]);
     for (int i = 0; i < g_nvp; i++) if (g_vp[i] == v) { g_vp[i] = g_vp[--g_nvp]; break; }
+    vpr_rebuild();
     free(v->pt); free(v->log); free(v->run); free(v); o->vp = NULL;
 }
 static void vunmap_run(int all); static int g_nvun;   // the deferred unmaps (below)
@@ -3852,6 +3936,7 @@ NVN(nvnCommandBufferMultiDrawArraysIndirectCount, void, NVNcommandBuffer *c, NVN
 }
 // Whether the host can read n bytes at a guest address: outside a sparse virtual pool always; inside one only where pages are mapped (nvn_mtl.m reads multi-draw counts there)
 int nvn_host_readable(uint64_t a, uint64_t n) {
+    if (!vpr_meets(a, a + 1)) return 1;   // in no pool's own range
     int ok = 1; pthread_mutex_lock(&g_vp_mu);
     for (int k = 0; k < g_nvp; k++) { struct vpool *v = g_vp[k]; if (a < (uint64_t)(uintptr_t)v->base || a >= (uint64_t)(uintptr_t)v->base + v->len) continue;
         uint64_t o = a - (uint64_t)(uintptr_t)v->base; ok = 0;
@@ -3863,13 +3948,27 @@ int nvn_host_readable(uint64_t a, uint64_t n) {
 // prove copy independence.
 int nvn_sparse_alias(uint64_t lo, uint64_t hi) {
     if (hi <= lo) return 0;
+    int known = vpr_meets(lo, hi); if (known >= 0) return known;
     int r = 0; pthread_mutex_lock(&g_vp_mu);
     for (int k = 0; k < g_nvp && !r; k++) { const struct vpool *v = g_vp[k];
         uint64_t base = (uint64_t)(uintptr_t)v->base;
         r = lo < base + v->len && base < hi;
     }
     pthread_mutex_unlock(&g_vp_mu); return r;
+}static void vpr_rebuild(void) {   // under g_vp_mu
+    atomic_fetch_add_explicit(&g_vpr_seq, 1, memory_order_relaxed); atomic_thread_fence(memory_order_release);   // odd: being written
+    int n = g_nvp <= VPR_MAX ? g_nvp : -1;
+    if (n > 0) {
+        uint64_t (*r)[2] = malloc((size_t)n * sizeof *r); if (!r) die("sparse pool ranges");
+        for (int i = 0; i < n; i++) { r[i][0] = (uint64_t)(uintptr_t)g_vp[i]->base; r[i][1] = r[i][0] + g_vp[i]->len; }
+        qsort(r, (size_t)n, sizeof *r, vpr_cmp);
+        for (int i = 0; i < n; i++) { atomic_store_explicit(&g_vpr[i].lo, r[i][0], memory_order_relaxed); atomic_store_explicit(&g_vpr[i].hi, r[i][1], memory_order_relaxed); }
+        free(r);
+    }
+    atomic_store_explicit(&g_vpr_n, n, memory_order_relaxed);
+    atomic_fetch_add_explicit(&g_vpr_seq, 1, memory_order_release);   // even again
 }
+
 // Textures of a sparse pool, read through its page table (see the sparse pools above): whether a pool is one, a copy of a texture's bytes (unmapped pages read as 0; → bytes not mapped),
 // whether its content may have changed since an upload (a mapping in its range newer than gen, or a physical page behind it written after the dirty-page stamp), and the write
 // protection of the physical pages behind it (taken before an upload, as for any packaged texture)
