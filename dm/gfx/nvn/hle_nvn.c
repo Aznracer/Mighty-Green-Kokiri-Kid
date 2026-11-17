@@ -1955,6 +1955,7 @@ static double g_rt_comp_ms;   // The computation the acquire thread declares (ms
 static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
 static uint64_t rt_period_ns(const win_t *o, uint64_t period);
+static _Atomic uint64_t g_rt_held_ns;   // the present period a frame really has (rt_declare)
 static int present_itv(const win_t *o);
 static int present_unpaced(const win_t *o);
 static int link_wait(const win_t *o, uint64_t timeout_ns);
@@ -2025,7 +2026,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock
     uint64_t at = *idx < 4 ? o->avail[*idx] : 0, now = dm_detclock_enabled() ? guest_ns() : now_ns(), wait = at > now ? at - now : 0, pace_ns = 0, drain_ns = 0;
     if (!dm_detclock_enabled()) {   // Register the acquire thread as a time-constraint thread (no longer registered only when it "arrived early": it must also declare itself when it is constantly behind in the hot state)
-        uint64_t period = present_period(o), rtp = rt_period_ns(o, period); rt_acquire(rtp); fwg_frame(rtp);
+        uint64_t period = present_period(o), rtp = rt_period_ns(o, period); atomic_store_explicit(&g_rt_held_ns, period, memory_order_relaxed); rt_acquire(rtp); fwg_frame(rtp);
         uint64_t p0 = now_ns(); int snap = mtl_snap_on();
         o->follow = 1;   // the beat paces this frame only where the branches below wait for the slot time (nvn_pace_follow)
         if (present_unpaced(o)) {}   // present interval 0: no vsync wait (below); only the free texture the ticket wait below gives
@@ -2545,9 +2546,14 @@ static double rt_share(int acq) {
     }
     return acq ? a : f;
 }
+// The present period while the frame step holds frames longer than the cap (rt_period_ns keeps the cap's deadline then): the computation cap is a share of the time a frame
+// really has, at most 0.9 of the declared period. With a 60 target held at 40 the queue replay thread was capped at 0.65 × 16.7 = 10.8 ms while it needed 9-16 ms on the
+// efficiency cores after an area load (Ocarina of Time on an iPhone; at a 40 target its cap is 16.25 ms and 40 held there), and a thread that runs past what it declared is held up
 static void rt_declare(rt_thr *t, uint64_t period_ns, double comp_ms) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
-    double cap = period_ns * rt_share(t->acq) / 1e6; if (comp_ms > cap) comp_ms = cap; if (comp_ms < 1) comp_ms = 1;
+    uint64_t held = atomic_load_explicit(&g_rt_held_ns, memory_order_relaxed), base = held > period_ns ? held : period_ns;
+    double cap = base * rt_share(t->acq) / 1e6, top = period_ns * 0.9 / 1e6; if (cap > top) cap = top;
+    if (comp_ms > cap) comp_ms = cap; if (comp_ms < 1) comp_ms = 1;
     uint64_t comp_ns = (uint64_t)(comp_ms * 1e6);
     thread_time_constraint_policy_data_t p = {
         .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp_ns * tb.denom / tb.numer),
