@@ -49,6 +49,7 @@ targets:
         DMShowFPS: ${DM_SHOW_FPS}           # YES = the frame-rate counter is on (front_ios.m; set by build_ipa.sh)
         DMLanguage: ${DM_LANG}              # the game language code (main.m sets DM_LANG from it; set by build_ipa.sh)
         LSSupportsGameMode: true
+        NSMicrophoneUsageDescription: The game listens for the microphone ocarina   # hle_audio.c input streams (DM_MIC=1); under LiveContainer its own Info.plist decides
         GCSupportsControllerUserInteraction: true   # Physical controllers (GameController)
         GCSupportedGameControllers:
           - ProfileName: ExtendedGamepad

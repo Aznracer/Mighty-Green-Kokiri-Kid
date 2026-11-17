@@ -757,13 +757,40 @@ void front_save_failed(int err) {
 // the ring / silent switch does not mute it, and it still interrupts other apps' audio.
 // Set once at boot and again on return to the foreground (the system may reset it after an interruption)
 static int g_session_off;   // the last activation failed (another app or a call still held the session): tried again when the app becomes active
+static _Atomic int g_mic_on;   // a game's audio input stream runs (hle_audio.c au_in_start, PR #2925): PlayAndRecord, so RemoteIO's input gets the microphone
 void front_ios_audio_session(void) {
     AVAudioSession *s = AVAudioSession.sharedInstance; NSError *e = nil;
-    if (![s setCategory:AVAudioSessionCategoryPlayback error:&e]) LOG("[RED] audio session category could not be set: %s", e.localizedDescription.UTF8String);
+    BOOL ok = atomic_load(&g_mic_on)
+        ? [s setCategory:AVAudioSessionCategoryPlayAndRecord mode:AVAudioSessionModeDefault
+                 options:AVAudioSessionCategoryOptionDefaultToSpeaker | AVAudioSessionCategoryOptionAllowBluetoothA2DP error:&e]   // the speaker, not the earpiece; A2DP keeps headphones' quality
+        : [s setCategory:AVAudioSessionCategoryPlayback error:&e];
+    if (!ok) LOG("[RED] audio session category could not be set: %s", e.localizedDescription.UTF8String);
     if (![s setPreferredIOBufferDuration:0.005 error:&e]) LOG("[RED] audio session I/O buffer duration could not be set: %s", e.localizedDescription.UTF8String);
     g_session_off = ![s setActive:YES error:&e];
     if (g_session_off) LOG("[RED] audio session activation failed: %s", e.localizedDescription.UTF8String);
     LOG("audio session: sample rate %.0f Hz, I/O buffer %.2f ms (asked for 5 ms)", s.sampleRate, s.IOBufferDuration * 1000);
+}
+
+// The microphone for a game's audio input stream (hle_audio.c, PR #2925: Ocarina of Time's microphone ocarina). Off unless DM_MIC=1: the app that runs us (LiveContainer)
+// must carry NSMicrophoneUsageDescription, or iOS ends the process at the first use. Returns 1 when the microphone may be used now: permission granted, the session moved to
+// PlayAndRecord. The first time it asks for permission and returns 0; the next start of the stream after the answer uses it. on = 0 goes back to Playback
+int front_ios_mic_session(int on) {
+    static int logged;
+    if (on) {
+        const char *e = getenv("DM_MIC");
+        if (!e || atoi(e) <= 0) { if (!logged++) LOG("audio input: the microphone is off (DM_MIC=1 turns it on); the game hears silence"); return 0; }
+        AVAudioApplicationRecordPermission p = AVAudioApplication.sharedInstance.recordPermission;
+        if (p == AVAudioApplicationRecordPermissionUndetermined) {
+            LOG("audio input: asking for microphone permission");
+            [AVAudioApplication requestRecordPermissionWithCompletionHandler:^(BOOL granted) { LOG("audio input: microphone permission %s", granted ? "granted" : "denied"); }];
+            return 0;
+        }
+        if (p != AVAudioApplicationRecordPermissionGranted) { if (!logged++) LOG("audio input: microphone permission denied (Settings → LiveContainer → Microphone); the game hears silence"); return 0; }
+    }
+    if (atomic_exchange(&g_mic_on, on) == on) return 1;
+    front_ios_audio_session();
+    LOG("audio input: audio session %s", on ? "PlayAndRecord (microphone on)" : "Playback (microphone off)");
+    return 1;
 }
 
 // Real audio output is suspended (the silent sink paces the game) while the app is in the background or another audio session has interrupted ours (Siri, an alarm, a call).

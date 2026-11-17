@@ -884,8 +884,14 @@ fail:
     return st;
 }
 
+#if TARGET_OS_IPHONE
+__attribute__((weak)) int front_ios_mic_session(int on) { (void)on; return 1; }   // front_ios.m's replaces this: DM_MIC, permission, PlayAndRecord
+#endif
 static void au_in_start(void) {
     if (!real_audio()) return;
+#if TARGET_OS_IPHONE
+    if (!front_ios_mic_session(1)) return;   // no microphone: the stream reads silence
+#endif
     if (!g_in_au) au_in_create();
     if (g_in_au && !atomic_load_explicit(&g_in_running, memory_order_relaxed)) {
         OSStatus st = AudioOutputUnitStart(g_in_au);
@@ -911,6 +917,9 @@ static void au_in_stop_if_idle(void) {
         AudioOutputUnitStop(g_in_au);
         atomic_store_explicit(&g_in_running, 0, memory_order_relaxed);
         LOG("audio input: AU recording stopped");
+#if TARGET_OS_IPHONE
+        front_ios_mic_session(0);
+#endif
     }
     pthread_mutex_unlock(&g_is_lock);
 }
