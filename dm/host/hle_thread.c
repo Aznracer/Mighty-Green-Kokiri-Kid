@@ -478,6 +478,20 @@ static void qos_apply(thr_t *t) {   // on the thread itself, holding G (prio and
 void dm_host_helper_qos(qos_class_t q) { if (g_qos_map) pthread_set_qos_class_self_np(q, 0); }
 static const char *thr_name(thr_t *t, char *buf, size_t n);
 static void thread_exit(thr_t *t);
+// DM_FRAME_WG_THREADS=<name>,<name>...: guest threads whose name starts with one of these join the frame workgroup (hle_nvn.c DM_FRAME_WG) on their own thread as they start.
+// The threads that record command buffers and the queue replay thread join by themselves; a game's job workers that compute the frame do not (Ocarina of Time's
+// BaseProcExecutor0-2, 100-170 ms/s each: on the efficiency cores in the Deku Tree a frame's CPU work was 16.5 ms against 60's 16.7, with the main thread in the group and they not)
+__attribute__((weak)) void dm_frame_wg_join(void) {}
+static void frame_wg_named(thr_t *t) {
+    static const char *list = (const char *)1; if (list == (const char *)1) list = getenv("DM_FRAME_WG_THREADS");
+    if (!list || !*list) return;
+    char nb[48]; const char *nm = thr_name(t, nb, sizeof nb); if (!nm || !*nm) return;
+    for (const char *p = list; *p; ) {
+        const char *e = strchr(p, ','); size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n && !strncmp(nm, p, n)) { dm_frame_wg_join(); return; }
+        if (!e) break; p = e + 1;
+    }
+}
 static void *thread_main(void *p) {
     thr_t *t = p;
     pthread_setspecific(g_keythr, t);
@@ -497,6 +511,7 @@ static void *thread_main(void *p) {
     int run = t->started; if (run) t->entered = 1; g_unlock();
     if (!run) thread_exit(t);   // never reaches guest code; StartThread before the close still runs it
     { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); pthread_setname_np(hn); }   // the guest's name (set before StartThread) for sample / Instruments
+    frame_wg_named(t);
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
 }
