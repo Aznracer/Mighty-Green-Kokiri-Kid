@@ -12384,7 +12384,14 @@ static uint64_t pool_walk(int samp, int dtt, int dpf, int base, __unsafe_unretai
 // TU_IDLE, a target the game still reads every frame stays. Their texture IDs drop their views, so a pool walk gives them the dummy until a pass writes the texture again
 // (pool_unwritten_target), as for a target never written, rather than making it again; a binding or a write makes it again (tex_mtl_), filled as a new texture is. TU_MAX a pass at
 // most: each serial that goes is a note, and past SER_NOTES of them every texture ID takes the slow path once
-enum { TU_IDLE = 30, TU_MAX = 256 };   // deciseconds; textures a pass
+// From cheemu21's kid-with-sword-remake L6.3: 32 a pass (256 before), a pass every 0.2 s (TU_EVERY; once a second before). A pass of more than SER_NOTES (64) serials overflows the
+// notes, so the next submission starts a new epoch and every texture ID takes the slow path (ser_sync): on an iPhone after an area change, when about 100 targets a second went,
+// that was a 120-250 ms frame once a second. 32 stays under the notes with room for the ghost trim's (GHOST_TRIM), and five passes a second still free up to 160
+enum { TU_IDLE = 30, TU_MAX_DEF = 32, TU_EVERY_DEF = 2 };   // deciseconds; textures a pass; deciseconds between passes
+// DM_NVN_RT_DEAD_MAX / DM_NVN_RT_DEAD_EVERY override the two (for A/B runs: 256 and 10 are the pacing before)
+static uint32_t tu_env(const char *name, uint32_t def) { const char *e = getenv(name); int v = e && *e ? atoi(e) : 0; return v > 0 ? (uint32_t)v : def; }
+#define TU_MAX (tu_env("DM_NVN_RT_DEAD_MAX", TU_MAX_DEF))
+#define TU_EVERY (tu_env("DM_NVN_RT_DEAD_EVERY", TU_EVERY_DEF))
 static uint64_t g_tu_n, g_tu_bytes, g_tu_serials, g_tu_pinned, g_tu_ns, g_tu_passes;
 static int tu_use_of(id o, own_use *u) {   // own_use_fn; the pass's mark keeps the record (the sweep below)
     uintptr_t k = (uintptr_t)(__bridge void *)o;
@@ -12459,7 +12466,7 @@ static void tu_tick(void) {   // when a submission begins; DM_NVN_RT_DEAD=0 keep
     if (g_tu_manual) return;
     static uint64_t t0; uint64_t ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); if (!t0) t0 = ns;
     g_tu_now = (uint32_t)((ns - t0) / 100000000ull) + 1;
-    if (g_tu_now - g_tu_last >= 10 && sw_on(tu_mode())) tu_pass();
+    if (g_tu_now - g_tu_last >= TU_EVERY && sw_on(tu_mode())) tu_pass();
     else if (g_tu_nlog > g_tu_ndone && !g_tu_over && g_tu.n && sw_on(tu_mode())) {   // a part of the pass's look at the uses, so that the pass has little of it left (TU_STEP a submission)
         os_unfair_lock_lock(&g_rmu); os_unfair_lock_lock(&g_tu_lk); tu_take_locked(TU_STEP, g_tu_last); os_unfair_lock_unlock(&g_tu_lk); os_unfair_lock_unlock(&g_rmu); }
 }
