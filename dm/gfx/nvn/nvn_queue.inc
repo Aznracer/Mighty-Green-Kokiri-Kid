@@ -123,6 +123,8 @@ static void nq_cost_end(nq_cost c) {
 static void *nq_worker(void *unused) {
     (void)unused; pthread_setname_np("NVN queue replay");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
+    { void dm_frame_wg_join(void); dm_frame_wg_join(); }   // hle_nvn.c DM_FRAME_WG: the frame's submissions are replayed here, the frame's heaviest host thread (5-15 ms a frame on the iPhone Duo).
+    // Left out, the frame's members waited on it, and the performance controller moved the whole frame to the efficiency cores at 1.6 GHz for 1,500 frames at a time (3-8% of the CPU time on performance cores)
     void *rt=nvn_rt_join("queue replay thread");   // it carries the frame's submissions: it declares the frame's deadline too (hle_nvn.c rt_tick)
     uint64_t frame=UINT64_MAX;
     for(;;) {
