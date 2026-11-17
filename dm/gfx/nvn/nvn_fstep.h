@@ -72,6 +72,7 @@ typedef struct {
                               // step are then the same real time as in vsyncs (2 × FSTEP_LATE, 2 × FSTEP_DEBT_MAX, 2 × FSTEP_MAX ticks); at an even kmin (60 / 30 fps) a hold moves by whole
                               // vsyncs (2 ticks), so a 60 Hz link shows it, and at an odd one (40 fps: 3 ticks, shown only on a 120 Hz link) by one tick: 3 or 4, never 5. A payback step
                               // is one tick more than the hold (game time only: the stub's ratio is a float)
+    int down_late;            // set by the caller (DM_FPS_DOWN_LATE): with a 40 floor, the late frames in a row at 60 that step to 40 (0 = 3)
     double up_wait; int up_fit;   // set by the caller (DM_FPS_UP_MS): with a 40 floor, how long after the last change and after how many frames that fit 60 a trial tries 60
                               // (0 = FSTEP_HOLD0 and FSTEP_RUN)
     double r60, c40;          // 60 target with a 40 floor: how much a frame's cost grows from 40 to 60 (learned from the trials that failed, 1.3 to start), and the cost the last trial
@@ -183,8 +184,10 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     // around it the next three late frames stepped to 30 for a second (Mario Kart World on an M4 Max, 43-68 ms stalls; issue #1823)
     double omax = 0; for (int i = 0; i < FSTEP_RUN; i++) if (s->over[i] > omax) omax = s->over[i];
     int short_of_k = scr || s->no_payback || s->over_sum - omax > late_by * FSTEP_RUN;
-    if (s->late_run >= 3 && s->k < kmax && short_of_k) {   // step up to the cost of the cheapest of the three late frames, at least one vsync (q ticks)
-        double c3 = s->last_cost[0] < s->last_cost[1] ? s->last_cost[0] : s->last_cost[1]; if (s->last_cost[2] < c3) c3 = s->last_cost[2];
+    // With a 40 floor DM_FPS_DOWN_LATE (default 1) late frames at 60 step to 40: a frame that missed 60 was shown at 40's time anyway, and the next that fits goes back up
+    const int dl = fl40 && s->down_late > 0 && s->down_late < 3 ? s->down_late : 3;
+    if (s->late_run >= dl && s->k < kmax && (short_of_k || dl < 3)) {   // step up to the cost of the cheapest of the late frames, at least one vsync (q ticks)
+        double c3 = s->last_cost[2]; for (int i = 3 - dl; i < 2; i++) if (s->last_cost[i] < c3) c3 = s->last_cost[i];
         int want = (int)ceil(c3 - 0.05);
         if (want < s->k + (s->k < 4 ? q3 : q)) want = s->k + (s->k < 4 ? q3 : q);
         if (!(q3 == 1 && want <= 4)) want = (want + q - 1) / q * q;
@@ -218,7 +221,9 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     // which try 60 without that evidence, keep the hold-off that doubles
     } else if (s->fit_run >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 && s->up_fit > 0 ? s->up_fit : FSTEP_RUN)
                && s->since >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 ? (s->up_wait > 0 ? s->up_wait : hold0) : s->hold) && !s->trial) { if (fl40) s->c40 = fitc; s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
-    else if ((slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
+    // No probes with a 40 floor: a trial goes up as soon as a frame's cost scaled to 60 (r60) fits, and a probe, which tries 60 without that, failed 15 times in 50 s in
+    // Hyrule Field with a 30-frame grace each (frames shown late that do not count)
+    else if (!fl40 && (slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
         s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
     }
     s->step = s->k + (s->debt >= 1 && s->k < smax);
