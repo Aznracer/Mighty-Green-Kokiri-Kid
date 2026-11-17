@@ -708,6 +708,14 @@ int main(void) {
         snprintf(b, sizeof b, "floor 40 on slowed cores: %d tries at 60 in 600 frames; on the fast cores again at 60 after %d frame(s)", tries, back);
         check(tries == 0 && back > 0 && back <= 2, b);
     }
+    {   // Floor 40, no prediction: a GPU clocked down at 40 (2.6 ticks there, 1.3 at 60) gets a try at 60 within 2 s and stays there
+        sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1; m.s.up_wait = 3; m.s.up_fit = 1; m.s.down_late = 1;
+        run(&m, 120, 1.0, 2, 3, 0); run(&m, 60, 2.9, 2, 3, 0); int up = -1;
+        for (int i = 0; i < 200 && up < 0; i++) { run(&m, 1, m.s.k == 2 ? 1.3 : 2.6, 2, 3, 0); if (m.s.k == 2) up = i + 1; }
+        int stay = 1; for (int i = 0; i < 300; i++) { run(&m, 1, m.s.k == 2 ? 1.3 : 2.6, 2, 3, 0); stay &= m.s.k == 2; }
+        snprintf(b, sizeof b, "floor 40, GPU clocked down at 40 (2.6 ticks, 1.3 at 60): at 60 after %d frames (2 s at most), %s", up, stay ? "stays there" : "fell back");
+        check(up > 0 && up <= 82 && stay, b);
+    }
     {   // The frame rate changed while the game runs in ticks: 60 → 40 → 30 → 40 → 60, the page's target read at each frame as hle_nvn.c fps_step_cap does (kmin 120 / cap)
         _Alignas(8) uint8_t page[64] = {0}; nvn_fstep_target_put(page, 60); uint32_t unit = 120; memcpy(page + FSTEP_UNIT_OFF, &unit, 4);
         sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2;

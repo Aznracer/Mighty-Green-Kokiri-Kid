@@ -228,6 +228,12 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     // without 40's wait, so the work bunched up and frames slipped to 33 ms; 35-39 fps in Hyrule Field where a 40 target held)
     } else if (!(fl40 && s->cpu_slow) && s->fit_run >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 && s->up_fit > 0 ? s->up_fit : FSTEP_RUN)
                && s->since >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 ? (s->up_wait > 0 ? s->up_wait : hold0) : s->hold) && !s->trial) { if (fl40) { s->c40 = fitc; s->grace = 2; s->pa = s->pb = 0; s->plate = s->ptotal = 0; } s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
+    // A 40 floor without prediction: a try at 60 every 2 s even when the cost at 40 does not fit. An iPhone lowers the GPU clock to the longer hold, so at 40 a scene can read
+    // 21-23 ms of GPU that fits 60 at 60's clock (the Deku Tree at resolution level 7: 8-12 ms at 60, 21-23 at 40 after the item screen, and nothing tried 60 again, the probes
+    // being off with the floor). A try that misses costs one frame shown at 40's time
+    else if (fl40 && !s->predict && !s->cpu_slow && s->k == 3 && !s->trial && s->since >= 2 * hold0) {
+        s->c40 = fitc; s->grace = 2; s->pa = s->pb = 0; s->plate = s->ptotal = 0; s->k = 2; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0;
+    }
     // No probes with a 40 floor: a trial goes up as soon as a frame's cost scaled to 60 (r60) fits, and a probe, which tries 60 without that, failed 15 times in 50 s in
     // Hyrule Field with a 30-frame grace each (frames shown late that do not count)
     else if (!fl40 && (slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
