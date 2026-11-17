@@ -660,13 +660,19 @@ int main(void) {
         run(&m, 120, 1.0, 2, 3, 0);
         for (int i = 0; i < 1200; i++) { int k = m.s.k; run(&m, 1, m.s.k == 2 ? 2.4 : 1.6, 2, 3, 0); if (k == 3 && m.s.k == 2) tries++; k0 = m.s.k; }
         (void)k0;
-        snprintf(b, sizeof b, "floor 40 at 60, an edge scene: 60 tried again %d times in 1,200 frames (about every 2 s)", tries);
-        check(tries >= 12, b);
+        snprintf(b, sizeof b, "floor 40 at 60, a scene at 1.6 ticks at 40 and 2.4 at 60: 60 tried %d times in 1,200 frames (1.6 × 1.3 does not fit 60)", tries);
+        check(tries <= 2, b);
         sim f = {0}; f.s.t120 = 1; f.s.per_vsync = 2; f.s.link120 = 1; f.s.up_wait = 12; f.s.up_fit = 4; int back = -1;   // DM_FPS_UP_MS=100
         run(&f, 120, 1.0, 2, 3, 0); run(&f, 60, 2.6, 2, 3, 0);
-        for (int i = 0; i < 100 && back < 0; i++) { run(&f, 1, 1.5, 2, 3, 0); if (f.s.k == 2) back = i + 1; }
-        snprintf(b, sizeof b, "  DM_FPS_UP_MS=100: frames that fit 60 again are back at 60 after %d frames (0.1 s)", back);
-        check(back > 0 && back <= 6, b);
+        for (int i = 0; i < 100 && back < 0; i++) { run(&f, 1, 1.2, 2, 3, 0); if (f.s.k == 2) back = i + 1; }
+        int stay = 1; for (int i = 0; i < 600; i++) { run(&f, 1, f.s.k == 2 ? 1.5 : 1.2, 2, 3, 0); stay &= f.s.k == 2; }
+        snprintf(b, sizeof b, "  DM_FPS_UP_MS=100: frames of 1.2 ticks at 40 are back at 60 after %d frames (0.1 s) and stay there at 1.5 (%s)", back, stay ? "stayed" : "fell back");
+        check(back > 0 && back <= 6 && stay, b);
+        sim h = {0}; h.s.t120 = 1; h.s.per_vsync = 2; h.s.link120 = 1; h.s.up_wait = 12; h.s.up_fit = 4; int fails = 0, kp = 3;   // Hyrule Field: 1.8 at 40, 2.3 at 60
+        run(&h, 120, 1.0, 2, 3, 0); run(&h, 60, 2.6, 2, 3, 0);
+        for (int i = 0; i < 2000; i++) { run(&h, 1, h.s.k == 2 ? 2.3 : 1.8, 2, 3, 0); if (kp == 2 && h.s.k == 3) fails++; kp = h.s.k; }
+        snprintf(b, sizeof b, "  a scene at 1.8 ticks at 40 and 2.3 at 60 (Hyrule Field): %d failed tries at 60 in 2,000 frames, then it stays at 40 (r60 %.2f)", fails, h.s.r60);
+        check(fails <= 3 && h.s.k == 3, b);
     }
     {   // The frame rate changed while the game runs in ticks: 60 → 40 → 30 → 40 → 60, the page's target read at each frame as hle_nvn.c fps_step_cap does (kmin 120 / cap)
         _Alignas(8) uint8_t page[64] = {0}; nvn_fstep_target_put(page, 60); uint32_t unit = 120; memcpy(page + FSTEP_UNIT_OFF, &unit, 4);
