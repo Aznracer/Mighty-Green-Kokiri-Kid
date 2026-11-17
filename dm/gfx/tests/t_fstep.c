@@ -655,6 +655,14 @@ int main(void) {
         snprintf(b, sizeof b, "floor 40 at 60: 21.7 ms → 3 ticks, 30-38 ms frames stay at 3 (late, paid back), cheap → 2 (k %d %d %d, above 3: %d)", k40, kafter, m.s.k, above);
         check(k40 == 3 && !above && kafter == 3 && m.s.k == 2, b);
     }
+    {   // DM_FPS_FLOOR=40 at 60: a scene on the edge (frames that fit 60 at 40, then miss it) tries 60 again after 1 s each time, not after a hold-off doubled to 8 s
+        sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1; int tries = 0, k0 = 0;
+        run(&m, 120, 1.0, 2, 3, 0);
+        for (int i = 0; i < 1200; i++) { int k = m.s.k; run(&m, 1, m.s.k == 2 ? 2.4 : 1.6, 2, 3, 0); if (k == 3 && m.s.k == 2) tries++; k0 = m.s.k; }
+        (void)k0;
+        snprintf(b, sizeof b, "floor 40 at 60, an edge scene: 60 tried again %d times in 1,200 frames (about every 2 s)", tries);
+        check(tries >= 12, b);
+    }
     {   // The frame rate changed while the game runs in ticks: 60 → 40 → 30 → 40 → 60, the page's target read at each frame as hle_nvn.c fps_step_cap does (kmin 120 / cap)
         _Alignas(8) uint8_t page[64] = {0}; nvn_fstep_target_put(page, 60); uint32_t unit = 120; memcpy(page + FSTEP_UNIT_OFF, &unit, 4);
         sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2;

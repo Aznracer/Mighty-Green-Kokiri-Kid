@@ -201,7 +201,9 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     s->fit40 = !late && fitc <= FSTEP_FIT * 3 ? s->fit40 + 1 : 0;
     if (s->link120 && s->t120 && kmin == 2 && s->k > 3 && !s->trial && s->since >= (s->fit40 >= FSTEP_RUN ? hold0 : s->hold40)) {
         s->k = 3; s->downs++; s->trial = FSTEP_RUN; s->t40 = 1; s->probe = 0; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
-    } else if (s->fit_run >= FSTEP_RUN && s->since >= s->hold && !s->trial) { s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
+    // A 60 target with a 40 floor (DM_FPS_FLOOR: kmax 3): a trial needs FSTEP_RUN frames whose cost fits 60, so it waits FSTEP_HOLD0 only, as the return to 40 does; the probes,
+    // which try 60 without that evidence, keep the hold-off that doubles
+    } else if (s->fit_run >= FSTEP_RUN && s->since >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 ? hold0 : s->hold) && !s->trial) { s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
     else if ((slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
         s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
     }
