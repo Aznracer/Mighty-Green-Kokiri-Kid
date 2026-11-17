@@ -2502,10 +2502,17 @@ typedef struct {
     _Atomic uint64_t period_ns, comp_us;   // the period and computation declared (0: none), read by the thread policy line
     unsigned ndecl; int retired;   // retired: an acquire thread that stopped acquiring, put back on the standard policy (rt_retire); the slot may go to the next acquire thread
     _Atomic int ready, pri, base, pol;   // the thread's priority, base priority and policy at its last sample (thread_info)
+    _Atomic uint32_t ew_us;   // a frame thread's CPU per frame, smoothed over about 10 frames (rt_frame_cpu_ms)
     _Atomic uint64_t frames, demoted, cpu_ns, cycles;   // since the last thread policy line: frames sampled, of them declared but below real-time priority (the kernel's fail-safe demotes
                                                         // a real-time thread that runs about 1.5 s without blocking), and the thread's CPU time and cycles
 } rt_thr;
 static rt_thr g_rtt[RT_THREADS]; static _Atomic int g_rtt_n;
+// The CPU a frame takes on the threads that carry it (the queue replay thread, an encode thread), the largest of them, smoothed (ms; 0: none measured)
+static double rt_frame_cpu_ms(void) {
+    double m = 0; int n = atomic_load(&g_rtt_n); if (n > RT_THREADS) n = RT_THREADS;
+    for (int i = 0; i < n; i++) { rt_thr *t = &g_rtt[i]; if (!atomic_load(&t->ready) || t->acq) continue; double v = atomic_load_explicit(&t->ew_us, memory_order_relaxed) / 1e3; if (v > m) m = v; }
+    return m;
+}
 static _Atomic uint64_t g_rt_frame_ns;   // the period the acquire thread declares; the frame threads follow it
 static pthread_mutex_t g_rt_mu = PTHREAD_MUTEX_INITIALIZER;   // the acquire threads' slots (rt_acquire): several threads may acquire, and one retires another's
 static int rt_base_pri(mach_port_t p, int *policy) {   // a thread's base priority (and policy), -1 if unknown
@@ -2591,6 +2598,8 @@ static void rt_tick(rt_thr *t, uint64_t period_ns) {
                 if (declared && xi.pth_curpri < 97) atomic_fetch_add(&t->demoted, 1);   // 97: BASEPRI_RTQUEUES, where a time-constraint thread runs
             }
             atomic_fetch_add(&t->frames, 1); atomic_fetch_add(&t->cpu_ns, cpu - t->r.cpu); atomic_fetch_add(&t->cycles, cyc - t->cyc);
+            if (!t->acq) { double ms = (double)(cpu - t->r.cpu) / 1e6 / (double)(f - t->r.frame), e = atomic_load_explicit(&t->ew_us, memory_order_relaxed) / 1e3;
+                           atomic_store_explicit(&t->ew_us, (uint32_t)((e > 0 ? e + (ms - e) / 10 : ms) * 1e3), memory_order_relaxed); }
         }
         t->cyc = cyc;
         double c = nvn_rt_sample(&t->r, f, cpu, (double)(period_ns ? period_ns : declared) / 1e6);
@@ -2978,7 +2987,10 @@ static void fstep_tick(const win_t *o, int c) {
     g_fs.link120 = t120 && mtl_link_active() && mtl_link_rate() == 120;   // 3 ticks show on the screen: a 60 target falls back to 40 before 30
     g_fs.smax = dm_fps_step_max;   // the stub's largest step (Mario Kart World: 2): frames held longer than the game steps would play in slow motion
     g_fs.no_payback = fps_high();   // at 120 fps the game steps by its target, not by the step: a late frame is slow motion, so three raise the hold whatever the average
-    g_fs.cpu_slow = cslow;
+    // No tries at 60 with a 40 floor while the threads that carry a frame need more than 12.5 ms of CPU a frame (0.75 of 60's 16.7): on the efficiency cores in Hyrule Field the
+    // queue replay thread took 15-18 ms and each try bunched frames up (33-41 ms). Not the cores themselves: in the Deku Tree it took 8-9 ms on them and 60 fit, which a block on
+    // the efficiency cores kept from being tried
+    g_fs.cpu_slow = rt_frame_cpu_ms() > 12.5;
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED);
     atomic_store(&g_fs_k, g_fs.k);
