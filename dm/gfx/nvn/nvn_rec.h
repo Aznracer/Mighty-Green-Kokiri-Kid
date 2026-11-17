@@ -315,6 +315,7 @@ static void rec_exec(const rec_t *r) {
 static void *rec_thread(void *arg) {
     (void)arg; pthread_setname_np("dm-encode");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    { void dm_frame_wg_join(void); dm_frame_wg_join(); }   // hle_nvn.c: the encode thread works to the frame's deadline
     void *rt = nvn_rt_join("encode thread");   // it makes the frame's Metal calls: it declares the frame's deadline too (hle_nvn.c rt_tick)
     for (;;) {
         pthread_mutex_lock(&g_rb_mu);
