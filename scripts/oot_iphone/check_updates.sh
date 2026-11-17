@@ -90,7 +90,7 @@ for p in new[-40:]:
     print(f"#{p['number']} {state(p):6} {p['user']['login']:18.18} | {p['title'][:150]}{tag}")
 if prs: open(lf, 'w').write(str(max(p['number'] for p in prs)))
 # Pull requests this build has taken in before upstream merged them: once one is merged, pull main instead
-watch = {2912: 'Mario Kart World CPU cost (merged into v4 by hand)'}
+watch = {2912: 'Mario Kart World CPU cost (merged into v4 by hand)', 2925: 'microphone input (merged into v4 by hand)', 2940: 'Ocarina DM_DRS_LEVEL (merged into v4 by hand)'}
 seen = {p['number']: p for p in prs}
 print(); print('=== pull requests taken into v4 early')
 for n, what in watch.items():
