@@ -3683,13 +3683,37 @@ static uint8_t *pkg_written(const tex_t *t, const void *span, uint64_t since, un
     }
     return need;
 }
+// DM_NVN_TEX_MIP_SKIP=<pixels> (off by default; 1 = 512; from seedds fc815c37 via the v3 iPhone env): a texture the CPU wrote, in a block-compressed format, 2D / 2D array / cube,
+// not in a sparse pool, with a mip chain and both sides at least that many pixels, is made without its finest level: the guest's level l + 1 becomes the host's level l, at half the
+// width and height, a quarter of the memory and of the bandwidth a draw that samples it near level 0 reads. Views and copies take the guest's level less the skip (tex_mip_skipped),
+// a copy of the dropped level is skipped, and such a texture is always re-uploaded whole (DM_NVN_PARTIAL_UPLOAD counts the guest's levels). Textures look softer up close
+static unsigned mip_skip_px(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_TEX_MIP_SKIP"); v = e ? atoi(e) : 0; if (v == 1) v = 512; if (v < 0) v = 0; if (v) MLOG("DM_NVN_TEX_MIP_SKIP: compressed CPU-written textures of %d pixels and more are made without their finest level", v); } return (unsigned)v; }
+static unsigned mip_skip(const tex_t *t, MTLTextureDescriptor *d) {
+    unsigned px = mip_skip_px();
+    if (!px || !fmt_compressed(t->d.format) || (d.usage & MTLTextureUsageShaderWrite) || d.mipmapLevelCount < 2) return 0;
+    if (t->pool && nvn_sparse_pool(t->pool)) return 0;
+    if (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) return 0;
+    if (t->d.target != 1 && t->d.target != 4 && t->d.target != 8 && t->d.target != 9) return 0;
+    return MIN(d.width, d.height) >= px;
+}
+// How many finest levels a host texture of t lacks (DM_NVN_TEX_MIP_SKIP): the levels by which its width falls short of the guest's. Compressed formats only, so a render target the
+// host scales (DM_GFX_SCALE, the render scale) is never taken for a skipped texture; 0 at once with the switch off
+static unsigned tex_mip_skipped(const tex_t *t, id<MTLTexture> m) {
+    unsigned k = 0; if (!mip_skip_px() || !t || !m || m.textureType == MTLTextureType3D || !fmt_compressed(t->d.format)) return 0;
+    while (k < 4 && MAX(t->d.width >> k, 1u) > m.width) k++;
+    return k;
+}
+// A copy's guest level as the host texture's (tex_mip_skipped): 0 when the host lacks that level
+static int lv_host(const tex_t *t, id<MTLTexture> m, unsigned *level) { unsigned k = tex_mip_skipped(t, m); if (*level < k) return 0; *level -= k; return 1; }
 static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture> reuse, MTLTextureUsage keep, id<MTLTexture> prev, const void *span, uint64_t since, unsigned *taken) {
     MTLTextureDescriptor *d = tex_desc(t, 1);
     if (!d) return nil;
+    unsigned sk = stamp ? mip_skip(t, d) : 0;   // levels the host texture leaves out (mip_skip): the guest's level l + sk is its level l
+    if (sk) { d.width = MAX(d.width >> sk, 1u); d.height = MAX(d.height >> sk, 1u); d.mipmapLevelCount -= sk; static uint64_t n; n++; if (n <= 3 || !(n % 2000)) MLOG("DM_NVN_TEX_MIP_SKIP: %llu textures made without their finest level (ser=%llu %ux%u format %#x)", (unsigned long long)n, (unsigned long long)t->serial, t->d.width, t->d.height, t->d.format); }
     d.usage |= keep & (MTLTextureUsageRenderTarget | MTLTextureUsagePixelFormatView);
     int rb_shift = rb_packed_shift(t->d.format);   // the RGB565 family is repacked into Metal's order on the CPU (rb_packed_shift)
     int linear = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET)) != 0;   // linear storage no view could take (linear_fit): its rows are copied on the CPU
-    int direct = !linear && !rb_shift && stamp && direct_upload_on() && g_nvn_deswz_gpu && !(t->pool && nvn_sparse_pool(t->pool)) && nvn_deswz_gpu_direct_supported(&t->d);
+    int direct = !sk && !linear && !rb_shift && stamp && direct_upload_on() && g_nvn_deswz_gpu && !(t->pool && nvn_sparse_pool(t->pool)) && nvn_deswz_gpu_direct_supported(&t->d);
     if (direct) d.usage |= MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView;
     id<MTLTexture> mt = reuse && reuse.pixelFormat == d.pixelFormat && reuse.width == d.width && reuse.height == d.height && reuse.mipmapLevelCount == d.mipmapLevelCount && reuse.textureType == d.textureType
                         && (reuse.usage & d.usage) == d.usage
@@ -3708,14 +3732,14 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     unsigned layers = (t->d.target == 4 || t->d.target == 9) ? t->d.depth : t->d.target == 8 ? 6 : t->d.target == 3 ? t->d.height : 1;   // a cube array's depth counts layer-faces (tex_desc)
     // Taken after the stamp and the protect: a write that lands from here on faults and is found at the next look
     uint8_t *need = NULL; unsigned nimg = (unsigned)d.mipmapLevelCount * layers, nup = 0;
-    if (prev && prev != mt && stamp && !sparse && !linear && bpb && d.sampleCount <= 1 && prev.pixelFormat == mt.pixelFormat && prev.textureType == mt.textureType && prev.sampleCount == mt.sampleCount
+    if (!sk && prev && prev != mt && stamp && !sparse && !linear && bpb && d.sampleCount <= 1 && prev.pixelFormat == mt.pixelFormat && prev.textureType == mt.textureType && prev.sampleCount == mt.sampleCount
         && prev.width == mt.width && prev.height == mt.height && prev.depth == mt.depth && prev.arrayLength == mt.arrayLength && prev.mipmapLevelCount == mt.mipmapLevelCount)
         need = pkg_written(t, span, since, (unsigned)d.mipmapLevelCount, layers, &nup);
     if (need && nup == nimg) { free(need); need = NULL; }
     if (need && taken) *taken = nimg - nup;
     size_t total = 0;
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
-        uint32_t w, h, z; tex_lsize(t, l, &w, &h, &z);
+        uint32_t w, h, z; tex_lsize(t, l + sk, &w, &h, &z);
         unsigned n = layers; if (need) { n = 0; for (unsigned y = 0; y < layers; y++) n += need[l * layers + y]; }
         total += (size_t)((w + bw - 1) / bw) * bpb * ((h + bh - 1) / bh) * z * n;
     }
@@ -3767,12 +3791,12 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
         if (upsrc && g_up_seq != src_batch) { uint64_t mo2; id<MTLBuffer> u2 = up_big_src((uint64_t)t->mem, t->L.size, &mo2); if (u2) { upsrc = u2; mb = (__bridge void *)u2; mo = mo2; } }
         size_t off = 0; int enc_ok = g_up_ce != nil, nb0 = g_nup_blits;
         for (unsigned l = 0; enc_ok && l < d.mipmapLevelCount; l++) {
-            uint32_t w, h, z; tex_lsize(t, l, &w, &h, &z);
+            uint32_t w, h, z; tex_lsize(t, l + sk, &w, &h, &z);
             size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
             for (unsigned y = 0; y < layers; y++) {
                 if (need && !need[l * layers + y]) { up_copy_add(prev, MTLSizeMake(w, h, z), mt, y, l); continue; }
                 size_t poff; id<MTLBuffer> params = up_param_alloc(&poff);   // Metal 4 has no setBytes: the parameter block of each deswizzle is cut from a shared block (no new GPU buffer each time)
-                if (nvn_deswz_gpu_encode_m4(g_up_ce, g_up_ct, params, poff, (__bridge id<MTLBuffer>)mb, mo, &t->d, l, y, stg, stg_off + off, pitch)) { enc_ok = 0; break; }
+                if (nvn_deswz_gpu_encode_m4(g_up_ce, g_up_ct, params, poff, (__bridge id<MTLBuffer>)mb, mo, &t->d, l + sk, y, stg, stg_off + off, pitch)) { enc_ok = 0; break; }
                 up_blit_add(stg, stg_off + off, pitch, pitch * rows, MTLSizeMake(w, h, z), mt, y, l);
                 off += pitch * rows * z;
             }
@@ -3802,7 +3826,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
     size_t off = 0;
     int zb = zblock_on() && t->d.format >= 0x79 && t->d.format <= 0x94; if (zb) { g_zb_ser = t->serial; g_zb_n = (int)MIN(d.mipmapLevelCount, 16u); memset(g_zb, 0, sizeof g_zb); memset(g_zb_tot, 0, sizeof g_zb_tot); }
     for (unsigned l = 0; l < d.mipmapLevelCount; l++) {
-        uint32_t w, h, z; tex_lsize(t, l, &w, &h, &z);
+        uint32_t w, h, z; tex_lsize(t, l + sk, &w, &h, &z);
         size_t pitch = (size_t)((w + bw - 1) / bw) * bpb, rows = (h + bh - 1) / bh;
         for (unsigned y = 0; y < layers; y++) {
             if (need && !need[l * layers + y]) { up_copy_add(prev, MTLSizeMake(w, h, z), mt, y, l); continue; }
@@ -3810,7 +3834,7 @@ static id<MTLTexture> pkg_upload_(const tex_t *t, uint64_t *stamp, id<MTLTexture
                 size_t srow = tex_linear_row(t);
                 if (l || y || z != 1 || srow < pitch || srow * rows > t->L.size) { RED_ONCE(153, "linear texture upload: %ux%u format %#x target %d levels %u is not one 2D level of rows (stride %zu)", t->d.width, t->d.height, t->d.format, t->d.target, t->d.levels, srow); break; }
                 for (size_t r = 0; r < rows; r++) memcpy((uint8_t *)stg.contents + off + r * pitch, src + r * srow, pitch);
-            } else if (nvn_deswizzle(&t->d, l, y, src, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
+            } else if (nvn_deswizzle(&t->d, l + sk, y, src, (uint8_t *)stg.contents + off, pitch)) { RED_ONCE(9, "deswizzle failed format %#x target %d", t->d.format, t->d.target); break; }
             if (rb_shift) rb_swap_rows((uint8_t *)stg.contents + off, pitch, rows, z, pitch, pitch * rows, rb_shift);
             if (zb && l < 16) { const uint64_t *q = (const uint64_t *)((const uint8_t *)stg.contents + off); size_t nb = pitch * rows * z / 16;
                 for (size_t i = 0; i < nb; i++) g_zb[l] += !(q[2 * i] | q[2 * i + 1]);
@@ -7360,7 +7384,8 @@ static id<MTLTexture> tex_by_id(int tid) {   // Caller holds g_rmu
         }
         // The view's levels count from the texture's level 0, which a sparse texture's host texture may start past (tex_level_shift): Resident Evil 4's streamed 512x512 and 1024x1024
         // textures, with only their two or three smallest levels mapped, are sampled through views of levels 1 + 0 and 2 + 0, which read past the host texture's one level and were left out
-        NSUInteger lb = tex_level_shift(&rp->t, base), n = base.mipmapLevelCount + lb;
+        NSUInteger lb = tex_level_shift(&rp->t, base); if (!lb) lb = tex_mip_skipped(&rp->t, base);   // or the levels DM_NVN_TEX_MIP_SKIP left out: a view of them reads the finest one kept
+        NSUInteger n = base.mipmapLevelCount + lb;
         NSUInteger l0 = r.v.set_levels ? r.v.base_level : 0;
         if (l0 >= n) { RED_ONCE(109, "texture view id %d starts at mip %lu beyond %lu levels", tid, (unsigned long)l0, (unsigned long)n); return nil; }
         NSUInteger nl = r.v.set_levels && r.v.nlevels ? r.v.nlevels : n - l0;
@@ -15454,7 +15479,7 @@ static void copy_t2b(const p_copy_b2t *c, uint32_t size) {
     if (!t) return;
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
-    if (!tex_level_ok(t, level, "texture-to-buffer copy")) return;
+    if (!lv_host(c->tex, t, &level) || !tex_level_ok(t, level, "texture-to-buffer copy")) return;
     const p_copy_strides *cs = copy_strides(c, size); int64_t rs = cs ? cs->row : S.copy_stride, is = cs ? cs->image : S.copy_img_stride;   // S: OP_COPY_STRIDE of an older capture
     size_t row = rs ? (size_t)rs : (size_t)((c->r.width + bw - 1) / bw) * bpb;
     size_t rows = (c->r.height + bh - 1) / bh, img = is ? (size_t)is : row * rows;   // per layer: SetCopyImageStride, else tightly packed
@@ -15534,7 +15559,7 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     int in_storage = 0; AP_B;
     id<MTLTexture> mt = tex_mtl_(t, &in_storage); AP_E(4);
     if (in_storage) { read_texels_storage(t, level, layer0, r, dst, row, img); return; }
-    if (!mt || !tex_level_ok(mt, level, "CPU readback")) { memset(dst, 0, img * nz); return; }
+    if (!mt || !lv_host(t, mt, &level) || !tex_level_ok(mt, level, "CPU readback")) { memset(dst, 0, img * nz); return; }
     mtl_finish_gpu_at(WS_READTEX);
     id<MTLBuffer> buf = [g_dev newBufferWithLength:wb * hb * nz options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cb = q_cb(); id<MTLBlitCommandEncoder> b = enc_b_begin(cb);
@@ -15576,7 +15601,7 @@ static void copy_b2t(const p_copy_b2t *c, uint32_t size) {
     tex_t pair; int paired = bcp_before(c->tex, t, &pair);   // a side of a compressed-alias pair: filled first, the copied region goes into its other side after
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
-    if (!tex_level_ok(t, level, "buffer-to-texture copy")) return;
+    if (!lv_host(c->tex, t, &level) || !tex_level_ok(t, level, "buffer-to-texture copy")) return;
     const p_copy_strides *cs = copy_strides(c, size); int64_t rs = cs ? cs->row : S.copy_stride, is = cs ? cs->image : S.copy_img_stride;   // S: OP_COPY_STRIDE of an older capture
     size_t row = rs ? (size_t)rs : (size_t)((c->r.width + bw - 1) / bw) * bpb;
     size_t rows = (c->r.height + bh - 1) / bh, img = is ? (size_t)is : row * rows;   // per layer: SetCopyImageStride, else tightly packed
@@ -16003,10 +16028,10 @@ static id<MTLTexture> copy_t2t_enc(const p_copy_t2t *c) {
     if (!s || !c->dst) return nil;
     unsigned sl = c->has_sv && c->sv.set_levels ? c->sv.base_level : 0, dl = c->has_dv && c->dv.set_levels ? c->dv.base_level : 0;
     unsigned sz0 = c->has_sv && c->sv.set_layers ? c->sv.min_layer : 0, dz0 = c->has_dv && c->dv.set_layers ? c->dv.min_layer : 0;
-    if (!tex_level_ok(s, sl, "texture copy source")) return nil;
+    if (!lv_host(c->src, s, &sl) || !tex_level_ok(s, sl, "texture copy source")) return nil;
     if (bc_alias_copy(c, s, sl, sz0, dl, dz0)) return nil;   // the destination aliases a compressed texture: the bytes go there, and the alias's own texture is not made (see bc_alias_copy)
     id<MTLTexture> d = tex_mtl_all(c->dst); sparse_gpu_wrote(c->dst); tu_wrote(d);
-    if (!d || !tex_level_ok(d, dl, "texture copy destination")) return nil;
+    if (!d || !lv_host(c->dst, d, &dl) || !tex_level_ok(d, dl, "texture copy destination")) return nil;
     { tex_t pair; bcp_before(c->dst, d, &pair); }   // a side of a compressed-alias pair: filled first, the copied region goes into its other side after (copy_t2t)
     if (c->flags & DM_COPY_RESOLVE) {   // Downsample: multisample resolve into the single-sample destination (depth takes sample 0); with equal sample counts it is a plain whole copy
         if (s.sampleCount == d.sampleCount && s.pixelFormat == d.pixelFormat && s.width == d.width && s.height == d.height) {
