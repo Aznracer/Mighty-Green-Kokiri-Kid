@@ -2890,6 +2890,13 @@ static int fstep_hold(void) {
     }
     return h;
 }
+// DM_FPS_FLOOR=<fps>: the lowest rate late frames may raise the hold to; frames later than that are only late (paid back), as with DM_FPS_HOLD=off at a target of that rate.
+// DM_FPS_TARGET=60 with DM_FPS_FLOOR=40 on a 120 Hz screen: 60 where it holds, 40 where it does not, and below 40 the same frames as a 40 target with the hold off
+static int fstep_floor(void) {
+    static int f = -1;
+    if (f < 0) { const char *e = getenv("DM_FPS_FLOOR"); f = e ? atoi(e) : 0; if (f < 0) f = 0; if (f) LOG("[nvn] frame step: late frames hold at most down to %d fps (DM_FPS_FLOOR)", f); }
+    return f;
+}
 // Once per present, before this frame's period is taken: the time since the previous frame's start (shown) and the frame's cost decide this frame's hold and the next frame's step.
 // Cost = max(CPU: the time between the frames' starts without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs (ticks of 1/120 s at 120 fps and with t120)
 static void fstep_tick(const win_t *o, int c) {
@@ -2911,6 +2918,10 @@ static void fstep_tick(const win_t *o, int c) {
     // else 3 vsyncs at a 60 cap, 2 at 30, the cap's own with fps_hold off, in ticks with t120
     int kmin = fstep_hz() / c, kmax = fps_high() ? 2 : c == 40 && t120 ? (fstep_hold() ? 4 : 3) : kv * (!fstep_hold() ? kmin / kv : kmin / kv >= 2 ? 2 : FSTEP_MAX), k0 = g_fs.k,
          kmin0 = g_fs.kmin, probe0 = g_fs.probe;
+    {   // DM_FPS_FLOOR: a hold the screen can show (whole vsyncs, or 3 ticks on a 120 Hz link)
+        int fl = fstep_floor(), hz = fstep_hz();
+        if (fl > 0 && fl < c && hz % fl == 0) { int kf = hz / fl; if ((kf % kv == 0 || (t120 && mtl_link_rate() == 120)) && kmax > kf) kmax = kf > kmin ? kf : kmin; }
+    }
     int fixed = dm_fps_state ? (int)__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED) : 0;
     uint64_t probes0 = g_fs.probes, failed0 = g_fs.failed;
     // A screen whose rate is not a multiple of 60 (144, 165 Hz) shows the link's 1/60 s ticks on their nearest refreshes (nvn_mtl.m link_range), so a frame on time can show for one

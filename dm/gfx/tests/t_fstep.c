@@ -646,6 +646,15 @@ int main(void) {
         snprintf(b, sizeof b, "  18.3 ms frames after that stay at 3 ticks (40), not 2 (k %d)", n.s.k);
         check(n.s.k == 3, b);
     }
+    {   // DM_FPS_FLOOR=40 at a 60 target (hle_nvn.c: kmax 3): 60 where it holds, 40 where it does not, and frames slower than 40 are only late, never a hold of 4 or 6
+        sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1; int above = 0;
+        run(&m, 120, 1.0, 2, 3, 0); run(&m, 300, 2.6, 2, 3, 0); int k40 = m.s.k;
+        for (int i = 0; i < 600; i++) { run(&m, 1, i % 2 ? 4.6 : 3.6, 2, 3, 0); above |= m.s.k > 3; }
+        run(&m, 300, 2.6, 2, 3, 0); int kafter = m.s.k;
+        run(&m, 3000, 1.0, 2, 3, 0);
+        snprintf(b, sizeof b, "floor 40 at 60: 21.7 ms → 3 ticks, 30-38 ms frames stay at 3 (late, paid back), cheap → 2 (k %d %d %d, above 3: %d)", k40, kafter, m.s.k, above);
+        check(k40 == 3 && !above && kafter == 3 && m.s.k == 2, b);
+    }
     {   // The frame rate changed while the game runs in ticks: 60 → 40 → 30 → 40 → 60, the page's target read at each frame as hle_nvn.c fps_step_cap does (kmin 120 / cap)
         _Alignas(8) uint8_t page[64] = {0}; nvn_fstep_target_put(page, 60); uint32_t unit = 120; memcpy(page + FSTEP_UNIT_OFF, &unit, 4);
         sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2;
