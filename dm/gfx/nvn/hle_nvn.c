@@ -2523,9 +2523,28 @@ static rt_thr *rt_register(const char *name, int acq) {   // on the thread itsel
     rt_thr *t = &g_rtt[i]; rt_init(t, name, acq, rt_self_tid()); return t;
 }
 static int rt_allowed(const rt_thr *t) { return rt_on() && (t->acq || rt_frame_on()); }
+// From cheemu21's kid-with-sword-remake (L4): the share of the period each thread may declare (DM_RT_SHARE=<acquire>,<frame threads>, default 0.5,0.3 on iOS, 0.9,0.9 elsewhere as before).
+// The iPhones this runs on have two performance cores. With the three declaring threads (acquire, queue replay, encode) each allowed 90 % of the period, an iPhone 18 Pro declared
+// 14 + 30 + 20 ms of a 33 ms frame: more real-time work than two cores hold, so the game's own workers, which the main thread waits for every frame, ran behind them. Capped, the three
+// together declare at most 1.1 periods: the deadline still reaches the performance controller, and most of a core stays for the game. On the iPhone Duo DM_RT=1 uncapped held the
+// frame's threads on the efficiency cores at 1.7 GHz, which is why DM_RT=0 was used
+static double rt_share(int acq) {
+    static double a = -1, f = -1;
+    if (a < 0) {
+#if TARGET_OS_IPHONE
+        a = 0.5; f = 0.3;
+#else
+        a = 0.9; f = 0.9;
+#endif
+        const char *e = getenv("DM_RT_SHARE"); double x, y;
+        if (e && sscanf(e, "%lf,%lf", &x, &y) == 2 && x > 0 && x <= 0.9 && y > 0 && y <= 0.9) { a = x; f = y; }
+        LOG("[nvn] time-constraint computation capped at %.2f of the period (acquire thread), %.2f (frame threads) (DM_RT_SHARE)", a, f);
+    }
+    return acq ? a : f;
+}
 static void rt_declare(rt_thr *t, uint64_t period_ns, double comp_ms) {
     static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
-    double cap = period_ns * 0.9 / 1e6; if (comp_ms > cap) comp_ms = cap; if (comp_ms < 1) comp_ms = 1;
+    double cap = period_ns * rt_share(t->acq) / 1e6; if (comp_ms > cap) comp_ms = cap; if (comp_ms < 1) comp_ms = 1;
     uint64_t comp_ns = (uint64_t)(comp_ms * 1e6);
     thread_time_constraint_policy_data_t p = {
         .period = (uint32_t)(period_ns * tb.denom / tb.numer), .computation = (uint32_t)(comp_ns * tb.denom / tb.numer),
