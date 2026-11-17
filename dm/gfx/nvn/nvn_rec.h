@@ -105,7 +105,7 @@ static inline int rec_on(void) {
     if (__builtin_expect(g_rec >= 0, 1)) return g_rec;
     const char *e = getenv("DM_NVN_ENC_THREAD");
 #if TARGET_OS_IPHONE
-    g_rec = !e || atoi(e) > 0;
+    g_rec = e ? atoi(e) > 0 : DM_GAME_ENC_THREAD_IOS;   // the profile's enc_thread_ios (on unless a profile turns it off: Ocarina of Time's Castle Town on the iPhone Duo dropped about half as many frames with the replay encoding on its own thread)
 #else
     g_rec = e ? atoi(e) > 0 : DM_GAME_ENC_THREAD;   // the profile's enc_thread: Need for Speed: Hot Pursuit Remastered waits on its fence each frame, so encoding on its thread took its 60 fps frame from 18.1 to 16.7 ms
 #endif

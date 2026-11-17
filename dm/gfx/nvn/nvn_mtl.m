@@ -349,6 +349,7 @@ static MTL4CommitOptions *commit_opts(DmCommitFB *fb) {
 }
 static id<MTL4CounterHeap> g_ts_heap;   // tentative: defined with the segment timestamps below
 #include "nvn_rec.h"   // deferred encoding (DM_NVN_ENC_THREAD)
+int mtl_enc_thread_on(void) { return rec_on(); }   // hle_nvn.c rt_share: the real-time shares follow how many threads carry the frame
 // Ends a Metal 4 command buffer, naming the residency sets first (see res_name). A recorded one (DM_NVN_ENC_THREAD) records its end, and the encode thread names them at RO_CB_END.
 // Nothing else calls endCommandBuffer (dm/tools/tests/test_residency_naming.py)
 static void cb_end(id cb, id<MTLResidencySet> also) {

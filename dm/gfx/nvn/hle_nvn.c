@@ -2532,7 +2532,10 @@ static double rt_share(int acq) {
     static double a = -1, f = -1;
     if (a < 0) {
 #if TARGET_OS_IPHONE
-        a = 0.5; f = 0.3;
+        // Three declaring threads with the encode thread; with it off the queue replay thread encodes too and carries most of the frame (Ocarina of Time's Castle Town on the
+        // iPhone Duo: replay 14-17 ms of a 25 ms frame), so the acquire thread gives it most of the share
+        int mtl_enc_thread_on(void); int enc = mtl_enc_thread_on();
+        a = enc ? 0.5 : 0.25; f = enc ? 0.3 : 0.65;
 #else
         a = 0.9; f = 0.9;
 #endif
