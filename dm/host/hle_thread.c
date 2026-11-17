@@ -17,6 +17,7 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <mach/mach.h>
+#include <mach/thread_switch.h>   // thread_switch, SWITCH_OPTION_NONE (DM_YIELD_SWITCH)
 #include <pthread/qos.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
@@ -848,10 +849,21 @@ static uint64_t yield_backoff_ns(uint64_t run_ns, int clock) {
 static void sleep_precise(uint64_t dl);
 // One back-off sleep of bo ns, counted for the power line
 static void backoff_sleep(thr_t *me, uint64_t bo) { me->nbackoff++; me->sleeping = 1; struct timespec ts = {0, (long)bo}; nanosleep(&ts, 0); me->sleeping = 0; }
+// DM_YIELD_SWITCH=1 (off by default): a guest yield's host yield is thread_switch with no option instead of sched_yield. Darwin's sched_yield (swtch_pri) drops the thread's
+// priority to the lowest while it is off the core; a thread that yields tens of thousands of times a frame spends much of the frame at that priority, which may leave it and the frame's
+// workgroup on the efficiency cores (Ocarina of Time on the iPhone Duo after the second area load of a route: main thread and ModuleSystem workers at about 34,000 yields a frame, 3-8 %
+// of the CPU time on performance cores at 1.6 GHz for 900-1,500 frames). thread_switch(MACH_PORT_NULL, SWITCH_OPTION_NONE, 0) gives the core up without changing the priority
+static int yield_switch_on(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_YIELD_SWITCH"); v = e && atoi(e) == 1; if (v) LOG("DM_YIELD_SWITCH=1: guest yields give the core up with thread_switch (no priority drop), not sched_yield"); }
+    return v;
+}
+extern kern_return_t thread_switch(mach_port_name_t thread_name, int option, mach_msg_timeout_t option_time);   // libsystem_kernel (mach_traps.h)
+static void host_yield(void) { if (yield_switch_on()) (void)thread_switch(MACH_PORT_NULL, SWITCH_OPTION_NONE, 0); else sched_yield(); }
 // sched_yield, or a short sleep once the wait has lasted run_ns past the back-off's start
 static void yield_for(thr_t *me, uint64_t run_ns, int clock) {
     uint64_t bo = yield_backoff_ns(run_ns, clock);
-    if (bo) backoff_sleep(me, bo); else sched_yield();
+    if (bo) backoff_sleep(me, bo); else host_yield();
 }
 // One yield SVC of the calling thread (me may be NULL); regs = the guest registers at the SVC.
 // A run of yields is a wait only while the loop makes no progress: it also starts again when the caller's callee-saved registers x19–x28 differ from the last yield's. The SDK's
@@ -868,7 +880,7 @@ static void yield_for(thr_t *me, uint64_t run_ns, int clock) {
 // A wait whose pass reads the system clock (dm_clock_reads moved since the last yield of the run) waits for a time, not for another thread's handoff: a clock wait (clock_wait).
 static void clock_wait(thr_t *me, uint64_t sig, uint64_t now, int predict);
 static void thr_yield(thr_t *me, const uint64_t *regs) {
-    if (!me) { sched_yield(); return; }
+    if (!me) { host_yield(); return; }
     static int clock_on = -1;   // DM_YIELD_CLOCK: 0 = clock waits are yields as any other, 1 = they back off from their start but sleep to no predicted end, 2 (the default) = both
     if (clock_on < 0) { const char *e = getenv("DM_YIELD_CLOCK"); clock_on = e && *e ? atoi(e) : 2; if (clock_on != 2) LOG("DM_YIELD_CLOCK=%d: yield loops that read the clock %s", clock_on, clock_on ? "back off from their start, with no sleep to a predicted end" : "back off after the start, as other yields"); }
     uint64_t y0 = now_ns(), sig = 0xcbf29ce484222325ull;
@@ -928,7 +940,7 @@ static void clock_wait(thr_t *me, uint64_t sig, uint64_t now, int predict) {
     } else if (me->cw_pred) {   // polling after the predicted sleep
         me->cw_after++;
         uint64_t past = now > me->cw_wake ? now - me->cw_wake : 0;
-        if (past < 2 * CW_MARGIN) sched_yield(); else yield_for(me, past - 2 * CW_MARGIN, 1);
+        if (past < 2 * CW_MARGIN) host_yield(); else yield_for(me, past - 2 * CW_MARGIN, 1);
         return;
     }
     yield_for(me, now - me->yrun_t0, 1);
