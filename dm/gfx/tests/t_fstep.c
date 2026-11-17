@@ -627,6 +627,19 @@ int main(void) {
         run(&t, 20, 2.15, 2, 6, 0);   // 17.9 ms: late by 0.15 ticks, within the 0.2-tick (1.7 ms) margin of a vsync
         check(t.s.k == 2 && t.s.ups == 0, "  17.9 ms frames at 60 are on time: the late margin is 1.7 ms, as in vsyncs");
     }
+    {   // 60 in ticks on a 120 Hz link (link120): 21.7 ms frames fall back to 3 ticks (40 fps), 30 ms frames to 4, 38 ms to 6; cheap frames come back down to 2
+        sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1;
+        run(&m, 120, 1.0, 2, 6, 0); run(&m, 300, 2.6, 2, 6, 0); int k40 = m.s.k;
+        run(&m, 300, 3.6, 2, 6, 0); int k30 = m.s.k;
+        run(&m, 300, 4.6, 2, 6, 0); int k20 = m.s.k;
+        run(&m, 3000, 1.0, 2, 6, 0); int kback = m.s.k;
+        snprintf(b, sizeof b, "120 Hz link at 60: 21.7 ms → 3 ticks, 30 ms → 4, 38 ms → 6, cheap → 2 (k %d %d %d %d)", k40, k30, k20, kback);
+        check(k40 == 3 && k30 == 4 && k20 == 6 && kback == 2, b);
+        sim n = {0}; n.s.t120 = 1; n.s.per_vsync = 2; n.s.link120 = 1;
+        run(&n, 120, 1.0, 2, 6, 0); run(&n, 300, 2.6, 2, 6, 0); run(&n, 3000, 2.2, 2, 6, 0);
+        snprintf(b, sizeof b, "  18.3 ms frames after that stay at 3 ticks (40), not 2 (k %d)", n.s.k);
+        check(n.s.k == 3, b);
+    }
     {   // The frame rate changed while the game runs in ticks: 60 → 40 → 30 → 40 → 60, the page's target read at each frame as hle_nvn.c fps_step_cap does (kmin 120 / cap)
         _Alignas(8) uint8_t page[64] = {0}; nvn_fstep_target_put(page, 60); uint32_t unit = 120; memcpy(page + FSTEP_UNIT_OFF, &unit, 4);
         sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2;
