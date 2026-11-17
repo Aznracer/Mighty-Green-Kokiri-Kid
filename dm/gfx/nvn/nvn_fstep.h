@@ -72,6 +72,7 @@ typedef struct {
                               // step are then the same real time as in vsyncs (2 × FSTEP_LATE, 2 × FSTEP_DEBT_MAX, 2 × FSTEP_MAX ticks); at an even kmin (60 / 30 fps) a hold moves by whole
                               // vsyncs (2 ticks), so a 60 Hz link shows it, and at an odd one (40 fps: 3 ticks, shown only on a 120 Hz link) by one tick: 3 or 4, never 5. A payback step
                               // is one tick more than the hold (game time only: the stub's ratio is a float)
+    int cpu_slow;             // set by the caller: the CPU runs slowed (efficiency cores; fstep_cpu_slowed), not the GPU's clocks
     int predict;              // set by the caller (DM_FPS_PREDICT, default 0): with a 40 floor, scale the cost at 40 by r60 before a trial toward 60; 0 tries 60 after every frame
                               // whose cost fits it, so above 40 each frame shows when it is ready (VRR) and at 40 and below the frames keep a 40 target's pace
     int down_late;            // set by the caller (DM_FPS_DOWN_LATE): with a 40 floor, the late frames in a row at 60 that step to 40 (0 = 3)
@@ -223,7 +224,9 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         s->k = 3; s->downs++; s->trial = FSTEP_RUN; s->t40 = 1; s->probe = 0; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
     // A 60 target with a 40 floor (DM_FPS_FLOOR: kmax 3): a trial needs FSTEP_RUN frames whose cost fits 60, so it waits FSTEP_HOLD0 only, as the return to 40 does; the probes,
     // which try 60 without that evidence, keep the hold-off that doubles
-    } else if (s->fit_run >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 && s->up_fit > 0 ? s->up_fit : FSTEP_RUN)
+    // (with a 40 floor not while the CPU runs slowed: on the efficiency cores the queue replay thread alone took 15-18 ms a frame, and each try at 60 started the next frame
+    // without 40's wait, so the work bunched up and frames slipped to 33 ms; 35-39 fps in Hyrule Field where a 40 target held)
+    } else if (!(fl40 && s->cpu_slow) && s->fit_run >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 && s->up_fit > 0 ? s->up_fit : FSTEP_RUN)
                && s->since >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 ? (s->up_wait > 0 ? s->up_wait : hold0) : s->hold) && !s->trial) { if (fl40) { s->c40 = fitc; s->grace = 2; s->pa = s->pb = 0; s->plate = s->ptotal = 0; } s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
     // No probes with a 40 floor: a trial goes up as soon as a frame's cost scaled to 60 (r60) fits, and a probe, which tries 60 without that, failed 15 times in 50 s in
     // Hyrule Field with a 30-frame grace each (frames shown late that do not count)

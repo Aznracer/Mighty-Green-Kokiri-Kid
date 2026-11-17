@@ -1956,6 +1956,7 @@ static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
 static uint64_t rt_period_ns(const win_t *o, uint64_t period);
 static _Atomic uint64_t g_rt_held_ns;   // the present period a frame really has (rt_declare)
+static int fstep_floor(void);
 static _Atomic int g_vrr40;   // VRR (a 60 target, DM_FPS_HOLD off, 120 Hz link) running at 40 or below: the threads' deadlines and budgets of a 40 target (fstep_tick)
 static int present_itv(const win_t *o);
 static int present_unpaced(const win_t *o);
@@ -2861,6 +2862,7 @@ static uint64_t rt_period_ns(const win_t *o, uint64_t period) {
     if (!period || !c || !fstep_on() || (dm_fps_state && __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED))) return period;
     int kmin = fstep_hz() / c;
     if (atomic_load_explicit(&g_vrr40, memory_order_relaxed)) return 25000000ull;   // VRR at 40 or below: a 40 target's deadline
+    if (fstep_floor() > 0 && present_itv(o) > kmin) return period;   // held at the floor (DM_FPS_FLOOR): the floor's own deadline and budgets, as a 40 target has them
     return present_itv(o) > kmin ? (uint64_t)kmin * 1000000000ull / (uint64_t)g_hz : period;
 }
 // Whether the CPU runs below its speed for reasons other than heat (nvn_fstep_next's slow, which allows probes): under 30% of the process's CPU time on performance cores in
@@ -2976,6 +2978,7 @@ static void fstep_tick(const win_t *o, int c) {
     g_fs.link120 = t120 && mtl_link_active() && mtl_link_rate() == 120;   // 3 ticks show on the screen: a 60 target falls back to 40 before 30
     g_fs.smax = dm_fps_step_max;   // the stub's largest step (Mario Kart World: 2): frames held longer than the game steps would play in slow motion
     g_fs.no_payback = fps_high();   // at 120 fps the game steps by its target, not by the step: a late frame is slow motion, so three raise the hold whatever the average
+    g_fs.cpu_slow = cslow;
     int n = nvn_fstep_next(&g_fs, shown, cost, kmin, kmax, fixed, cslow || gslow);
     if (dm_fps_state) __atomic_store_n((uint32_t *)(dm_fps_state + 0x20), (uint32_t)n, __ATOMIC_RELAXED);
     atomic_store(&g_fs_k, g_fs.k);

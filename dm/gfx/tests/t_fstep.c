@@ -700,6 +700,14 @@ int main(void) {
         snprintf(b, sizeof b, "floor 40, no prediction: Hyrule Field tried 60 %d times in 1,200 frames, never held past 40 (%d); a scene that fits 60 %s", tries, over, stay ? "stays at 60" : "fell back");
         check(tries >= 100 && !over && stay, b);
     }
+    {   // Floor 40 with the CPU slowed (efficiency cores): no tries at 60, frames keep 40's pace; tries again once the CPU is back
+        sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1; m.s.up_wait = 3; m.s.up_fit = 1; m.s.down_late = 1; m.s.cpu_slow = 1;
+        run(&m, 120, 1.0, 2, 3, 0); run(&m, 60, 2.6, 2, 3, 0); int tries = 0, kp = m.s.k;
+        for (int i = 0; i < 600; i++) { run(&m, 1, m.s.k == 2 ? 2.3 : 1.8, 2, 3, 0); tries += kp == 3 && m.s.k == 2; kp = m.s.k; }
+        m.s.cpu_slow = 0; int back = -1; for (int i = 0; i < 20 && back < 0; i++) { run(&m, 1, 1.2, 2, 3, 0); if (m.s.k == 2) back = i + 1; }
+        snprintf(b, sizeof b, "floor 40 on slowed cores: %d tries at 60 in 600 frames; on the fast cores again at 60 after %d frame(s)", tries, back);
+        check(tries == 0 && back > 0 && back <= 2, b);
+    }
     {   // The frame rate changed while the game runs in ticks: 60 → 40 → 30 → 40 → 60, the page's target read at each frame as hle_nvn.c fps_step_cap does (kmin 120 / cap)
         _Alignas(8) uint8_t page[64] = {0}; nvn_fstep_target_put(page, 60); uint32_t unit = 120; memcpy(page + FSTEP_UNIT_OFF, &unit, 4);
         sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2;
