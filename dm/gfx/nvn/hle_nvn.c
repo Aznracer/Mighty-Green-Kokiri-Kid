@@ -1956,6 +1956,7 @@ static void sleep_until_ns(uint64_t dl);
 static uint64_t present_period(const win_t *o);
 static uint64_t rt_period_ns(const win_t *o, uint64_t period);
 static _Atomic uint64_t g_rt_held_ns;   // the present period a frame really has (rt_declare)
+static _Atomic int g_vrr40;   // VRR (a 60 target, DM_FPS_HOLD off, 120 Hz link) running at 40 or below: the threads' deadlines and budgets of a 40 target (fstep_tick)
 static int present_itv(const win_t *o);
 static int present_unpaced(const win_t *o);
 static int link_wait(const win_t *o, uint64_t timeout_ns);
@@ -2026,7 +2027,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock
     uint64_t at = *idx < 4 ? o->avail[*idx] : 0, now = dm_detclock_enabled() ? guest_ns() : now_ns(), wait = at > now ? at - now : 0, pace_ns = 0, drain_ns = 0;
     if (!dm_detclock_enabled()) {   // Register the acquire thread as a time-constraint thread (no longer registered only when it "arrived early": it must also declare itself when it is constantly behind in the hot state)
-        uint64_t period = present_period(o), rtp = rt_period_ns(o, period); atomic_store_explicit(&g_rt_held_ns, period, memory_order_relaxed); rt_acquire(rtp); fwg_frame(rtp);
+        uint64_t period = present_period(o), rtp = rt_period_ns(o, period); atomic_store_explicit(&g_rt_held_ns, atomic_load_explicit(&g_vrr40, memory_order_relaxed) ? 25000000ull : period, memory_order_relaxed); rt_acquire(rtp); fwg_frame(rtp);
         uint64_t p0 = now_ns(); int snap = mtl_snap_on();
         o->follow = 1;   // the beat paces this frame only where the branches below wait for the slot time (nvn_pace_follow)
         if (present_unpaced(o)) {}   // present interval 0: no vsync wait (below); only the free texture the ticket wait below gives
@@ -2859,6 +2860,7 @@ static uint64_t rt_period_ns(const win_t *o, uint64_t period) {
     int c = fps_step_cap();
     if (!period || !c || !fstep_on() || (dm_fps_state && __atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED))) return period;
     int kmin = fstep_hz() / c;
+    if (atomic_load_explicit(&g_vrr40, memory_order_relaxed)) return 25000000ull;   // VRR at 40 or below: a 40 target's deadline
     return present_itv(o) > kmin ? (uint64_t)kmin * 1000000000ull / (uint64_t)g_hz : period;
 }
 // Whether the CPU runs below its speed for reasons other than heat (nvn_fstep_next's slow, which allows probes): under 30% of the process's CPU time on performance cores in
@@ -2931,6 +2933,17 @@ static void fstep_tick(const win_t *o, int c) {
     }
     int fixed = dm_fps_state ? (int)__atomic_load_n((uint32_t *)(dm_fps_state + 0x24), __ATOMIC_RELAXED) : 0;
     uint64_t probes0 = g_fs.probes, failed0 = g_fs.failed;
+    {   // VRR: a 60 target with the hold off on a 120 Hz link shows each frame at 60's or 40's time as it comes. Running at 40 or below (frames of 2.6 ticks or more on average,
+        // back above 2.3) its threads get a 40 target's deadline and budgets: on the efficiency cores the queue replay thread needed 15-21 ms a frame and a 60 target let it
+        // declare 10.8 (28-38 fps in Hyrule Field), where a 40 target's 16.25 held 40 for 26 minutes. What the screen shows does not change: a frame past 16.7 ms shows at 25 either way
+        static double avg; static int said;
+        int vrr = !fstep_hold() && kmin == 2 && t120 && mtl_link_active() && mtl_link_rate() == 120 && !fixed;
+        if (vrr && shown > 0) {
+            avg = avg > 0 ? avg + (shown - avg) / 16 : shown;
+            int was = atomic_load_explicit(&g_vrr40, memory_order_relaxed), now = was ? avg > 2.3 : avg >= 2.6;
+            if (now != was) { atomic_store_explicit(&g_vrr40, now, memory_order_relaxed); if (said++ < 20) LOG("[nvn] frame step: VRR %s (frames of %.2f ticks on average)", now ? "at 40 or below: a 40 target's thread deadlines" : "back above 40: the 60 target's thread deadlines", avg); }
+        } else if (!vrr) { avg = 0; atomic_store_explicit(&g_vrr40, 0, memory_order_relaxed); }
+    }
     // A screen whose rate is not a multiple of 60 (144, 165 Hz) shows the link's 1/60 s ticks on their nearest refreshes (nvn_mtl.m link_range), so a frame on time can show for one
     // refresh more than its hold: a cheap 50 ms frame shows 54.5 ms at 165 Hz, which counted as late kept the hold at 20 fps for good
     int hz = front_screen_max_fps(); g_fs.shown_slack = hz > fstep_hz() && hz % fstep_hz() && mtl_link_active() ? (double)fstep_hz() / hz : 0;
