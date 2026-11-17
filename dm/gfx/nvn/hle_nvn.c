@@ -2918,8 +2918,13 @@ static void fstep_tick(const win_t *o, int c) {
     // 18.9 ms frames at hold 1 missed one refresh in 7, never three in a row, and ran at a jittering 53 fps with a payback every few frames instead of a steady 30
     if (mtl_snap_on() && mtl_link_active() && !mtl_link_stalled() && o->presents > 9) {   // (frames the stall fallback drops say nothing about the game: judged by cost then)
         uint64_t pn = o->presents - 8; double a = mtl_presented_time(pn), b = mtl_presented_time(pn - 1);
-        if (a < 0) g_fs.screen = 2; else if (a > 0 && b > 0) g_fs.screen = (a - b) * 1e3 > 1.25 * pres_expect_ms(pn) ? 2 : 1;
-        static uint16_t slow_bits; static int slow_k; int k = g_fs.k ? g_fs.k : kmin;
+        // A frame the screen showed at a shorter hold than the one in force now says nothing about this hold: with the screen 8 presents behind, the late frames that stepped the
+        // hold up stepped it again two and three presents later (Ocarina of Time on an iPhone at a 60 target: 2 → 3 → 4 → 6 ticks in 6 presents at a cost of 2.2-2.3 ticks,
+        // 20 fps where 40 held). Until the screen shows frames of this hold, lateness is judged by the cost
+        int hk = g_hold_ring[pn % 16] > g_hold_ring[(pn - 1) % 16] ? g_hold_ring[pn % 16] : g_hold_ring[(pn - 1) % 16], kc = g_fs.k ? g_fs.k : kmin;
+        if (hk && hk < kc) g_fs.screen = 0;
+        else if (a < 0) g_fs.screen = 2; else if (a > 0 && b > 0) g_fs.screen = (a - b) * 1e3 > 1.25 * pres_expect_ms(pn) ? 2 : 1;
+        static uint16_t slow_bits; static int slow_k; int k = kc;
         if (k != slow_k) { slow_k = k; slow_bits = 0; }   // judged against the hold in force, not the frames before a step
         slow_bits = (uint16_t)(slow_bits << 1 | (shown > k + FSTEP_LATE * kv));
         if (__builtin_popcount(slow_bits) >= 12) g_fs.screen = 2;
