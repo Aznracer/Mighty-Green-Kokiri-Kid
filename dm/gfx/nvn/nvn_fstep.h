@@ -72,6 +72,8 @@ typedef struct {
                               // step are then the same real time as in vsyncs (2 × FSTEP_LATE, 2 × FSTEP_DEBT_MAX, 2 × FSTEP_MAX ticks); at an even kmin (60 / 30 fps) a hold moves by whole
                               // vsyncs (2 ticks), so a 60 Hz link shows it, and at an odd one (40 fps: 3 ticks, shown only on a 120 Hz link) by one tick: 3 or 4, never 5. A payback step
                               // is one tick more than the hold (game time only: the stub's ratio is a float)
+    double up_wait; int up_fit;   // set by the caller (DM_FPS_UP_MS): with a 40 floor, how long after the last change and after how many frames that fit 60 a trial tries 60
+                              // (0 = FSTEP_HOLD0 and FSTEP_RUN)
     int t40, fit40; double hold40;   // a return to 3 ticks (40 fps) from a longer hold is under way (link120); frames in a row whose cost fits 3 ticks; vsyncs before the next
                               // return (FSTEP_HOLD0, doubled when one fails up to 4 s; FSTEP_HOLD0 again once FSTEP_RUN frames fit)
     int link120;              // set by the caller: the screen's link runs at 120 Hz, so it shows a hold of 3 ticks. With t120 and kmin 2 the hold then moves 2 → 3 → 4 by one tick
@@ -203,7 +205,8 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         s->k = 3; s->downs++; s->trial = FSTEP_RUN; s->t40 = 1; s->probe = 0; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
     // A 60 target with a 40 floor (DM_FPS_FLOOR: kmax 3): a trial needs FSTEP_RUN frames whose cost fits 60, so it waits FSTEP_HOLD0 only, as the return to 40 does; the probes,
     // which try 60 without that evidence, keep the hold-off that doubles
-    } else if (s->fit_run >= FSTEP_RUN && s->since >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 ? hold0 : s->hold) && !s->trial) { s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
+    } else if (s->fit_run >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 && s->up_fit > 0 ? s->up_fit : FSTEP_RUN)
+               && s->since >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 ? (s->up_wait > 0 ? s->up_wait : hold0) : s->hold) && !s->trial) { s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
     else if ((slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
         s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
     }

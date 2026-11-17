@@ -662,6 +662,11 @@ int main(void) {
         (void)k0;
         snprintf(b, sizeof b, "floor 40 at 60, an edge scene: 60 tried again %d times in 1,200 frames (about every 2 s)", tries);
         check(tries >= 12, b);
+        sim f = {0}; f.s.t120 = 1; f.s.per_vsync = 2; f.s.link120 = 1; f.s.up_wait = 12; f.s.up_fit = 4; int back = -1;   // DM_FPS_UP_MS=100
+        run(&f, 120, 1.0, 2, 3, 0); run(&f, 60, 2.6, 2, 3, 0);
+        for (int i = 0; i < 100 && back < 0; i++) { run(&f, 1, 1.5, 2, 3, 0); if (f.s.k == 2) back = i + 1; }
+        snprintf(b, sizeof b, "  DM_FPS_UP_MS=100: frames that fit 60 again are back at 60 after %d frames (0.1 s)", back);
+        check(back > 0 && back <= 6, b);
     }
     {   // The frame rate changed while the game runs in ticks: 60 → 40 → 30 → 40 → 60, the page's target read at each frame as hle_nvn.c fps_step_cap does (kmin 120 / cap)
         _Alignas(8) uint8_t page[64] = {0}; nvn_fstep_target_put(page, 60); uint32_t unit = 120; memcpy(page + FSTEP_UNIT_OFF, &unit, 4);

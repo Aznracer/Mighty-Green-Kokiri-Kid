@@ -2897,6 +2897,13 @@ static int fstep_floor(void) {
     if (f < 0) { const char *e = getenv("DM_FPS_FLOOR"); f = e ? atoi(e) : 0; if (f < 0) f = 0; if (f) LOG("[nvn] frame step: late frames hold at most down to %d fps (DM_FPS_FLOOR)", f); }
     return f;
 }
+// DM_FPS_UP_MS=<ms> (default 100, with DM_FPS_FLOOR only): how soon after the last change the frame step tries 60 again once frames fit it, and the frames at 40 that must fit
+// first (one per 25 ms, at least 3). Each try that fails costs 3 late frames
+static int fstep_up_ms(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DM_FPS_UP_MS"); v = e && *e ? atoi(e) : 100; if (v < 0) v = 0; if (fstep_floor()) LOG("[nvn] frame step: tries 60 again %d ms after the last change once frames fit it (DM_FPS_UP_MS)", v); }
+    return v;
+}
 // Once per present, before this frame's period is taken: the time since the previous frame's start (shown) and the frame's cost decide this frame's hold and the next frame's step.
 // Cost = max(CPU: the time between the frames' starts without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs (ticks of 1/120 s at 120 fps and with t120)
 static void fstep_tick(const win_t *o, int c) {
@@ -2950,6 +2957,7 @@ static void fstep_tick(const win_t *o, int c) {
     // (Breath of the Wild on an M5 Pro: the probe's 33 frames took the clock 338 → 432 MHz and its GPU time 24.8 → 18.5 ms, then it failed at 22 ms frames; hold 1 needed about 560 MHz)
     g_fs.ramp = mtl_probe_ramp_on();
     g_fs.per_vsync = fstep_hz() / 60; g_fs.t120 = t120;
+    if (fstep_floor()) { int um = fstep_up_ms(); g_fs.up_wait = um > 0 ? um * fstep_hz() / 1000.0 : 0.01; g_fs.up_fit = um / 25 > 3 ? um / 25 : 3; }
     g_fs.link120 = t120 && mtl_link_active() && mtl_link_rate() == 120;   // 3 ticks show on the screen: a 60 target falls back to 40 before 30
     g_fs.smax = dm_fps_step_max;   // the stub's largest step (Mario Kart World: 2): frames held longer than the game steps would play in slow motion
     g_fs.no_payback = fps_high();   // at 120 fps the game steps by its target, not by the step: a late frame is slow motion, so three raise the hold whatever the average
