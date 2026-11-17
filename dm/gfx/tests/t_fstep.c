@@ -629,12 +629,18 @@ int main(void) {
     }
     {   // 60 in ticks on a 120 Hz link (link120): 21.7 ms frames fall back to 3 ticks (40 fps), 30 ms frames to 4, 38 ms to 6; cheap frames come back down to 2
         sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1;
-        run(&m, 120, 1.0, 2, 6, 0); run(&m, 300, 2.6, 2, 6, 0); int k40 = m.s.k;
-        run(&m, 300, 3.6, 2, 6, 0); int k30 = m.s.k;
-        run(&m, 300, 4.6, 2, 6, 0); int k20 = m.s.k;
+        run(&m, 120, 1.0, 2, 6, 0); run(&m, 300, 2.6, 2, 6, 0); int k40 = m.s.k, at[7] = {0};
+        for (int i = 0; i < 600; i++) { run(&m, 1, 3.6, 2, 6, 0); at[m.s.k]++; }
+        snprintf(b, sizeof b, "120 Hz link at 60: 21.7 ms → 3 ticks; 30 ms frames mostly at 4, never 5 or 6 (3 %d / 4 %d / 5 %d / 6 %d)", at[3], at[4], at[5], at[6]);
+        check(k40 == 3 && at[4] >= 400 && !at[5] && !at[6], b);   // a return to 40 every 4 s at most
+        run(&m, 300, 4.6, 2, 6, 0); int k20 = 0; for (int i = 0; i < 300; i++) { run(&m, 1, 4.6, 2, 6, 0); k20 |= m.s.k == 6; }
+        int back = 0; while (m.s.k != 3 && back < 400) { run(&m, 1, 2.6, 2, 6, 0); back++; }
+        run(&m, 300, 2.6, 2, 6, 0); int kstay = m.s.k;
+        snprintf(b, sizeof b, "  38 ms frames reach 6 ticks; 21.7 ms frames after them are back at 3 within %d frames (1.5 s at most) and stay (k %d)", back, kstay);
+        check(k20 && back <= 30 && kstay == 3, b);
         run(&m, 3000, 1.0, 2, 6, 0); int kback = m.s.k;
-        snprintf(b, sizeof b, "120 Hz link at 60: 21.7 ms → 3 ticks, 30 ms → 4, 38 ms → 6, cheap → 2 (k %d %d %d %d)", k40, k30, k20, kback);
-        check(k40 == 3 && k30 == 4 && k20 == 6 && kback == 2, b);
+        snprintf(b, sizeof b, "  cheap frames: back to 2 ticks (k %d)", kback);
+        check(kback == 2, b);
         sim n = {0}; n.s.t120 = 1; n.s.per_vsync = 2; n.s.link120 = 1;
         run(&n, 120, 1.0, 2, 6, 0); run(&n, 300, 2.6, 2, 6, 0); run(&n, 3000, 2.2, 2, 6, 0);
         snprintf(b, sizeof b, "  18.3 ms frames after that stay at 3 ticks (40), not 2 (k %d)", n.s.k);

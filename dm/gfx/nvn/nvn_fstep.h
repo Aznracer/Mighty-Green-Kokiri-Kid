@@ -72,6 +72,8 @@ typedef struct {
                               // step are then the same real time as in vsyncs (2 × FSTEP_LATE, 2 × FSTEP_DEBT_MAX, 2 × FSTEP_MAX ticks); at an even kmin (60 / 30 fps) a hold moves by whole
                               // vsyncs (2 ticks), so a 60 Hz link shows it, and at an odd one (40 fps: 3 ticks, shown only on a 120 Hz link) by one tick: 3 or 4, never 5. A payback step
                               // is one tick more than the hold (game time only: the stub's ratio is a float)
+    int t40, fit40; double hold40;   // a return to 3 ticks (40 fps) from a longer hold is under way (link120); frames in a row whose cost fits 3 ticks; vsyncs before the next
+                              // return (FSTEP_HOLD0, doubled when one fails up to 4 s; FSTEP_HOLD0 again once FSTEP_RUN frames fit)
     int link120;              // set by the caller: the screen's link runs at 120 Hz, so it shows a hold of 3 ticks. With t120 and kmin 2 the hold then moves 2 → 3 → 4 by one tick
                               // (60 → 40 → 30 fps) and by whole vsyncs past 4 (Ocarina of Time on an iPhone at a 60 target: 21 ms frames in Hyrule Field went to 30, where 40 held)
     double shown_slack;       // vsyncs a frame on time may show longer than k (set by the caller): one refresh on screens whose rate is not a multiple of 60; the cost keeps FSTEP_LATE
@@ -180,18 +182,26 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         if (want < s->k + (s->k < 4 ? q3 : q)) want = s->k + (s->k < 4 ? q3 : q);
         if (!(q3 == 1 && want <= 4)) want = (want + q - 1) / q * q;
         if (want > kmax) want = kmax;
-        if (s->trial || s->tpend || (s->probe == 2 && s->since < hold_max)) { s->failed++; s->trial = 0; s->hold = s->hold * 2 < hold_max ? s->hold * 2 : hold_max; }
+        if (s->t40) { s->t40 = 0; s->trial = 0; s->failed++; s->hold40 = s->hold40 * 2 < 4 * hold0 ? s->hold40 * 2 : 4 * hold0; }   // the return to 40 failed: the next waits longer, 4 s at most
+        else if (s->trial || s->tpend || (s->probe == 2 && s->since < hold_max)) { s->failed++; s->trial = 0; s->hold = s->hold * 2 < hold_max ? s->hold * 2 : hold_max; }
         else if (s->probe == 2) s->hold = hold0;   // the probe's run at kmin lasted
         if (held == kmin && s->run >= hold_max) s->cref = s->crun;   // kmin held 8 s at this cost
         s->k = want; s->ups++; s->late_run = s->fit_run = 0; s->since = 0; s->probe = 0; s->tpend = 0;
-    } else if (s->trial && !grace && !--s->trial) { if (s->probe) { s->probe = 2; s->since = 0; } else { s->tpend = 1; s->tsince = 0; } }   // the trial held: its run is judged by how long it lasts
+    } else if (s->trial && !grace && !--s->trial) { if (s->t40) { s->t40 = 0; s->hold40 = hold0; } else if (s->probe) { s->probe = 2; s->since = 0; } else { s->tpend = 1; s->tsince = 0; } }   // the trial held: its run is judged by how long it lasts
     // A frame also fits k − 1 while the running mean of this hold's frames on time does: single frames over the fit among frames under it are
     // what the shorter hold absorbs, and they kept the trial from ever starting (Ocarina of Time on a Mac after a load's late frames: 13.4 ms of GPU work at hold 2 with one
     // frame in 20 over 14.2 ms, 30 fps for the rest of the scene where 60 had held; 22 ms at hold 3 under a lowered GPU clock with frames of 29–44 ms, 20 fps for 25 s)
     double fitc = s->ck == s->k && s->cn && s->ccur < cost ? s->ccur : cost;
     const int qd = s->k <= 4 ? q3 : q;   // the ticks a trial moves down by
     if (!late) s->fit_run = s->k > kmin && fitc <= FSTEP_FIT * (s->k - qd) ? s->fit_run + 1 : 0;
-    if (s->fit_run >= FSTEP_RUN && s->since >= s->hold && !s->trial) { s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
+    // Below 40 (link120): back to 3 ticks after FSTEP_HOLD0 whatever the cost says, with a probe's grace for the clocks to rise; a failed return doubles the wait for the next,
+    // a held one resets it. A hold the late frames of a load or of the efficiency cores raised to 30 or 20 came back to 40 only after the hold-off of the trials toward 60
+    // (up to 8 s), while at a 40 target, with no hold, the next frame on time is 40 again. The trials and probes toward kmin keep their own hold-off
+    if (!s->hold40) s->hold40 = hold0;
+    s->fit40 = !late && fitc <= FSTEP_FIT * 3 ? s->fit40 + 1 : 0;
+    if (s->link120 && s->t120 && kmin == 2 && s->k > 3 && !s->trial && s->since >= (s->fit40 >= FSTEP_RUN ? hold0 : s->hold40)) {
+        s->k = 3; s->downs++; s->trial = FSTEP_RUN; s->t40 = 1; s->probe = 0; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
+    } else if (s->fit_run >= FSTEP_RUN && s->since >= s->hold && !s->trial) { s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
     else if ((slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline
         s->k = kmin; s->downs++; s->probes++; s->trial = FSTEP_RUN; s->probe = 1; s->grace = FSTEP_GRACE; s->fit_run = s->late_run = 0; s->pa = s->pb = 0; s->plate = s->ptotal = 0;
     }
