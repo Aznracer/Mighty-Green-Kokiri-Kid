@@ -656,7 +656,7 @@ int main(void) {
         check(k40 == 3 && !above && kafter == 3 && m.s.k == 2, b);
     }
     {   // DM_FPS_FLOOR=40 at 60: a scene on the edge (frames that fit 60 at 40, then miss it) tries 60 again after 1 s each time, not after a hold-off doubled to 8 s
-        sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1; int tries = 0, k0 = 0;
+        sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1; m.s.predict = 1; int tries = 0, k0 = 0;
         run(&m, 120, 1.0, 2, 3, 0);
         for (int i = 0; i < 1200; i++) { int k = m.s.k; run(&m, 1, m.s.k == 2 ? 2.4 : 1.6, 2, 3, 0); if (k == 3 && m.s.k == 2) tries++; k0 = m.s.k; }
         (void)k0;
@@ -668,7 +668,7 @@ int main(void) {
         int stay = 1; for (int i = 0; i < 600; i++) { run(&f, 1, f.s.k == 2 ? 1.5 : 1.2, 2, 3, 0); stay &= f.s.k == 2; }
         snprintf(b, sizeof b, "  DM_FPS_UP_MS=25: frames of 1.2 ticks at 40 are back at 60 after %d frame(s) and stay there at 1.5 (%s)", back, stay ? "stayed" : "fell back");
         check(back > 0 && back <= 2 && stay, b);
-        sim h = {0}; h.s.t120 = 1; h.s.per_vsync = 2; h.s.link120 = 1; h.s.up_wait = 3; h.s.up_fit = 1; h.s.down_late = 1; int fails = 0, kp = 3;   // Hyrule Field: 1.8 at 40, 2.3 at 60
+        sim h = {0}; h.s.t120 = 1; h.s.per_vsync = 2; h.s.link120 = 1; h.s.up_wait = 3; h.s.up_fit = 1; h.s.down_late = 1; h.s.predict = 1; int fails = 0, kp = 3;   // Hyrule Field: 1.8 at 40, 2.3 at 60
         run(&h, 120, 1.0, 2, 3, 0); run(&h, 60, 2.6, 2, 3, 0);
         for (int i = 0; i < 2000; i++) { run(&h, 1, h.s.k == 2 ? 2.3 : 1.8, 2, 3, 0); if (kp == 2 && h.s.k == 3) fails++; kp = h.s.k; }
         snprintf(b, sizeof b, "  a scene at 1.8 ticks at 40 and 2.3 at 60 (Hyrule Field): %d failed tries at 60 in 2,000 frames (one every 10 s or more, 1 late frame each; r60 %.2f)", fails, h.s.r60);
@@ -690,6 +690,15 @@ int main(void) {
         for (int i = 0; i < 1600; i++) { run(&m, 1, m.s.k == 2 ? 1.86 : 1.6, 2, 3, 0); at60 += m.s.k == 2 && i >= 1200; }
         snprintf(b, sizeof b, "standing still at 1.6 ticks (13.3 ms) at 40, 1.86 at 60: at 60 for %d of the last 400 frames (r60 after a load %.2f)", at60, rl);
         check(at60 >= 380 && rl <= 1.6, b);
+    }
+    {   // DM_FPS_PREDICT off (the default) with the floor: Hyrule Field (1.8 at 40, 2.3 at 60) tries 60 after every frame that fits, never shows a frame past 40's time,
+        // and a scene that fits 60 stays there
+        sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1; m.s.up_wait = 3; m.s.up_fit = 1; m.s.down_late = 1;
+        run(&m, 120, 1.0, 2, 3, 0); run(&m, 60, 2.6, 2, 3, 0); int tries = 0, kp = m.s.k, over = 0;
+        for (int i = 0; i < 1200; i++) { run(&m, 1, m.s.k == 2 ? 2.3 : 1.8, 2, 3, 0); tries += kp == 3 && m.s.k == 2; kp = m.s.k; over += m.s.k > 3; }
+        int stay = 1; for (int i = 0; i < 400; i++) { run(&m, 1, m.s.k == 2 ? 1.5 : 1.2, 2, 3, 0); if (i >= 10) stay &= m.s.k == 2; }
+        snprintf(b, sizeof b, "floor 40, no prediction: Hyrule Field tried 60 %d times in 1,200 frames, never held past 40 (%d); a scene that fits 60 %s", tries, over, stay ? "stays at 60" : "fell back");
+        check(tries >= 100 && !over && stay, b);
     }
     {   // The frame rate changed while the game runs in ticks: 60 → 40 → 30 → 40 → 60, the page's target read at each frame as hle_nvn.c fps_step_cap does (kmin 120 / cap)
         _Alignas(8) uint8_t page[64] = {0}; nvn_fstep_target_put(page, 60); uint32_t unit = 120; memcpy(page + FSTEP_UNIT_OFF, &unit, 4);

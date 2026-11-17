@@ -72,6 +72,8 @@ typedef struct {
                               // step are then the same real time as in vsyncs (2 × FSTEP_LATE, 2 × FSTEP_DEBT_MAX, 2 × FSTEP_MAX ticks); at an even kmin (60 / 30 fps) a hold moves by whole
                               // vsyncs (2 ticks), so a 60 Hz link shows it, and at an odd one (40 fps: 3 ticks, shown only on a 120 Hz link) by one tick: 3 or 4, never 5. A payback step
                               // is one tick more than the hold (game time only: the stub's ratio is a float)
+    int predict;              // set by the caller (DM_FPS_PREDICT, default 0): with a 40 floor, scale the cost at 40 by r60 before a trial toward 60; 0 tries 60 after every frame
+                              // whose cost fits it, so above 40 each frame shows when it is ready (VRR) and at 40 and below the frames keep a 40 target's pace
     int down_late;            // set by the caller (DM_FPS_DOWN_LATE): with a 40 floor, the late frames in a row at 60 that step to 40 (0 = 3)
     double up_wait; int up_fit;   // set by the caller (DM_FPS_UP_MS): with a 40 floor, how long after the last change and after how many frames that fit 60 a trial tries 60
                               // (0 = FSTEP_HOLD0 and FSTEP_RUN)
@@ -211,7 +213,7 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     // frame in 20 over 14.2 ms, 30 fps for the rest of the scene where 60 had held; 22 ms at hold 3 under a lowered GPU clock with frames of 29–44 ms, 20 fps for 25 s)
     double fitc = s->ck == s->k && s->cn && s->ccur < cost ? s->ccur : cost;
     const int qd = s->k <= 4 ? q3 : q;   // the ticks a trial moves down by
-    if (!late) s->fit_run = s->k > kmin && fitc * (fl40 && s->k == 3 ? s->r60 : 1) <= FSTEP_FIT * (s->k - qd) ? s->fit_run + 1 : 0;
+    if (!late) s->fit_run = s->k > kmin && fitc * (fl40 && s->k == 3 && s->predict ? s->r60 : 1) <= FSTEP_FIT * (s->k - qd) ? s->fit_run + 1 : 0;
     // Below 40 (link120): back to 3 ticks after FSTEP_HOLD0 whatever the cost says, with a probe's grace for the clocks to rise; a failed return doubles the wait for the next,
     // a held one resets it. A hold the late frames of a load or of the efficiency cores raised to 30 or 20 came back to 40 only after the hold-off of the trials toward 60
     // (up to 8 s), while at a 40 target, with no hold, the next frame on time is 40 again. The trials and probes toward kmin keep their own hold-off
