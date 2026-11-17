@@ -77,7 +77,8 @@ typedef struct {
                               // (0 = FSTEP_HOLD0 and FSTEP_RUN)
     double r60, c40;          // 60 target with a 40 floor: how much a frame's cost grows from 40 to 60 (learned from the trials that failed, 1.3 to start), and the cost the last trial
                               // started from. Cost measured at 40 understates 60: in Hyrule Field frames of 1.7-1.85 ticks at 40 took 2.2-2.3 at 60, and with a 0.1 s retry
-                              // the trials failed 48 times in 47 s, 3 late frames each (34 fps). A trial now needs the cost at 40 times this to fit 60
+                              // the trials failed 48 times in 47 s, 3 late frames each (34 fps). A trial now needs the cost at 40 times this to fit 60. 1.2 to start, at
+                              // most 1.6, forgotten at 0.02 a second; a trial's first 2 frames are its grace (the frame shown at 40's time before it is not late at 60)
     int t40, fit40; double hold40;   // a return to 3 ticks (40 fps) from a longer hold is under way (link120); frames in a row whose cost fits 3 ticks; vsyncs before the next
                               // return (FSTEP_HOLD0, doubled when one fails up to 4 s; FSTEP_HOLD0 again once FSTEP_RUN frames fit)
     int link120;              // set by the caller: the screen's link runs at 120 Hz, so it shows a hold of 3 ticks. With t120 and kmin 2 the hold then moves 2 → 3 → 4 by one tick
@@ -127,7 +128,8 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     const int q = s->t120 && kmin % 2 == 0 ? 2 : 1;   // the ticks a hold moves by (t120 above)
     const int q3 = s->link120 && s->t120 && kmin == 2 ? 1 : q;   // the ticks a hold moves by up to 4 (link120 above)
     const int fl40 = s->link120 && s->t120 && kmin == 2 && kmax == 3;   // a 60 target with a 40 floor (DM_FPS_FLOOR)
-    if (fl40 && s->r60 < 1) s->r60 = 1.3;
+    if (fl40 && s->r60 < 1) s->r60 = 1.2;
+    if (fl40 && s->k == 3 && !s->trial && s->r60 > 1) { s->r60 -= 0.0005; if (s->r60 < 1) s->r60 = 1; }   // forgets slowly (0.02 a second at 40): a scene that changed gets tried again
     if (kmax > smax) kmax = smax;
     if (kmax < kmin) kmax = kmin;
     if (!s->hold) s->hold = hold0;
@@ -194,8 +196,8 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
         if (want > kmax) want = kmax;
         if (s->t40) { s->t40 = 0; s->trial = 0; s->failed++; s->hold40 = s->hold40 * 2 < 4 * hold0 ? s->hold40 * 2 : 4 * hold0; }   // the return to 40 failed: the next waits longer, 4 s at most
         else if (s->trial || s->tpend || (s->probe == 2 && s->since < hold_max)) {
-            if (fl40 && !s->probe && s->c40 > 0) {   // a trial toward 60 failed: learn how much the cost grew (r60 above); a higher ratio is taken at once, a lower one slowly
-                double r = c3 / s->c40; if (r < 1) r = 1; if (r > 2) r = 2;
+            if (fl40 && !s->probe && s->c40 > 0 && c3 <= 3) {   // a trial toward 60 failed: learn how much the cost grew (r60 above). A frame that missed even 40 is a hitch, not the
+                double r = c3 / s->c40; if (r < 1) r = 1; if (r > 1.6) r = 1.6;   // scene (a load's 2.95 after 0.65 made it 2 and nothing went to 60 again)
                 s->r60 = r > s->r60 ? r : 0.75 * s->r60 + 0.25 * r;
             }
             s->failed++; s->trial = 0; s->hold = s->hold * 2 < hold_max ? s->hold * 2 : hold_max;
@@ -220,7 +222,7 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     // A 60 target with a 40 floor (DM_FPS_FLOOR: kmax 3): a trial needs FSTEP_RUN frames whose cost fits 60, so it waits FSTEP_HOLD0 only, as the return to 40 does; the probes,
     // which try 60 without that evidence, keep the hold-off that doubles
     } else if (s->fit_run >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 && s->up_fit > 0 ? s->up_fit : FSTEP_RUN)
-               && s->since >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 ? (s->up_wait > 0 ? s->up_wait : hold0) : s->hold) && !s->trial) { if (fl40) s->c40 = fitc; s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
+               && s->since >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 ? (s->up_wait > 0 ? s->up_wait : hold0) : s->hold) && !s->trial) { if (fl40) { s->c40 = fitc; s->grace = 2; s->pa = s->pb = 0; s->plate = s->ptotal = 0; } s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
     // No probes with a 40 floor: a trial goes up as soon as a frame's cost scaled to 60 (r60) fits, and a probe, which tries 60 without that, failed 15 times in 50 s in
     // Hyrule Field with a 30-frame grace each (frames shown late that do not count)
     else if (!fl40 && (slow || nvn_fstep_same(s)) && s->k > kmin && s->since >= s->hold && !s->trial) {   // probe: straight to kmin, so the controller sees the whole deadline

@@ -671,8 +671,8 @@ int main(void) {
         sim h = {0}; h.s.t120 = 1; h.s.per_vsync = 2; h.s.link120 = 1; h.s.up_wait = 3; h.s.up_fit = 1; h.s.down_late = 1; int fails = 0, kp = 3;   // Hyrule Field: 1.8 at 40, 2.3 at 60
         run(&h, 120, 1.0, 2, 3, 0); run(&h, 60, 2.6, 2, 3, 0);
         for (int i = 0; i < 2000; i++) { run(&h, 1, h.s.k == 2 ? 2.3 : 1.8, 2, 3, 0); if (kp == 2 && h.s.k == 3) fails++; kp = h.s.k; }
-        snprintf(b, sizeof b, "  a scene at 1.8 ticks at 40 and 2.3 at 60 (Hyrule Field): %d failed tries at 60 in 2,000 frames, then it stays at 40 (r60 %.2f)", fails, h.s.r60);
-        check(fails <= 3 && h.s.k == 3, b);
+        snprintf(b, sizeof b, "  a scene at 1.8 ticks at 40 and 2.3 at 60 (Hyrule Field): %d failed tries at 60 in 2,000 frames (one every 10 s or more, 1 late frame each; r60 %.2f)", fails, h.s.r60);
+        check(fails <= 6, b);
     }
     {   // DM_FPS_DOWN_LATE=1 with the floor: the first frame that misses 60 steps to 40, and the next that fits goes back to 60
         sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1; m.s.up_wait = 3; m.s.up_fit = 1; m.s.down_late = 1;
@@ -681,6 +681,15 @@ int main(void) {
         int back = -1; for (int i = 0; i < 20 && back < 0; i++) { run(&m, 1, 1.2, 2, 3, 0); if (m.s.k == 2) back = i + 1; }
         snprintf(b, sizeof b, "floor 40, DM_FPS_DOWN_LATE=1: at 60 (k %d), one frame of 21.7 ms → 40 (k %d), back at 60 %d frame(s) later", k60, kdown, back);
         check(k60 == 2 && kdown == 3 && back > 0 && back <= 2, b);
+    }
+    {   // Standing still at 13.3 ms (1.6 ticks) at 40, 15.5 ms at 60: tried after the ratio is forgotten down to 1.19, then holds 60; a load's hitch does not teach the ratio
+        sim m = {0}; m.s.t120 = 1; m.s.per_vsync = 2; m.s.link120 = 1; m.s.up_wait = 3; m.s.up_fit = 1; m.s.down_late = 1;
+        run(&m, 120, 1.0, 2, 3, 0); run(&m, 60, 2.6, 2, 3, 0);
+        for (int i = 0; i < 40; i++) run(&m, 1, m.s.k == 2 ? 3.4 : 0.7, 2, 3, 0);   // a load: hitches at 60
+        double rl = m.s.r60; int at60 = 0;
+        for (int i = 0; i < 1600; i++) { run(&m, 1, m.s.k == 2 ? 1.86 : 1.6, 2, 3, 0); at60 += m.s.k == 2 && i >= 1200; }
+        snprintf(b, sizeof b, "standing still at 1.6 ticks (13.3 ms) at 40, 1.86 at 60: at 60 for %d of the last 400 frames (r60 after a load %.2f)", at60, rl);
+        check(at60 >= 380 && rl <= 1.6, b);
     }
     {   // The frame rate changed while the game runs in ticks: 60 → 40 → 30 → 40 → 60, the page's target read at each frame as hle_nvn.c fps_step_cap does (kmin 120 / cap)
         _Alignas(8) uint8_t page[64] = {0}; nvn_fstep_target_put(page, 60); uint32_t unit = 120; memcpy(page + FSTEP_UNIT_OFF, &unit, 4);
