@@ -30,7 +30,10 @@ zip_store	.zs:.bwav:.webm:.metallib
 # 256 MB + 8 GB alias + 256 MB stack + 8 GB heap. Guest memory is in files on the iPhone, so pages mapped and not touched cost nothing
 mem_reserve	0x420000000
 mem_alias	0x200000000
-mem_map_limit	off
+mem_map_limit	on
+# mem_map_limit on with 1 GB of room past the pool (v4): with no limit (cheemu21's L6.1 above) the time skip played, but in a 21-minute run the game's mapped memory grew
+# to 6.77 GB (it keeps freed pages mapped while maps succeed) and the iPhone ran out of memory in Hyrule Field. The time skip needs 3.28 GB mapped; the pool leaves 2.74 GB
+mem_map_room	0x40000000
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x3000000

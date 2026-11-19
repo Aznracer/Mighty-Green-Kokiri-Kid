@@ -377,6 +377,17 @@ static _Atomic int64_t g_alias_mapped;   // bytes mapped in the alias region (pa
 // SetHeapSize charged the rewritten modules' size instead (their patch areas and key pages included), which GetInfo never reported: a game whose modules were larger than mem_used was
 // refused the heap the host had just offered (ResultLimitReached; MIO: Memories in Orbit, 68 MB of modules against the default 64 MB, aborted in nninitStartup, GitHub issue #941).
 // mem_used only sets what the game sees (its heap size, as on hardware); the host's own module copies (patch areas, key pages) are not the Switch's to count
+// The room maps get past the application pool (profile mem_map_room; DM_MAP_ROOM_MB=<MB> overrides, read once)
+static int64_t map_room(void) {
+    static _Atomic int64_t v = -1;
+    int64_t r = atomic_load(&v);
+    if (r < 0) {
+        const char *e = getenv("DM_MAP_ROOM_MB");
+        r = e && *e ? (int64_t)strtoull(e, NULL, 10) << 20 : (int64_t)DM_GAME_MEM_MAP_ROOM;
+        if (atomic_exchange(&v, r) < 0 && r && DM_GAME_MEM_MAP_LIMIT) LOG("[mem] maps may go %.2f GB past the application pool (%s)", r / 1073741824.0, e && *e ? "DM_MAP_ROOM_MB" : "profile mem_map_room");
+    }
+    return r;
+}
 static uint64_t used_beside_heap(void) { return (uint64_t)DM_GAME_MEM_USED + big_bss_bytes() + (DM_GAME_MEM_MAP_LIMIT ? (uint64_t)atomic_load(&g_alias_mapped) : 0); }
 
 // For memory accounting (memstat.m): the range of the whole guest address space block (base = NULL when not initialized)
@@ -988,6 +999,9 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
         if (DM_GAME_MEM_MAP_LIMIT && num == 0x2C) {
             int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + used_beside_heap());   // used_beside_heap holds the mapped pages with mem_map_limit
+            // Profile mem_map_room / DM_MAP_ROOM_MB: maps may go that far past the pool before they are refused (heap growth and GetInfo are not changed). Ocarina of Time sizes its heap to the
+            // pool and needs 3.3 GB mapped at the time skip after the Master Sword, past what the pool leaves (2.74 GB); with no limit at all its mapped total grew to 6.8 GB in 21 minutes
+            room += map_room();
             if (need && need > room) {
                 pthread_mutex_unlock(&g_map_lock);
                 static _Atomic int nref; if (atomic_fetch_add(&nref, 1) < 8) LOG("[mem] MapPhysicalMemory +%#zx refused: %.2f GB mapped, the application pool is full (ResultLimitReached, the SDK frees cached pages and retries)",
