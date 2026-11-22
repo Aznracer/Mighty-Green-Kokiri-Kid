@@ -789,10 +789,11 @@ void front_save_failed(int err) {
     });
 }
 
-// Audio session: the frames RemoteIO asks for in each callback follow the I/O buffer duration, about 21 ms by default on iOS (1024 frames at 48 kHz). The game keeps only 4 blocks × 5 ms = 20 ms in flight,
+// Audio session: the frames RemoteIO asks for in each callback follow the I/O buffer duration, about 21 ms by default on iOS (1024 frames at 48 kHz). The renderer then kept only 4 blocks × 5 ms = 20 ms in flight,
 // so every callback came up 1.3 ms short and was zero-filled, about 47 gaps per second (crackling; reproducible on the Mac by forcing 1024-frame callbacks: 1999 underruns in 2000 callbacks). Ask for 5 ms and the system picks the nearest it supports;
 // The category is Playback, or PlayAndRecord while a microphone stream is active:
 // the ring / silent switch does not mute it, and it still interrupts other apps' audio.
+// Bluetooth A2DP still asks 256 frames (5.33 ms), so hle_audio.c gives that route eight blocks of headroom instead (dm_pcmout_blocks).
 // Set once at boot and again on return to the foreground (the system may reset it after an interruption)
 static int g_session_off;   // the last activation failed (another app or a call still held the session): tried again when the app becomes active
 static _Atomic int g_mic_on;   // a game's audio input stream runs (hle_audio.c au_in_start, PR #2925): PlayAndRecord, so RemoteIO's input gets the microphone
@@ -818,6 +819,12 @@ void front_ios_audio_session(void) {
 }
 // The channels the route takes now (hle_audio.c decides the output from it: six only when the session has six)
 int dm_ios_output_channels(void) { return (int)AVAudioSession.sharedInstance.outputNumberOfChannels; }
+// Frames per RemoteIO callback the session grants now: 240 on the speakers, 256 on Bluetooth (A2DP's packet size, which the
+// 5 ms preference cannot lower). hle_audio.c sizes the renderer's headroom from it.
+int dm_ios_audio_frames(void) {
+    AVAudioSession *s = AVAudioSession.sharedInstance;
+    return (int)(s.IOBufferDuration * s.sampleRate + 0.5);
+}
 
 // The microphone for a game's audio input stream (hle_audio.c, PR #2925: Ocarina of Time's microphone ocarina). Off unless DM_MIC=1: the app that runs us (LiveContainer)
 // must carry NSMicrophoneUsageDescription, or iOS ends the process at the first use. Returns 1 when the microphone may be used now: permission granted, the session moved to
