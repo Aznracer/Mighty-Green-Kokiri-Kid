@@ -519,7 +519,7 @@ static NSString *sensors_line(void) {
     if (isfinite(vin) && isfinite(iin) && iin > 0.02 && vin > 1) power = [NSString stringWithFormat:@"⚡ in %.1f W", vin * iin];
     else if (isfinite(vw) && vw > 5) power = [NSString stringWithFormat:@"⚡ wireless %.1f V", vw];   // native_oot2.py: no readable wireless input current, so its voltage
     else power = @"⚡ no input";
-    if (isfinite(vb) && isfinite(ib) && (ib > 0.02 || ![power isEqualToString:@"⚡ no input"])) power = [power stringByAppendingFormat:@" · into battery %.1f W", vb * MAX(ib, 0)];   // plugged in: shown even at 0
+    if (isfinite(vb) && isfinite(ib) && (ib > 0.02 || ![power isEqualToString:@"⚡ no input"])) power = [power stringByAppendingFormat:@" · ➡️🔋 %.1f W", vb * MAX(ib, 0)];   // plugged in: shown even at 0
     double bw = g_bat_w_n ? g_bat_w_sum / g_bat_w_n : NAN; g_bat_w_sum = 0; g_bat_w_n = 0;   // counter_power.py
     if ([power isEqualToString:@"⚡ no input"]) power = isfinite(bw) && bw < 0 ? [NSString stringWithFormat:@"⚡ on battery · draw %.1f W", -bw] : @"⚡ on battery";   // iOS has no readable discharge sensor
     return [NSString stringWithFormat:@"%@\n%@", temps, power];
@@ -555,6 +555,7 @@ static UILabel *front_ios_fps_label(void) {
     l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.45]; l.layer.cornerRadius = 6; l.layer.masksToBounds = YES; l.userInteractionEnabled = NO;
     UIDevice.currentDevice.batteryMonitoringEnabled = YES;
     static NSString *const thermal[] = {@"Nominal", @"Fair", @"Serious", @"Critical"};
+    static NSString *const thermal_face[] = {@"😎", @"🙂", @"🥵", @"🔥"};   // the counter shows the thermal state as a face: nominal, fair, serious, critical (the log keeps the words)
     __block battery_fall_t bat; battery_fall_reset(&bat);
     __block uint64_t n0 = mtl_present_count(); __block double t0 = CACurrentMediaTime(); __block NSString *fps = @"--";
     void (^update)(void) = ^{
@@ -563,7 +564,7 @@ static UILabel *front_ios_fps_label(void) {
         n0 = n; t0 = now;
         int th = dm_thermal_now();
         static int last_th = -1; if (th != last_th) { LOG("front end: thermal state %d (%s)", th, thermal[th >= 0 && th <= 3 ? th : 0].UTF8String); last_th = th; }
-        NSString *text = [NSString stringWithFormat:@"%@ fps · 🌡 %@%@\n%@", fps, thermal[th >= 0 && th <= 3 ? th : 0], dm_thermal_capped() ? @" · ❄ 30 cap" : @"", battery_line(&bat, now)];   // counter_power.py
+        NSString *text = [NSString stringWithFormat:@"%@ fps · %@%@\n%@", fps, thermal_face[th >= 0 && th <= 3 ? th : 0], dm_thermal_capped() ? @" · ❄ 30 cap" : @"", battery_line(&bat, now)];   // counter_power.py
         if (g_sensor_line) text = [text stringByAppendingFormat:@"\n%@", g_sensor_line];   // sensors_hud.py
         if (fps_wide()) {   // hud2.py: two lines, frame rate and battery, then temperatures and power
             NSArray<NSString *> *p = [text componentsSeparatedByString:@"\n"];
