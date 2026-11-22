@@ -130,6 +130,9 @@ Finding, keying and translating shaders (`dm/gfx/tools/shader_split.py`, `dmsh_b
 - **Found on:** Oceanhorn: Monster of Uncharted Seas (`01007D7001D0E000` 1.0.1, no profile in the repository; originally reported in [PR #2906](https://github.com/seedds/nxnative/pull/2906)): `data.vfs` (172.6 MB, 1,041 indexed entries) yields 362 GLSLC records (172 unique shaders: 57 vertex, 115 pixel) in ~180 ms via `mmap`, matching a full-file zlib scan with zero `[RED]` lines.
 - **Check:** `dm/tools/tests/test_split_vfs2.py` covers mode 0 (raw), mode 1 (bitwise-inverted), and mode 2 (zlib) entries, nested directory paths, nameless (`names_off = 0`) containers via `scan_file` (`mmap`), and fail-loud `[RED]` rejection on truncated headers, oversized counts, out-of-range offsets, corrupt zlib, length mismatches, inflated-size bombs, unsupported modes, and parent cycles; fuzz seed `vfs2` in `dm/tools/fuzz/fuzz_shader_split.py`.
 
+- **Found on:** The Legend of Heroes: Trails into Reverie (`01008CB0156BC000`, NISA v1.0.4 / `v262144`, provisional profile): 8.09 GB `data/asset/nx/assets.pka` (14,915 virtual `.pkg`s, 83,768 unique zstd blobs, 5,710 `.fx*.phyre`) and 213 loose `.pkg` files yield 58,567 unique shaders (44,189 pixel, 14,378 vertex, 14,378 variation pairs, 0 `[RED]`/`[WARN]`) in 9.5 s on Mac, against a stall/0 before.
+- **Check:** `dm/tools/tests/test_split_falcom.py` tests stored/LZ4/zstd `.pkg` entries, `RYHP` GLSLC fallback, `.pka` SHA-256 deduplication inside a `RomFS.img`, non-pkg fallback, O(1) rejection on large bogus counts, LZ4 bomb pre-check, unknown-flag `[WARN]`, and corrupt `.pkg`/`.pka` red lines.
+
 ### Diablo III's console packages
 
 - **Symptom:** the split finds no shaders (`[RED] the shader split found no shaders in main or the RomFS`), the RomFS holds only `.cpk` files, and `cpk.py` refuses them (`not a CPK`); the run prints `[RED] shader … is not in the shader map` for every program.
