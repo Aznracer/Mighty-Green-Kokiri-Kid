@@ -574,7 +574,7 @@ static int mem_hot(void) {
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (at && now - at < 500000000ull) return atomic_load_explicit(&g_mem_hot, memory_order_relaxed);
     at = now;
-    if (cfg.high_mb < 0) { const char *h = getenv("DM_NVN_MEM_HIGH_MB"), *r = getenv("DM_NVN_MEM_ROOM_MB"); cfg.high_mb = h && *h ? atoll(h) : 0; cfg.room_mb = r && *r ? atoll(r) : 3000;
+    if (cfg.high_mb < 0) { const char *h = getenv("DM_NVN_MEM_HIGH_MB"), *r = getenv("DM_NVN_MEM_ROOM_MB"); cfg.high_mb = h && *h ? atoll(h) : 0; cfg.room_mb = r && *r ? atoll(r) : 1200;   // v8: 1200 (cheemu21: 3000): the iPhone Duo plays with 1.6-1.9 GB of room in heavy areas, where 3000 kept the mode on for good and freed 481 of 625 recycled heaps unused (2026-11-22)
         MLOG("memory pressure mode: from a %lld MB footprint (DM_NVN_MEM_HIGH_MB, 0 = not by footprint) or under %lld MB of room to the iOS limit (DM_NVN_MEM_ROOM_MB, 0 = not by room)", (long long)cfg.high_mb, (long long)cfg.room_mb); }
     task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT; int64_t fp = 0, room = -1;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) fp = (int64_t)(vi.phys_footprint >> 20);
@@ -11443,7 +11443,11 @@ static id<MTLRenderPipelineState> pso_build_ex(MTLRenderPipelineDescriptor *d, i
 static id<MTLRenderPipelineState> pso_build(MTLRenderPipelineDescriptor *d, int off, NSError **e) { return pso_build_ex(d, off, e, 1); }   // off: !pso_key.border of the key d was made from
 // Pipeline key: current state S + pass formats (normal pass; a merged pass additionally carries lmap / specialized function, filled in by pso_get)
 // The FN_OFF_* mask a pipeline of key k is built with (fn_off): without the border corrections when no bound sampler has a twin, without the blend fix-up when its words are both 0
-static inline int pso_off(const pso_key *k) { return (k->border ? 0 : FN_OFF_BORDER) | (k->blend_live ? 0 : FN_OFF_BLEND); }
+// DM_NVN_BLEND_SPEC (v8, Mighty Green Kokiri Kid; default 0 here): 1 specializes the blend fix-up away per pipeline (#3176, 2-6 % of the hottest pixel shaders on an M2). It splits
+// every pipeline whose draw has nonzero blend words from the one its prewarm row builds (rows carry blend_live 0), and on the iPhone Duo each such draw then waited for its pipeline
+// at play: 14.1 s of waits in 300 frames with 117 draws (2026-11-22). Off, every pipeline keeps the fix-up as before #3176, so the prewarm rows and the user's list match again
+static int blend_spec_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_BLEND_SPEC"); v = e && *e ? atoi(e) != 0 : 0; MLOG("blend fix-up specialization: %s (DM_NVN_BLEND_SPEC)", v ? "on, per pipeline" : "off, every pipeline keeps it, as its prewarm row builds it"); } return v; }
+static inline int pso_off(const pso_key *k) { return (k->border ? 0 : FN_OFF_BORDER) | (k->blend_live || !blend_spec_on() ? 0 : FN_OFF_BLEND); }
 static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t cfmt[8], uint32_t dfmt, uint32_t sfmt, uint32_t samples, int lmap) {
     memset(k, 0, sizeof *k);
     k->vs = (__bridge void *)vs; k->fs = (__bridge void *)fs;
@@ -11452,7 +11456,7 @@ static void pso_key_fill(pso_key *k, NvShader *vs, NvShader *fs, const uint32_t 
     for (int i = 0; i < 8; i++) if (k->cfmt[i] || lmap) k->blend[i] = S.blend[i];
     k->logic = lop_key(k, fs, lmap);
     k->border = border_need(vs, vs->stage) || border_need(fs, 1);   // as prog_border, which the draw compares
-    k->blend_live = fs && fs->has_bz && (bz_word(g_pso_lmap) | rop_word(g_pso_lmap)) != 0;   // the words bz_bind binds for this draw (draw_ passes its copy of g_pso_lmap) (T-126 v2): both 0 → the fix-up specialized away (FN_OFF_BLEND)
+    k->blend_live = blend_spec_on() && fs && fs->has_bz && (bz_word(g_pso_lmap) | rop_word(g_pso_lmap)) != 0;   // DM_NVN_BLEND_SPEC=0: 0 in every key, as in the prewarm rows. The words bz_bind binds for this draw (draw_ passes its copy of g_pso_lmap) (T-126 v2): both 0 → the fix-up specialized away (FN_OFF_BLEND)
     const nvn_refl *rf = &vs->rf;
     for (int v = 0; v < rf->nv; v++) { int a = rf->v[v].nvn; if (a < 32 && a < S.nattr) { if (a < 16) k->attr[a] = S.attr[a]; else k->attr_hi[a - 16] = S.attr[a]; int st = S.attr[a].stream; if (st < 16) k->stream[st] = S.stream[st]; } }
     pso_key_norm(k, lmap);
@@ -11773,7 +11777,7 @@ static MTL4FunctionDescriptor *pre_fn(id<MTLLibrary> lib, NSString *name) {   //
     if (!f.functionConstantsDictionary.count) return ld;
     MTLFunctionConstantValues *cv = [MTLFunctionConstantValues new];
     if (f.functionConstantsDictionary[@"dm_border_off"]) { BOOL yes = YES; [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BORDER_FC]; }
-    if (f.functionConstantsDictionary[@"dm_blend_off"]) { BOOL yes = YES; [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BLEND_OFF_FC]; }   // and the blend fix-up (FN_OFF_BLEND), as most draws
+    if (blend_spec_on() && f.functionConstantsDictionary[@"dm_blend_off"]) { BOOL yes = YES; [cv setConstantValue:&yes type:MTLDataTypeBool atIndex:DMSH_BLEND_OFF_FC]; }   // and the blend fix-up (FN_OFF_BLEND), as most draws
     MTL4SpecializedFunctionDescriptor *sd = [MTL4SpecializedFunctionDescriptor new]; sd.functionDescriptor = ld; sd.constantValues = cv; return sd;
 }
 static NSDictionary *pre_json(NSString *key) { NSData *d = msl_data([NSString stringWithFormat:@"%@/%@_b.json", g_msl_dir, key]); return d ? [NSJSONSerialization JSONObjectWithData:d options:0 error:nil] : nil; }
@@ -19171,7 +19175,22 @@ void mtl_present_screen(uint32_t w, uint32_t h) { atomic_store(&g_screen_shape, 
 // The picture's shape: the presented rectangle (the window crop where the game set one, else the whole texture) when it has the screen's shape (DM_SCREEN_ASPECT), else the
 // layer's. A game drawing the taller screen into part of its 16:9 window texture (Ocarina of Time: 1920x1344 of 2560x1440) has the screen's shape in its crop alone; frame
 // generation's snapshots are the crop already, and without them the whole texture's 16:9 put bars above and below (iPhone Duo, 2026-11-16)
-static void present_shape(id<MTLTexture> src, const int crop[4], double *w, double *h) {
+// v8 (iPhone Duo, 2026-11-22): Ocarina of Time's screen-shape stubs (#3037) draw the picture at 1920 x oh into a window texture of the screen's shape (2560 x oh*4/3: 2560x1792 at
+// 1.43) and leave the window crop at 1920x1080, so the crop alone was shown, in a 16:9 box. A 16:9 crop at the texture's origin, in a texture of the screen's shape, is taken at the
+// screen's shape: its width, and the height the texture's shape gives it (1920x1344). Every consumer of the crop (the present, its shape, frame generation's snapshots) goes through it
+static const int *crop_screen(id<MTLTexture> src, const int crop[4], int out[4]) {
+    uint64_t v = atomic_load(&g_screen_shape);
+    if (!v || !crop || crop[0] || crop[1] || crop[2] <= 0 || crop[3] <= 0 || !src.width || !src.height) return crop;
+    double sr = (double)(uint32_t)v / (double)(v >> 32), tr = (double)src.width / src.height;
+    if (fabs(tr / sr - 1) >= 0.01 || fabs(((double)crop[2] / crop[3]) / (16.0 / 9.0) - 1) >= 0.01) return crop;
+    long h = lround((double)crop[2] * src.height / src.width);
+    if (h <= crop[3] || (NSUInteger)h > src.height || (NSUInteger)crop[2] > src.width) return crop;
+    static int logged; if (!logged) { logged = 1; MLOG("present: the window crop %dx%d taken at the screen's shape, %dx%ld (a texture %lux%lu of that shape: the screen-shape stubs draw there)",
+                                                       crop[2], crop[3], crop[2], h, (unsigned long)src.width, (unsigned long)src.height); }
+    out[0] = 0; out[1] = 0; out[2] = crop[2]; out[3] = (int)h; return out;
+}
+static void present_shape(id<MTLTexture> src, const int crop_in[4], double *w, double *h) {
+    int cs[4]; const int *crop = crop_screen(src, crop_in, cs);
     double sw = src.width, sh = src.height;
     if (crop && crop[2] > 0 && crop[3] > 0 && (uint64_t)crop[0] + crop[2] <= src.width && (uint64_t)crop[1] + crop[3] <= src.height) { sw = crop[2]; sh = crop[3]; }
     uint64_t v = atomic_load(&g_screen_shape);
@@ -19181,7 +19200,8 @@ static void present_shape(id<MTLTexture> src, const int crop[4], double *w, doub
 }
 static MTLViewport present_fit(id<MTLTexture> src, const int crop[4], double dw, double dh) { double w, h; present_shape(src, crop, &w, &h); return present_viewport(w, h, dw, dh); }
 // The valid source rectangle of a present (x, y, width, height; the crop of nvnWindowSetCrop, zero = the whole texture); 0 when it lies outside the texture
-static int present_crop_rect(id<MTLTexture> src, const int crop[4], NSUInteger r[4]) {
+static int present_crop_rect(id<MTLTexture> src, const int crop_in[4], NSUInteger r[4]) {
+    int cs[4]; const int *crop = crop_screen(src, crop_in, cs);
     r[0] = 0; r[1] = 0; r[2] = src.width; r[3] = src.height;
     if (!crop || !(crop[2] || crop[3])) return 1;
     if (crop[0] < 0 || crop[1] < 0 || crop[2] <= 0 || crop[3] <= 0 ||
