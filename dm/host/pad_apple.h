@@ -28,7 +28,10 @@ static inline uint64_t dm_pad_face(GCExtendedGamepad *g) {
 static inline uint64_t dm_pad_buttons(GCExtendedGamepad *g) {
     uint64_t m = dm_pad_face(g);
     #define K(btn, bit) if (btn.isPressed) m |= (bit)
-    K(g.leftShoulder, DM_BTN_L); K(g.rightShoulder, DM_BTN_R); K(g.leftTrigger, DM_BTN_ZL); K(g.rightTrigger, DM_BTN_ZR);
+    K(g.leftShoulder, DM_BTN_L); K(g.rightShoulder, DM_BTN_R);
+    // Work around nonzero resting values (Xbox LT about 0.06 with isPressed true): digital Switch triggers actuate above 25% (PR #2504).
+    if (g.leftTrigger.value > 0.25f) m |= DM_BTN_ZL;
+    if (g.rightTrigger.value > 0.25f) m |= DM_BTN_ZR;
     K(g.buttonMenu, DM_BTN_PLUS); K(g.buttonOptions, DM_BTN_MINUS); K(g.leftThumbstickButton, DM_BTN_LS); K(g.rightThumbstickButton, DM_BTN_RS);   // nil on pads without them: not pressed
     K(g.dpad.left, DM_BTN_LEFT); K(g.dpad.up, DM_BTN_UP); K(g.dpad.right, DM_BTN_RIGHT); K(g.dpad.down, DM_BTN_DOWN);
     #undef K

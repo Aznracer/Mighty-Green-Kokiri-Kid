@@ -75,7 +75,7 @@ class LauncherSettingsTests(unittest.TestCase):
     def test_iphone_switches_only_on_the_iphone(self):   # the frame-rate counter and touch feedback are the iOS front end's (front_ios.m, DmGamepad.m)
         ios, mac = build(BOTW, 'nvn'), build(BOTW, 'nvn', 'mac')
         self.assertEqual(build(BOTW, 'nvn', 'ios').keys(), ios.keys())   # ios when unset
-        self.assertEqual(set(ios) - set(mac), {'DM_SHOW_FPS', 'DM_TOUCH_HAPTICS', 'DM_PICTURE_FIT'})
+        self.assertEqual(set(ios) - set(mac), {'DM_SHOW_FPS', 'DM_TOUCH_HAPTICS', 'DM_PICTURE_FIT', 'DM_PAD_THEME', 'DM_TOUCH_FPS', 'DM_PLAY_STYLE'})
         self.assertIn('DM_RUMBLE', mac); self.assertIn('DM_METAL_HUD', mac)
         self.assertEqual(set(mac) - set(ios), {'DM_FULLSCREEN', 'DM_SW2'})   # the Mac window's Display mode (front_mac.m reads 1 or 0); Switch 2 controllers (pad_switch2_apple.m, wired on the Mac only)
         s = mac['DM_FULLSCREEN']
@@ -93,6 +93,18 @@ class LauncherSettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, 'SETTINGS_PLATFORM must be ios or mac'):
             build(WONDER, 'nvn', 'mca')
 
+    def test_picture_shape_requires_the_rewriter_capability(self):
+        games = ('0400486024DEC000', BOTW, '01006F8002326000')
+        for gid in games:
+            self.assertNotIn('DM_SCREEN_ASPECT', build(gid, 'nvn'))
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {'GFXAPI': 'nvn', 'SETTINGS_PLATFORM': 'ios'}):
+            (Path(tmp) / 'main.fixups.tsv').write_text('# SCREEN_ASPECT\t1\n', encoding='utf-8')
+            for gid in games:
+                with self.subTest(gid=gid):
+                    rows = settings.build(gid, tmp, Path(tmp) / 'control.nacp')['settings']
+                    shape = next(row for row in rows if row['env'] == 'DM_SCREEN_ASPECT')
+                    self.assertEqual(shape['default'], 'auto')
+
     def test_malformed_platform_defaults_are_rejected(self):
         for default in ('1|', '|0', '1|0|1'):
             with self.subTest(default=default), tempfile.TemporaryDirectory() as tmp:
@@ -108,7 +120,7 @@ class LauncherSettingsTests(unittest.TestCase):
             listed = settings.build(BOTW, tmp, Path(tmp) / 'control.nacp')
         rows = {s['env']: s for s in listed['settings']}
         self.assertEqual(listed['schema'], 1)
-        self.assertEqual([e for e, s in rows.items() if s.get('level') == 'basic'], ['DM_FPS_TARGET', 'DM_RENDER_SCALE', 'DM_OPMODE', 'DM_LANG', 'DM_RUMBLE'])
+        self.assertEqual([e for e, s in rows.items() if s.get('level') == 'basic'], ['DM_FPS_TARGET', 'DM_RENDER_SCALE', 'DM_OPMODE', 'DM_LANG', 'DM_PLAY_STYLE', 'DM_TOUCH_FPS', 'DM_RUMBLE'])
         self.assertEqual(rows['DM_RUMBLE_GAIN']['needs'], 'DM_RUMBLE=1')
         self.assertFalse({'level', 'needs'} & set(rows['DM_METAL_HUD']), 'a row without meta has no optional fields')
 

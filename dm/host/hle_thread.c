@@ -18,11 +18,9 @@
 #include <time.h>
 #include <mach/mach.h>
 #include <mach/thread_switch.h>   // thread_switch, SWITCH_OPTION_NONE (DM_YIELD_SWITCH)
-#include <mach/mach_time.h>
 #include <pthread/qos.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
-#include <os/os_sync_wait_on_address.h>
 
 #define R_TIMEOUT     0xEA01u   // Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -33,7 +31,7 @@
 #define WAITERS_BIT   0x40000000u
 #define H_CUR_THREAD  0xFFFF8000u
 
-enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W };
+enum { O_FREE, O_THREAD, O_EVENT_R, O_EVENT_W, O_READONLY_SHMEM, O_TRANSFER_MEMORY };
 enum { MAX_SYNC_OBJECTS = 64 };
 typedef struct { void *obj; int type; } sync_ref_t;
 // Service-layer SystemEvent bindings (see hle_bind_system_event): guest SystemEventType address → the write-end handle of its kernel event.
@@ -66,20 +64,19 @@ typedef struct thr {
     int yield_pending;         // this caller woke a higher-priority thread pinned to its core: hand off before returning to guest code
     _Atomic uint64_t hand_epoch;   // this thread's current handoff: threads it makes runnable belong to it until its next thread SVC returns (svc_thread)
     struct thr *start_by; uint64_t start_epoch;   // the lower-priority thread on this core whose StartThread holds for this thread, and that handoff (dm_thread_service_request)
+    pthread_cond_t hcv; int hwait, hcv_init;   // this thread's handoff wait, initialized on first use (G held)
     struct { struct thr *by; uint64_t epoch; } hand[4]; int nhand;   // the handoffs this thread was made runnable for (its waker's, then those the waker belonged to), until it blocks (note_runnable / hand_leave)
     _Atomic int *host_work;    // points at the thread's dm_host_work (registered when the thread starts)
     int native_wait;          // nesting depth of a blocking native HLE wait (G held)
     int host_owned;            // a guest thread the host created itself (dm_guest_thread_spawn): it waits in host code and is not one of the game's threads
     uint64_t wseq;             // Sequence number of wait registration: at equal priority first come, first woken (same order as the Horizon kernel's KThread wait tree)
     struct thr *next;          // Wait chain
-    struct thr *wprev, *bnext, *bprev; int bkt1;   // previous in the wait chain; the waiters of the same bucket (wb_slot) and its index + 1 (0: in none)
     struct thr *all;           // All-threads chain (for the state dump)
     int last_svc; uint64_t last_lr;
     int closed, refs;           // Reclaim only after handle close, thread exit and the last reference: synchronization waits and a pause in progress (thr_put)
     uint64_t nsvc;             // SVC count (for the state dump)
     uint64_t nyield, nyield_seen, nbackoff, nbackoff_seen;   // Yields (SleepThread 0/-1/-2) and those the back-off turned into short sleeps, with both counts at the last power report (dm_yield_top)
     uint64_t nclkyield, nclkyield_seen;       // Yields of clock waits (thr_yield), and their count at the last power report
-    uint64_t npsleep, npsleep_seen; int64_t psleep_ns;   // Short guest sleeps (poll_sleep), their count at the last power report, and the length the last one asked for
     uint64_t nspin, nspin_seen, spin_site; const char *spin_mod;   // Spin wait passes (dm_spin_wait; those that yield count in nyield too) and where the last one was
     uint64_t srun_svc, srun_t0, spin_ret;     // Current spin wait: nsvc at its passes, when it began, when the last pass returned
     uint64_t cpu_seen_us;                     // CPU time (µs) at the last power report (dm_thread_cpu)
@@ -101,7 +98,6 @@ typedef struct thr {
     int ctx_ok; uint64_t ctx_x[29], ctx_fp, ctx_lr, ctx_sp, ctx_pc; uint32_t ctx_pstate, ctx_fpcr, ctx_fpsr; __uint128_t ctx_v[32];
     pthread_cond_t pcv;
     _Atomic int sig_pend;   // wakes of this thread signalled after G is let go and not signalled yet (g_unlock): thr_free waits for them
-    _Atomic uint32_t wword; _Atomic int wmode;   // block's wait on an address (DM_WAIT_ON_ADDRESS): the word each wake bumps, and 1 while the thread waits on it instead of cv (thr_kick)
 } thr_t;
 static thr_t *g_all;
 extern __thread _Atomic int dm_host_work;   // declared in hle.h too; defined in hle_nvn.c
@@ -117,64 +113,22 @@ static pthread_mutex_t G = PTHREAD_MUTEX_INITIALIZER;
 enum { WDEF = 8 };
 static __thread struct thr *t_wdef[WDEF]; static __thread int t_nwdef;
 static int g_wake_unlocked = 1;
-static _Atomic uint64_t g_wao_idle;   // address wakes that found no thread asleep on the word (thread lock line)
-// Wake t from its current wait: block's wait on t->wword when wmode says so (set under G before each wait, so a waker that set woke under G after it reads the current wait's mode
-// or a later wait's, whose wake is spurious), else its condition variable
-static inline void thr_kick(struct thr *t) {
-    if (atomic_load_explicit(&t->wmode, memory_order_relaxed)) {
-        atomic_fetch_add_explicit(&t->wword, 1, memory_order_release);
-        if (os_sync_wake_by_address_any((void *)&t->wword, sizeof t->wword, OS_SYNC_WAKE_BY_ADDRESS_NONE) < 0) atomic_fetch_add_explicit(&g_wao_idle, 1, memory_order_relaxed);
-    } else pthread_cond_signal(&t->cv);
-}
-static inline void wake_signal(struct thr *t) { thr_kick(t); atomic_fetch_sub_explicit(&t->sig_pend, 1, memory_order_release); }
-// A thread that finds G taken first waits up to G_SPIN_NS for it in user mode, reading g_held (a hint: the lock word stays pthread's), before it sleeps in the kernel: Darwin's
-// mutex does not spin, and G is held for short stretches by every thread SVC, so a busy G sent the taker to sleep (__psynch_mutexwait) and its holder into the kernel to wake it
-// (__psynch_mutexdrop). No thread spins while another sleeps in the kernel for G (g_sleepers): a woken sleeper needs microseconds to run again, and spinners took G at every
-// release before it did (t_wait_word, with a thread taking G in a loop beside two threads handing a word back and forth: 20,000 hand-offs in 1,989 ms, 307 ms without the
-// spin, 332 ms with this rule); newcomers queue behind a sleeper as before. DM_G_SPIN=0 sleeps at once as before (ab: alternates with the DM_AB phases). Counts under G:
-// acquisitions, those that found G taken, those a spin got
-enum { G_SPIN_NS = 4000 };
-static _Atomic int g_held, g_sleepers;
-static uint64_t g_lock_n, g_lock_busy, g_lock_spun;
-__attribute__((weak)) int mtl_sw_mode(const char *name, int dflt);
-__attribute__((weak)) int mtl_sw_on(int m);
-static int g_gspin; static uint64_t g_gspin_ticks; static pthread_once_t g_gspin_once = PTHREAD_ONCE_INIT;
-static void gspin_init(void) { g_gspin = mtl_sw_mode("DM_G_SPIN", 1); mach_timebase_info_data_t tb; mach_timebase_info(&tb); g_gspin_ticks = (uint64_t)G_SPIN_NS * tb.denom / tb.numer; }
-static __attribute__((noinline)) int g_spin(void) {
-    pthread_once(&g_gspin_once, gspin_init);
-    if (!mtl_sw_on(g_gspin)) return 0;
-    uint64_t t0 = mach_absolute_time();
-    for (;;) {
-        for (int i = 0; i < 16; i++) {
-            if (atomic_load_explicit(&g_sleepers, memory_order_relaxed)) return 0;
-            if (!atomic_load_explicit(&g_held, memory_order_relaxed) && !pthread_mutex_trylock(&G)) return 1;
-            __asm__ volatile("isb" ::: "memory");
-        }
-        if (mach_absolute_time() - t0 > g_gspin_ticks) return 0;
-    }
-}
+static inline void wake_signal(struct thr *t) { pthread_cond_signal(&t->cv); atomic_fetch_sub_explicit(&t->sig_pend, 1, memory_order_release); }
 static inline void g_lock(void) {
-    int busy = pthread_mutex_trylock(&G) != 0, spun = busy && g_spin();
-    if (busy && !spun) { atomic_fetch_add_explicit(&g_sleepers, 1, memory_order_relaxed); pthread_mutex_lock(&G); atomic_fetch_sub_explicit(&g_sleepers, 1, memory_order_relaxed); }
-    atomic_store_explicit(&g_held, 1, memory_order_relaxed);
-    g_lock_n++; g_lock_busy += (uint64_t)busy; g_lock_spun += (uint64_t)spun;
+    pthread_mutex_lock(&G);
     if (t_nwdef) die("thread lock: %d wakes still queued from an earlier hold (G let go without g_unlock)", t_nwdef);
 }
 static inline void g_unlock(void) {
     int n = t_nwdef; struct thr *d[WDEF];
     for (int i = 0; i < n; i++) d[i] = t_wdef[i];
     t_nwdef = 0;
-    atomic_store_explicit(&g_held, 0, memory_order_relaxed);
     pthread_mutex_unlock(&G);
     for (int i = 0; i < n; i++) wake_signal(d[i]);
 }
 // Wait on cv holding G (dl: CLOCK_REALTIME deadline, NULL none); as pthread_cond_wait, it may return early, and every caller rechecks its condition in a loop
 static inline int g_cond_wait(pthread_cond_t *cv, const struct timespec *dl) {
     if (t_nwdef) { g_unlock(); g_lock(); return 0; }   // this hold's wakes first, with G let go: a spurious wakeup to the caller
-    atomic_store_explicit(&g_held, 0, memory_order_relaxed);
-    int rc = dl ? pthread_cond_timedwait(cv, &G, dl) : pthread_cond_wait(cv, &G);
-    atomic_store_explicit(&g_held, 1, memory_order_relaxed);
-    return rc;
+    return dl ? pthread_cond_timedwait(cv, &G, dl) : pthread_cond_wait(cv, &G);
 }
 #define MAX_H 4096
 static struct { int type; void *obj; } g_h[MAX_H];
@@ -182,9 +136,14 @@ static pthread_key_t g_keythr;
 static uint64_t g_next_id = 0x51;
 static thr_t *g_wait;          // All waiting threads (lock / condition / address / synchronization)
 
-static uint32_t h_new(int type, void *obj) {     // Caller holds G
+static uint32_t h_try_new(int type, void *obj) {     // Caller holds G
     for (int i = 1; i < MAX_H; i++) if (!g_h[i].type) { g_h[i].type = type; g_h[i].obj = obj; return 0x1000 + i; }
-    die("handle table full");
+    return 0;
+}
+static uint32_t h_new(int type, void *obj) {     // Caller holds G
+    uint32_t h = h_try_new(type, obj);
+    if (!h) die("handle table full");
+    return h;
 }
 static void *h_peek(uint32_t h, int type) {      // Lookup only, no report
     if (h == H_CUR_THREAD && type == O_THREAD) return pthread_getspecific(g_keythr);
@@ -217,8 +176,20 @@ static int thr_in_handoff(const thr_t *t, const thr_t *self) {
     for (int i = 0; i < t->nhand; i++) if (t->hand[i].by == self && t->hand[i].epoch == self->hand_epoch) return 1;
     return 0;
 }
+// Holding G. t stopped running guest code on its core (it blocked, exited or was paused): the threads waiting in a handoff it held look again (dm_yield_to_core_peers).
+// g_hand_cv is for the waiters of the core_preempt mode (DM_PREEMPT), which wait for every runnable higher-priority peer of their core, not only for those they woke
+static pthread_cond_t g_hand_cv = PTHREAD_COND_INITIALIZER;
+static int g_hand_waiters;
+static _Atomic uint64_t g_hand_timeouts;   // timed rechecks, read by the unlocked thread dump
+static void hand_signal(thr_t *t) {
+    for (int i = 0; i < t->nhand; i++) {
+        thr_t *by = t->hand[i].by;
+        if (by->hwait && by->hand_epoch == t->hand[i].epoch) pthread_cond_signal(&by->hcv);
+    }
+    if (g_hand_waiters) pthread_cond_broadcast(&g_hand_cv);
+}
 // Holding G. t blocked (a guest wait, a timed sleep, YieldToAnyThread): it gave its core back, so it no longer holds the threads whose handoff made it runnable
-static void hand_leave(thr_t *t) { t->nhand = 0; t->start_by = NULL; }
+static void hand_leave(thr_t *t) { hand_signal(t); t->nhand = 0; t->start_by = NULL; }
 // A file system call is a request to fsp-srv on Horizon: svcSendSyncRequest blocks the caller until the service replies, and a lower-priority thread of its core runs meanwhile.
 // The host answers in the caller's own thread, so without this the caller never gives up its core and its waker stays held until it blocks or exits. Digimon Story Cyber Sleuth's
 // save manager (main+0x16cdf0 and its neighbours) sets its busy flag after StartThread returns, and its priority-38 worker clears it last thing: on Horizon the worker's first request lets
@@ -286,19 +257,43 @@ void dm_thread_native_wait(int entering) {
 // priority (Mesosphere's KScheduler migrates suggested threads), and the host never counts peers the wake did not make runnable as busy. Batman: Arkham Knight's job workers
 // (priority 43, mask 0x5) finish a job and signal the main thread (priority 29, core 0), which then spin-waits for the next two jobs it hands them; waiting for it to block
 // left both workers in this loop for good, and the game stopped presenting as New Story loaded
+// A block, exit or pause signals the waiter. The 50 µs timeout keeps the recheck for changes that don't signal:
+// host sleeps, GPU work, and changes to priority or affinity. Only the runnable-state scan can end the handoff.
+#define HANDOFF_BACKSTOP_NS 50000
 int dm_yield_to_core_peers(int all) {
     thr_t *self = pthread_getspecific(g_keythr); if (!self) return 0;
     uint64_t bit = 1ull << (__atomic_load_n(&self->core, __ATOMIC_RELAXED) & 63); int waited = 0;   // read without G, as GetCurrentProcessorNumber does
     if (__atomic_load_n(&self->mask, __ATOMIC_RELAXED) & ~bit) return 0;
+    g_lock();
     for (;;) {
         int busy = 0;
-        g_lock();
         for (thr_t *t = g_all; t && !busy; t = t->all)
             if (t != self && t->started && !t->exited && !t->host_owned && t->mask == bit && t->prio < self->prio && thr_runnable(t) && (all || thr_in_handoff(t, self))) busy = 1;
-        g_unlock();
-        if (!busy) return waited;
-        { struct timespec ts = {0, 50000}; nanosleep(&ts, 0); } waited = 1;
+        if (!busy) break;
+        waited = 1;
+        struct timespec dl;
+        clock_gettime(CLOCK_REALTIME, &dl);
+        dl.tv_nsec += HANDOFF_BACKSTOP_NS;
+        if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+        int rc;
+        if (all) {
+            g_hand_waiters++;
+            rc = g_cond_wait(&g_hand_cv, &dl);
+            g_hand_waiters--;
+        } else {
+            if (!self->hcv_init) {
+                rc = pthread_cond_init(&self->hcv, NULL);
+                if (rc) die("handoff condition variable: %s", strerror(rc));
+                self->hcv_init = 1;
+            }
+            self->hwait = 1;
+            rc = g_cond_wait(&self->hcv, &dl);
+            self->hwait = 0;
+        }
+        if (rc == ETIMEDOUT) atomic_fetch_add_explicit(&g_hand_timeouts, 1, memory_order_relaxed);
     }
+    g_unlock();
+    return waited;
 }
 // Take a host lock that an HLE call holds while it runs guest code. A guest thread waiting for it is in a native HLE wait (dm_thread_native_wait), blocked as it would be
 // on the guest-visible lock the SDK's own code uses there, so it does not hold a same-core handoff: Kirby and the Forgotten Land's guide movies froze the game when the movie decoder's decode lock was held across the
@@ -312,46 +307,15 @@ void dm_host_lock(pthread_mutex_t *m) {
 }
 
 // ---------- Wait primitives (called holding G) ----------
-// The waiters are also kept in buckets by what they wait for (wb_slot): lock and address waits by their address, condition waits by their key, synchronization waits all in one.
-// pick and the checks for other waiters on the same address or key look at one bucket, and a waiter leaves the chain in place, instead of walking every waiting thread: Mario Kart
-// World keeps about 87 threads waiting, and at its 60 fps cap about 31,000 picks and 22,000 wakes a second each walked them all under G, other threads queued on G meanwhile
-// (with the buckets: process CPU -1.9 ms a frame, CPU energy -0.18 to -0.23 W on an M3 Max). DM_WAIT_INDEX=0 walks the whole chain as before (ab: alternates with the DM_AB phases)
-enum { WB_N = 512 };
-static thr_t *g_wb[WB_N];
-__attribute__((weak)) int mtl_sw_mode(const char *name, int dflt);
-__attribute__((weak)) int mtl_sw_on(int m);
-static int g_widx; static pthread_once_t g_widx_once = PTHREAD_ONCE_INIT;
-static void widx_init(void) { g_widx = mtl_sw_mode("DM_WAIT_INDEX", 1); }
-static int widx_on(void) { pthread_once(&g_widx_once, widx_init); return mtl_sw_on(g_widx); }
-static inline int wb_slot(int kind, uint64_t key) { return (int)(((key ^ ((uint64_t)kind << 59)) * 0x9E3779B97F4A7C15ull) >> 55) & (WB_N - 1); }
-static inline uint64_t wb_key(const thr_t *t) { return t->wkind == 2 ? t->wkey : t->wkind == 4 ? 0 : t->waddr; }
-static void wb_link(thr_t *t) { int s = wb_slot(t->wkind, wb_key(t)); t->bkt1 = s + 1; t->bprev = NULL; t->bnext = g_wb[s]; if (g_wb[s]) g_wb[s]->bprev = t; g_wb[s] = t; }
-static void wb_unlink(thr_t *t) {
-    if (!t->bkt1) return;
-    if (t->bprev) t->bprev->bnext = t->bnext; else g_wb[t->bkt1 - 1] = t->bnext;
-    if (t->bnext) t->bnext->bprev = t->bprev;
-    t->bnext = t->bprev = NULL; t->bkt1 = 0;
-}
-// The first waiter of the bucket of (kind, key), or of the whole chain with the index off (ix = widx_on(), read once a walk); the next one: wnext
-static inline thr_t *wfirst(int ix, int kind, uint64_t key) { return ix ? g_wb[wb_slot(kind, key)] : g_wait; }
-static inline thr_t *wnext(int ix, const thr_t *t) { return ix ? t->bnext : t->next; }
-static void wait_link(thr_t *t, int kind) {
-    t->wkind = kind; t->next = g_wait; t->wprev = NULL; if (g_wait) g_wait->wprev = t; g_wait = t;
-    wb_link(t);
-}
 static void wait_unlink(thr_t *t) {
-    if (!widx_on()) { thr_t *p = g_wait; while (p && p != t) p = p->next;   // the walk the chain took before the index (DM_WAIT_INDEX=0)
-                      if (!p != !(t->wprev || g_wait == t)) die("wait chain: thread %#x %s the chain but its links say otherwise", t->handle, p ? "is in" : "is not in"); }
-    if (t->wprev) t->wprev->next = t->next; else if (g_wait == t) g_wait = t->next;
-    else { t->next = NULL; wb_unlink(t); return; }   // not waiting
-    if (t->next) t->next->wprev = t->wprev;
-    t->next = t->wprev = NULL; wb_unlink(t);
+    for (thr_t **p = &g_wait; *p; p = &(*p)->next) if (*p == t) { *p = t->next; break; }
+    t->next = NULL;
 }
 // Pick a waiter in kernel order: numerically lower priority first, at equal priority the earlier registered first (holding G). kind 1 matches by lock address, 2 by condition key, 3 by address
 static uint64_t g_wseq;
 static thr_t *pick(int kind, uint64_t a) {
-    thr_t *b = NULL; int ix = widx_on();
-    for (thr_t *t = wfirst(ix, kind, a); t; t = wnext(ix, t)) {
+    thr_t *b = NULL;
+    for (thr_t *t = g_wait; t; t = t->next) {
         if (t->wkind != kind || (kind == 2 ? t->wkey : t->waddr) != a) continue;
         if (!b || t->prio < b->prio || (t->prio == b->prio && t->wseq < b->wseq)) b = t;
     }
@@ -373,53 +337,24 @@ static void note_runnable(thr_t *t) {
 // Holding G: signal t's condition once this hold of G ends (g_unlock / g_cond_wait), or now when the list is full
 static void wake_queue(thr_t *t) {
     if (g_wake_unlocked && t_nwdef < WDEF) { atomic_fetch_add_explicit(&t->sig_pend, 1, memory_order_relaxed); t_wdef[t_nwdef++] = t; }
-    else thr_kick(t);
+    else pthread_cond_signal(&t->cv);
 }
 static void wake(thr_t *t, int64_t res) {
     wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; wake_queue(t);
     note_runnable(t);
 }
-// Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT
-// The wait itself is on t->wword (os_sync_wait_on_address) unless DM_WAIT_ON_ADDRESS=0: G is let go by g_unlock (which first signals this hold's queued wakes) and taken again by
-// g_lock, so a thread woken while G is busy spins for it (g_spin) instead of sleeping again in the kernel inside pthread_cond_wait, and the kernel's wait and wake on a word are
-// lighter than its condition variable's (dev/tools/wakecost.c: about 3.1-4.0 against 4.3-4.8 µs of CPU a wait and wake). The word is read under G before G is let go, and every
-// wake bumps it after setting woke under G, so a wake between the unlock and the sleep makes the kernel's compare fail and the wait return. The deterministic clock's waits stay on cv
-static uint64_t g_wao_waits;   // under G: waits on the word (thread lock line)
-static int g_wao; static pthread_once_t g_wao_once = PTHREAD_ONCE_INIT;
-static void wao_init(void) { g_wao = mtl_sw_mode("DM_WAIT_ON_ADDRESS", 1); }
-static int wao_on(void) { pthread_once(&g_wao_once, wao_init); return mtl_sw_on(g_wao); }
-static int g_word_wait(thr_t *t, uint64_t dl_abs) {   // holding G; dl_abs: mach_absolute_time deadline, 0 none; returns 0 or ETIMEDOUT, with G held again
-    uint32_t seq = atomic_load_explicit(&t->wword, memory_order_relaxed);
-    atomic_store_explicit(&t->wmode, 1, memory_order_relaxed); g_wao_waits++;
-    g_unlock();
-    int r = dl_abs ? os_sync_wait_on_address_with_deadline((void *)&t->wword, seq, sizeof t->wword, OS_SYNC_WAIT_ON_ADDRESS_NONE, OS_CLOCK_MACH_ABSOLUTE_TIME, dl_abs)
-                   : os_sync_wait_on_address((void *)&t->wword, seq, sizeof t->wword, OS_SYNC_WAIT_ON_ADDRESS_NONE);
-    int e = r < 0 ? errno : 0;
-    g_lock();
-    return e == ETIMEDOUT ? ETIMEDOUT : 0;
-}
+// Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT.
+// Relative timeouts use host time even in replay: this wait may hold up the next present that advances the guest clock.
 static int64_t block(thr_t *t, int kind, int64_t ns) {
-    wait_link(t, kind); t->woke = 0; t->wseq = ++g_wseq;
+    t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     hand_leave(t);
     struct timespec dl;
-    int det_wait = ns > 0 && dm_detclock_enabled();
-    uint64_t guest_deadline = det_wait ? guest_ns() + (uint64_t)ns : 0;
-    int word = !dm_detclock_enabled() && wao_on(); uint64_t word_dl = 0;
-    if (word && ns > 0) { mach_timebase_info_data_t tb; mach_timebase_info(&tb); word_dl = mach_absolute_time() + (uint64_t)((__uint128_t)(uint64_t)ns * tb.denom / tb.numer); }
-    else if (ns > 0 && !det_wait) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
+    if (ns > 0) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
     while (!t->woke) {
-        int rc;
-        if (word) rc = g_word_wait(t, word_dl);
-        else if (det_wait) {
-            atomic_store_explicit(&t->wmode, 0, memory_order_relaxed);
-            uint64_t now = guest_ns();
-            if (now >= guest_deadline) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
-            (void)(guest_deadline - now);
-            rc = g_cond_wait(&t->cv, NULL);
-        } else { atomic_store_explicit(&t->wmode, 0, memory_order_relaxed); rc = ns > 0 ? g_cond_wait(&t->cv, &dl) : g_cond_wait(&t->cv, NULL); }
-        if (rc == ETIMEDOUT && !t->woke && (!det_wait || guest_ns() >= guest_deadline)) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
+        int rc = g_cond_wait(&t->cv, ns > 0 ? &dl : NULL);
+        if (rc == ETIMEDOUT && !t->woke) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     }
     return t->wres;
 }
@@ -434,7 +369,7 @@ static inline int cas32(uint64_t a, uint32_t *exp, uint32_t v) { return __atomic
 static void lock_handoff(uint64_t addr) {
     thr_t *w = pick(1, addr); int more = 0;
     if (!w) { st32(addr, 0); return; }
-    int ix = widx_on(); for (thr_t *t = wfirst(ix, 1, addr); t; t = wnext(ix, t)) if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
+    for (thr_t *t = g_wait; t; t = t->next) if (t != w && t->wkind == 1 && t->waddr == addr) { more = 1; break; }
     st32(addr, w->wtag | (more ? WAITERS_BIT : 0));
     wake(w, 0);
 }
@@ -445,7 +380,7 @@ static void lock_acquire_for(thr_t *t, uint64_t addr, uint32_t tag) {
         if (v == 0) { if (cas32(addr, &v, tag)) { wake(t, 0); return; } continue; }
         if (cas32(addr, &v, v | WAITERS_BIT)) break;
     }
-    wb_unlink(t); t->wkind = 1; t->waddr = addr; t->wtag = tag; wb_link(t);   // Still in g_wait, changed to a lock wait (and moved to its bucket)
+    t->wkind = 1; t->waddr = addr; t->wtag = tag;      // Still in g_wait, changed to a lock wait
     t->wseq = ++g_wseq;                                  // The kernel inserts it anew into the lock owner's wait queue: at equal priority it goes after the existing lock waiters
 }
 
@@ -524,7 +459,7 @@ static void thr_free(thr_t *t) {   // Holding G; unlink from the all-threads cha
         for (int i = 0; i < u->nhand; ) if (u->hand[i].by == t) u->hand[i] = u->hand[--u->nhand]; else i++;
         if (u->start_by == t) u->start_by = NULL;
     }
-    pthread_cond_destroy(&t->cv); pthread_cond_destroy(&t->pcv); free(t);
+    pthread_cond_destroy(&t->cv); pthread_cond_destroy(&t->pcv); if (t->hcv_init) pthread_cond_destroy(&t->hcv); free(t);
 }
 static void thr_put(thr_t *t) {   // Holding G; drop a reference taken with t->refs++ (a wait, a pause): the last holder of a closed, exited thread frees it
     if (!--t->refs && t->closed && t->exited) thr_free(t);
@@ -537,6 +472,7 @@ static void thread_exit(thr_t *t) {
     // No logging here: the exit happens on the guest thread's own stack (some are only a dozen or so KiB), and a printf with floating point would blow the stack (real-device smoke test: SIGBUS when LibcurlResolver exits, backtrace fprintf → __dtoa). Only the time is recorded, and it is printed later in the state dump
     g_lock();
     t->exited = 1;
+    hand_signal(t);         // a handoff it held ends here
     wake_sync_waiters(t);   // Complete synchronization waits on this thread
     pthread_setspecific(g_keythr, NULL);
     if (t->closed && !t->refs) thr_free(t);
@@ -758,21 +694,13 @@ static int sync_signaled(sync_ref_t ref) {   // holding G
 // Complete each registered wait under G: a clear before the waiter resumes
 // must not erase the notification that already made it runnable.
 static void wake_sync_waiters(const void *obj) {
-    int ix = widx_on();
-    for (thr_t *w = wfirst(ix, 4, 0); w; ) { thr_t *n = wnext(ix, w);
+    for (thr_t *w = g_wait; w; ) { thr_t *n = w->next;
         if (w->wkind == 4)
             for (int i = 0; i < w->wn; i++) if (w->wobjs[i].obj == obj) {
                 w->widx = i; wake(w, 0); break;
             }
         w = n; }
 }
-void dm_guest_clock_advanced(void) {
-    if (!dm_detclock_enabled()) return;
-    g_lock();
-    for (thr_t *t = g_wait; t; t = t->next) if (t->wkind) thr_kick(t);
-    g_unlock();
-}
-
 // Handle thread / synchronization SVCs; returns 1 = handled
 static const char *thr_name(thr_t *t, char *nb, size_t n) {   // SDK ThreadType+0x1a0 = name pointer
     if (!t->arg) return t->handle == 0x1001 ? "main thread" : "?";
@@ -864,7 +792,8 @@ void svc_thread_dump(void) {
     static const char *kinds[] = {"running/not waiting", "mutex", "condvar", "address", "sync object"};
     int nh = 0; for (int i = 1; i < MAX_H; i++) nh += g_h[i].type != O_FREE;
     fprintf(stderr, "[dm] handle table use %d / %d, threads created so far %llu\n", nh, MAX_H, g_next_id - 0x51);
-    fprintf(stderr, "[dm] same-core handoffs %llu, total %.1f ms\n", (unsigned long long)g_preempt_n, g_preempt_ns / 1e6);
+    fprintf(stderr, "[dm] same-core handoffs %llu, total %.1f ms, timed rechecks %llu\n",
+            (unsigned long long)g_preempt_n, g_preempt_ns / 1e6, (unsigned long long)atomic_load_explicit(&g_hand_timeouts, memory_order_relaxed));
     for (thr_t *t = g_all; t; t = t->all) {
         module_t *m = module_of((void *)t->last_lr);
         // Thread name: SDK ThreadType+0x1a0 is the name pointer (ThreadManager::SetInitialThreadNameUnsafe 0x34a2a4); x2 of CreateThread = ThreadType*
@@ -1090,7 +1019,7 @@ void dm_spin_wait(uint64_t gate, uint64_t site) {
 // back-off's start its timeout becomes the back-off's sleep (yield_backoff_ns), which, unlike the sleep, ends at once when the wait is signalled. The yields' register test does not
 // apply: at the SVC the SDK's own frames hold the time left (SDK 3.5.1 InternalConditionVariableImplByHorizon::TimedWait, x21). → the timeout to wait with
 static int64_t poll_wait_begin(int64_t ns) {
-    if (ns <= 0 || ns >= 20000 || dm_detclock_enabled()) return ns;
+    if (ns <= 0 || ns >= 20000) return ns;
     thr_t *me = pthread_getspecific(g_keythr); if (!me) return ns;
     uint64_t now = now_ns();
     if (me->yrun_svc + 1 != me->nsvc || now - me->poll_ret > SPIN_GAP_NS) me->yrun_t0 = now;   // a new run
@@ -1102,7 +1031,7 @@ static int64_t poll_wait_begin(int64_t ns) {
 }
 // After the wait (ns: the guest's timeout): a signalled wait ends the run, the loop moves on
 static void poll_wait_end(int64_t ns, int64_t r) {
-    if (ns <= 0 || ns >= 20000 || dm_detclock_enabled()) return;
+    if (ns <= 0 || ns >= 20000) return;
     thr_t *me = pthread_getspecific(g_keythr); if (!me) return;
     if (r == R_TIMEOUT) me->poll_ret = now_ns(); else me->yrun_svc = 0;
 }
@@ -1117,7 +1046,7 @@ void dm_guest_sleep_ns(int64_t ns);
 static void poll_sleep(thr_t *me, int64_t ns) {
     uint64_t now = now_ns();
     if (me->yrun_svc + 1 != me->nsvc || now - me->poll_ret > SPIN_GAP_NS) me->yrun_t0 = now;   // a new run
-    me->yrun_svc = me->nsvc; me->npsleep++; me->psleep_ns = ns;
+    me->yrun_svc = me->nsvc;
     uint64_t bo = yield_backoff_ns(now - me->yrun_t0, 0);
     if (bo > (uint64_t)ns) { me->nyield++; backoff_sleep(me, bo); }
     else dm_guest_sleep_ns(ns);
@@ -1126,18 +1055,17 @@ static void poll_sleep(thr_t *me, int64_t ns) {
 // The threads that yielded or passed through spin waits most since the last call (the power line every 300 frames, hle_nvn.c): "handle name N (back-off sleeps M)", at most two,
 // N the yields (spin wait passes that yielded among them), with the clock waits' yields among them ("; clock waits C"), the spin wait passes and the last one's site ("; spin passes K, last at main+0x…")
 void dm_yield_top(char *out, size_t n) {
-    thr_t *top[2] = {0}; uint64_t d[2] = {0}, b[2] = {0}, c[2] = {0}, cp[2] = {0}, s[2] = {0}, r[2] = {0}, q[2] = {0};
+    thr_t *top[2] = {0}; uint64_t d[2] = {0}, b[2] = {0}, c[2] = {0}, cp[2] = {0}, s[2] = {0}, r[2] = {0};
     g_lock();
     for (thr_t *t = g_all; t; t = t->all) {
-        uint64_t y = t->nyield - t->nyield_seen, bo = t->nbackoff - t->nbackoff_seen, ck = t->nclkyield - t->nclkyield_seen, pr = t->ncwpred - t->ncwpred_seen, sp = t->nspin - t->nspin_seen, ps = t->npsleep - t->npsleep_seen, k = y + sp + ps;
-        t->nyield_seen = t->nyield; t->nbackoff_seen = t->nbackoff; t->nclkyield_seen = t->nclkyield; t->ncwpred_seen = t->ncwpred; t->nspin_seen = t->nspin; t->npsleep_seen = t->npsleep;
-        if (k > r[0]) { top[1] = top[0]; d[1] = d[0]; b[1] = b[0]; c[1] = c[0]; cp[1] = cp[0]; s[1] = s[0]; r[1] = r[0]; q[1] = q[0]; top[0] = t; d[0] = y; b[0] = bo; c[0] = ck; cp[0] = pr; s[0] = sp; r[0] = k; q[0] = ps; }
-        else if (k > r[1]) { top[1] = t; d[1] = y; b[1] = bo; c[1] = ck; cp[1] = pr; s[1] = sp; r[1] = k; q[1] = ps; }
+        uint64_t y = t->nyield - t->nyield_seen, bo = t->nbackoff - t->nbackoff_seen, ck = t->nclkyield - t->nclkyield_seen, pr = t->ncwpred - t->ncwpred_seen, sp = t->nspin - t->nspin_seen, k = y + sp;
+        t->nyield_seen = t->nyield; t->nbackoff_seen = t->nbackoff; t->nclkyield_seen = t->nclkyield; t->ncwpred_seen = t->ncwpred; t->nspin_seen = t->nspin;
+        if (k > r[0]) { top[1] = top[0]; d[1] = d[0]; b[1] = b[0]; c[1] = c[0]; cp[1] = cp[0]; s[1] = s[0]; r[1] = r[0]; top[0] = t; d[0] = y; b[0] = bo; c[0] = ck; cp[0] = pr; s[0] = sp; r[0] = k; }
+        else if (k > r[1]) { top[1] = t; d[1] = y; b[1] = bo; c[1] = ck; cp[1] = pr; s[1] = sp; r[1] = k; }
     }
     size_t o = 0; char nb[32];
     for (int i = 0; i < 2 && top[i] && o < n; i++) {
         o += snprintf(out + o, n - o, "%s%#x '%s' %llu times (back-off sleeps %llu", i ? ", " : "", top[i]->handle, thr_name(top[i], nb, sizeof nb), (unsigned long long)d[i], (unsigned long long)b[i]);
-        if (o < n && q[i]) o += snprintf(out + o, n - o, "; short sleeps %llu, last %lld ns", (unsigned long long)q[i], (long long)top[i]->psleep_ns);
         if (o < n && c[i]) o += snprintf(out + o, n - o, "; clock waits %llu, %llu of them slept to a predicted end", (unsigned long long)c[i], (unsigned long long)cp[i]);
         if (o < n && s[i]) o += snprintf(out + o, n - o, "; spin passes %llu, last at %s+%#llx", (unsigned long long)s[i], top[i]->spin_mod, (unsigned long long)top[i]->spin_site);
         if (o < n) o += snprintf(out + o, n - o, ")");
@@ -1162,11 +1090,7 @@ void dm_thread_cpu(char *out, size_t n, double secs) {
     size_t o = (size_t)snprintf(out, n, "by guest priority ≤44 %.0f / 45–59 %.0f / ≥60 %.0f ms/s; top: ", band[0], band[1], band[2]); char nb[32];
     for (int i = 0; i < 3 && top[i] && o < n; i++)
         o += (size_t)snprintf(out + o, n - o, "%s%#x '%s' priority %d %.0f ms/s%s", i ? ", " : "", top[i]->handle, thr_name(top[i], nb, sizeof nb), top[i]->prio, d[i], top[i]->host_owned ? " (host-created)" : "");
-    if (!top[0] && o < n) o += (size_t)snprintf(out + o, n - o, "none");
-    static uint64_t ln, lb, ls, lw, li; uint64_t wi = atomic_load_explicit(&g_wao_idle, memory_order_relaxed);
-    if (o < n) snprintf(out + o, n - o, "; thread lock %.0f/s, found taken %.0f/s, %.0f/s of them got by a spin; waits on an address %.0f/s, wakes with no sleeper %.0f/s",
-                        (g_lock_n - ln) / secs, (g_lock_busy - lb) / secs, (g_lock_spun - ls) / secs, (g_wao_waits - lw) / secs, (wi - li) / secs);
-    ln = g_lock_n; lb = g_lock_busy; ls = g_lock_spun; lw = g_wao_waits; li = wi;
+    if (!top[0] && o < n) snprintf(out + o, n - o, "none");
     g_unlock();
 }
 // Sleep until dl (host monotonic ns) on time: macOS nanosleep / mach_wait_until carry timer slack; measured, 33 ms sleeps take about 36.4 ms, 5 ms take 6.1 ms, 1 ms take 1.26 ms (the same at any QoS).
@@ -1179,27 +1103,12 @@ static void sleep_precise(uint64_t dl) {
         struct timespec ts = {(time_t)(s / 1000000000u), (long)(s % 1000000000u)}; nanosleep(&ts, 0);
     }
 }
-// The graphics library's switches (nvn_mtl.m sw_mode / sw_on): 0 off, 1 on, ab alternating with the DM_AB phases. Tests that link this file alone read 0 / 1 only
-__attribute__((weak)) int mtl_sw_mode(const char *name, int dflt) { const char *e = getenv(name); return e && *e ? strncmp(e, "ab", 2) && atoi(e) != 0 : dflt; }
-__attribute__((weak)) int mtl_sw_on(int m) { return m == 1; }
-static int g_short_sleep; static pthread_once_t g_short_sleep_once = PTHREAD_ONCE_INIT;
-static void short_sleep_init(void) { g_short_sleep = mtl_sw_mode("DM_SHORT_SLEEP", 1); }
-static int short_sleep_on(void) { pthread_once(&g_short_sleep_once, short_sleep_init); return mtl_sw_on(g_short_sleep); }
-// A guest thread sleeps ns nanoseconds the way SleepThread does: on the guest clock under the deterministic clock, else on time (sleep_precise). Also for host hooks that stand for a
-// call which blocks on hardware (hle_net.c: Poll / Select with nothing to wait on).
-// A sleep of up to twice sleep_precise's 20 µs margin is one nanosleep of its length: sleep_precise returned at once from one of 20 µs (its deadline was already within the margin),
-// and Mario Kart World's job dispatcher (main+0x4520 on v0) sleeps exactly that between its scans of the job arrays, so its WorkerMgr threads spun through their waits (at the 60 fps
-// cap on an M3 Max: 26 % of a core between them, 10 % with the sleep, CPU energy -0.25 to -0.41 W handheld). DM_SHORT_SLEEP=0 returns at once as before (ab: alternates with the DM_AB phases)
+// SleepThread takes a relative duration. Host time lets the thread resume even if its work is needed to present the next frame.
+// Also used by host hooks that block on hardware (hle_net.c: Poll / Select with nothing to wait on).
 void dm_guest_sleep_ns(int64_t ns) {
     if (ns <= 0) return;
-    if (dm_detclock_enabled()) {
-        uint64_t deadline = guest_ns() + (uint64_t)ns;
-        while (guest_ns() < deadline) { struct timespec ts = {0, 1000000}; nanosleep(&ts, 0); }
-        return;
-    }
     thr_t *me = pthread_getspecific(g_keythr); if (me) me->sleeping = 1;
-    if (ns <= 2 * 20000 && short_sleep_on()) { struct timespec ts = {0, (long)ns}; nanosleep(&ts, 0); }
-    else sleep_precise(now_ns() + (uint64_t)ns);
+    sleep_precise(now_ns() + (uint64_t)ns);
     if (me) me->sleeping = 0;
 }
 // A host hook's bounded wait on a host condition variable (m held), a sleep to a garbage collector's pause like dm_guest_sleep_ns; the caller checks its condition and the clock
@@ -1262,8 +1171,8 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         // A sleep, and YieldToAnyThread (-2), which takes the thread off its core so that lower-priority threads run there, end its part in a handoff;
         // the other yields (0, -1) pass the core only to threads of its own priority or higher
         if ((ns > 0 || ns == -2) && me && me->nhand) { g_lock(); hand_leave(me); g_unlock(); }
-        if (me && ns >= 20000 && (uint64_t)ns < yield_backoff_cap() && !dm_detclock_enabled()) poll_sleep(me, ns);   // a short sleep: a poll
-        else if ((ns > 0 && dm_detclock_enabled()) || ns >= 20000) dm_guest_sleep_ns(ns);
+        if (me && ns >= 20000 && (uint64_t)ns < yield_backoff_cap()) poll_sleep(me, ns);   // a short sleep: a poll
+        else if (ns >= 20000) dm_guest_sleep_ns(ns);
         // Yield (0 / -1 / -2), and sleeps shorter than 20 µs, which sleep_precise would return from at once: Super Mario Galaxy's Hagi polls with SleepThread(100 ns) (main+0x517c),
         // which kept a core at 100% (1.4 billion calls in 200 s); as yields they get the back-off below.
         // Count and time of the main thread's yields are recorded: a render task graph's "wait for everything to finish" is often pure polling + yield; measure how much of a frame it takes
@@ -1301,7 +1210,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         if (!t) r = R_BAD_HANDLE;
         else if (t == me) r = R_BAD_STATE;
         else if (act == 1) {
-            atomic_store(&t->pause_req, 1);
+            atomic_store(&t->pause_req, 1); hand_signal(t);   // a paused thread holds no handoff
             int st = atomic_fetch_or(&t->svc_state, 2);
             if (!t->started || t->exited || (st & 1)) t->paused = 1;
             uint64_t t0 = now_ns(); int warned = 0;
@@ -1376,7 +1285,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         uint64_t key = regs[0]; int cnt = (int)regs[1], n = 0;
         g_lock();
         for (thr_t *w; (cnt <= 0 || n < cnt) && (w = pick(2, key)); n++) lock_acquire_for(w, w->waddr, w->wtag);   // In kernel order; once turned into a lock wait or woken it is no longer kind 2
-        int left = 0, ix = widx_on(); for (thr_t *w = wfirst(ix, 2, key); w; w = wnext(ix, w)) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
+        int left = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 2 && w->wkey == key) { left = 1; break; }
         if (!left) st32(key, 0);
         g_unlock();
         regs[0] = 0; return 1;
@@ -1398,7 +1307,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
     case 0x35: {  // SignalToAddress(x0 address, w1 type, w2 value, w3 count): 0 wake, 1 increment if equal and wake, 2 if equal modify the value by waiter count and wake
         uint64_t addr = regs[0]; int type = (int)regs[1]; int32_t val = (int32_t)regs[2]; int cnt = (int)regs[3];
         g_lock();
-        int nw = 0, ix = widx_on(); for (thr_t *w = wfirst(ix, 3, addr); w; w = wnext(ix, w)) if (w->wkind == 3 && w->waddr == addr) nw++;
+        int nw = 0; for (thr_t *w = g_wait; w; w = w->next) if (w->wkind == 3 && w->waddr == addr) nw++;
         int64_t r = 0;
         if (type != 0) {
             int32_t nv = val + 1;
@@ -1482,12 +1391,44 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             t->closed = 1;
             if (!t->started) pthread_cond_broadcast(&t->cv);   // a thread that never started ends now (thread_main)
             if (t->exited && !t->refs) thr_free(t);
+        } else if (i > 0 && i < MAX_H && g_h[i].type == O_READONLY_SHMEM) {
+            g_h[i].type = O_FREE; g_h[i].obj = NULL;
+        } else if (i > 0 && i < MAX_H && g_h[i].type == O_TRANSFER_MEMORY) {
+            free(g_h[i].obj);
+            g_h[i].type = O_FREE; g_h[i].obj = NULL;
         }
         g_unlock();
         regs[0] = 0; return 1;
     }
     }
     return 0;
+}
+
+uint32_t hle_new_readonly_shmem(const hle_readonly_shmem *memory) {
+    g_lock(); uint32_t h = h_new(O_READONLY_SHMEM, (void *)memory); g_unlock();
+    return h;
+}
+const hle_readonly_shmem *hle_get_readonly_shmem(uint32_t handle) {
+    g_lock(); const hle_readonly_shmem *memory = h_peek(handle, O_READONLY_SHMEM); g_unlock();
+    return memory;
+}
+
+uint32_t hle_new_transfer_memory(hle_transfer_memory memory) {
+    hle_transfer_memory *object = malloc(sizeof *object);
+    if (!object) return 0;
+    *object = memory;
+    g_lock(); uint32_t h = h_try_new(O_TRANSFER_MEMORY, object); g_unlock();
+    if (!h) free(object);
+    return h;
+}
+
+int hle_get_transfer_memory(uint32_t handle, hle_transfer_memory *memory) {
+    g_lock();
+    const hle_transfer_memory *object = h_peek(handle, O_TRANSFER_MEMORY);
+    int found = object != NULL;
+    if (found) *memory = *object;
+    g_unlock();
+    return found;
 }
 
 // ---------- SystemEvent of the service layer ----------

@@ -12,7 +12,7 @@ ipa	ZeldaOcarinaOfTime.ipa
 app_category	public.app-category.adventure-games
 
 # ---- Versions ----
-build	v131072	v131072	main=e0f3ccfaf50065ae4ea01eb5aeb13b1a	subsdk0=b0110087a7b339ef74588d3bd0b4dd5d	sdk=1643a838814f9c10c696f930ed681e7f
+build	v131072	1.1.1	main=e0f3ccfaf50065ae4ea01eb5aeb13b1a	subsdk0=b0110087a7b339ef74588d3bd0b4dd5d	sdk=1643a838814f9c10c696f930ed681e7f
 package	v131072
 shader_versions	v131072
 
@@ -23,15 +23,11 @@ zip_store	.zs:.bwav:.webm:.metallib
 
 # ---- Memory ----
 # The Switch 2 leaves games 9 GB of its 12 GB (Donkey Kong Bananza's figure). The NPDM declares 48 MB of system resource, so virtual address memory is on.
-# nninitStartup asks SetHeapSize 0x18ce00000 (6.2 GB) with the 9 GB pool, as Mario Kart World. 256 MB in front + 4 GB alias region + 256 MB stack region + 8 GB heap region: a starting split, to be measured
-# cheemu21's kid-with-sword-remake L6.1 (e72f779a), for the Master Sword white screen (nxnative issue #2407): an 8 GB alias region and no pool check on the guest's maps.
-# With 4 GB, play filled it to 3.75 GB, and at the time skip the game's map of 38 MB more was refused ("2.74 GB mapped, the application pool is full"); the cutscene's
-# AV1 decoder never opened and the fade-in stayed white (four v4 runs on the iPhone; map limit off alone did not do it). The block grows by the same 4 GB:
-# 256 MB + 8 GB alias + 256 MB stack + 8 GB heap. Guest memory is in files on the iPhone, so pages mapped and not touched cost nothing
+# 256 MiB in front + 8 GiB heap + 256 MiB stacks + 8 GiB alias region. At 4 GiB the Chamber of Sages transition runs out of room for a 50.03 MiB address region (#3103).
 mem_reserve	0x420000000
 mem_alias	0x200000000
 mem_map_limit	on
-# mem_map_limit on with 1 GB of room past the pool (v4): with no limit (cheemu21's L6.1 above) the time skip played, but in a 21-minute run the game's mapped memory grew
+# mem_map_limit on with 1 GB of room past the pool (v4): with no limit (cheemu21's L6.1, as above but without the limit) the time skip played, but in a 21-minute run the game's mapped memory grew
 # to 6.77 GB (it keeps freed pages mapped while maps succeed) and the iPhone ran out of memory in Hyrule Field. The time skip needs 3.28 GB mapped; the pool leaves 2.74 GB
 mem_map_room	0x40000000
 mem_stack	0x10000000

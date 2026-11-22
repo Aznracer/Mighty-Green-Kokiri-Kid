@@ -44,10 +44,15 @@ static int test_pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mu
 #define clock_gettime_nsec_np test_clock_gettime_nsec_np
 #define clock_gettime test_clock_gettime
 #define pthread_cond_timedwait test_pthread_cond_timedwait
+#define nvn_game_fps nvn_game_fps_mtl_default
 #include "../nvn/nvn_mtl.m"
+#undef nvn_game_fps
 #undef pthread_cond_timedwait
 #undef clock_gettime
 #undef clock_gettime_nsec_np
+#define g_ft g_ft_hle
+#include "../nvn/hle_nvn.c"
+#undef g_ft
 void *front_metal_layer(void) { return NULL; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 module_t *g_mod; int g_nmod;
@@ -173,7 +178,7 @@ static void faces(id<MTLLibrary> lib) {
 // X level 1, then the halves of Y (layers 0-5 and 6-11) at levels 0 and 1, the order Mario Kart World's three cube chains come in. Two passes of three attachments instead of six,
 // and every layer of both levels holds its own output (the textures are cleared to zero first, so a draw that went nowhere shows)
 static tex_t texture_lv(int target, int format, int layers, int levels) { tex_t t=texture(target,format,layers); t.d.levels=levels; nvn_tex_layout(&t.d,&t.L); return t; }
-static int layers_read(const tex_t *t, int level, int base) {   // layers base..base+5 of the level: layer base+s must hold output 5-s
+static int layers_read(const tex_t *t, int level, int base, const uint8_t *solid) {
     id<MTLTexture> mt=tex_mtl(t); NSUInteger w=MAX(8u>>level,1u); NSUInteger img=w*w*4;
     id<MTLBuffer> out=[g_dev newBufferWithLength:img*6 options:MTLResourceStorageModeShared]; if(!out) return 0x3f;
     id<MTLCommandBuffer> cb=[g_q commandBuffer]; id<MTLBlitCommandEncoder> e=[cb blitCommandEncoder];
@@ -181,7 +186,7 @@ static int layers_read(const tex_t *t, int level, int base) {   // layers base..
     [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     int bad=0; const uint8_t *bytes=out.contents;
     for(int s=0;s<6;s++) { int k=5-s; uint8_t want[4]={(uint8_t)(51*k),(uint8_t)(255-51*k),255,255};
-        for(NSUInteger i=0;i<w*w;i++) if(memcmp(bytes+(NSUInteger)s*img+4*i,want,4)) { bad|=1<<s; break; } }
+        for(NSUInteger i=0;i<w*w;i++) if(memcmp(bytes+(NSUInteger)s*img+4*i,solid ? solid : want,4)) { bad|=1<<s; break; } }
     return bad;
 }
 static void layers_zero(const tex_t *t, int levels, int layers) {
@@ -210,8 +215,52 @@ static void merges(id<MTLLibrary> lib) {
     c.n-=8; uint64_t p0=g_fsp_npass, m0=g_fsm_npass, d0=g_fsm_moved; execute(&c);
     CHECK("face-split draws of one level size into other textures and layers join the first one's pass",g_fsm_npass-m0==(uint64_t)(on?2:0) && g_fsm_moved-d0==(uint64_t)(on?4:0));
     CHECK("six face-split draws in two passes, passing over the other level's",g_fsp_npass-p0==(uint64_t)(split?(on?2:6):0));
-    CHECK("every layer of both levels holds its own output",!layers_read(&x,0,0) && !layers_read(&x,1,0) && !layers_read(&y,0,0) && !layers_read(&y,0,6) && !layers_read(&y,1,0) && !layers_read(&y,1,6));
+    CHECK("every layer of both levels holds its own output",!layers_read(&x,0,0,NULL) && !layers_read(&x,1,0,NULL) && !layers_read(&y,0,0,NULL) && !layers_read(&y,0,6,NULL) && !layers_read(&y,1,0,NULL) && !layers_read(&y,1,6,NULL));
     CHECK("no moved draw is left for a later submission",g_fsm_ntaken==0);
+}
+
+static void merge_read_order(id<MTLLibrary> lib) {
+    tex_t x=texture(NVN_TEXTURE_TARGET_2D,NVN_FORMAT_RGBA8,1);
+    tex_t a=texture(NVN_TEXTURE_TARGET_2D_ARRAY,NVN_FORMAT_RGBA8,6);
+    tex_t c=texture(NVN_TEXTURE_TARGET_2D_ARRAY,NVN_FORMAT_RGBA8,6);
+    prog_t sample={0}, writer={0};
+    NvProg *p=make_program(lib,&sample,"six_read");
+    make_program(lib,&writer,"red");
+    NvShader *fs=p->sh[1];
+    p->sh[0]->fn=fn4_note(p->sh[0]->fn,lib,@"v",nil);
+    fs->fn=fn4_note(fs->fn,lib,@"six_read",nil);
+    fs->ae=[fs->fn newArgumentEncoderWithBufferIndex:0]; fs->arg_len=fs->ae.encodedLength;
+    fs->rf.color_mask=0x3f; fs->rf.nb=1;
+    fs->rf.b[0]=(nvn_rbind){.kind=NVN_RB_TEX,.reg=0,.aid=0,.dtt=MTLTextureType2D};
+
+    NVNtexturePool pools[2];
+    CHECK("two descriptor pools initialize",h_nvnTexturePoolInitialize(&pools[0],NULL,0,256) && h_nvnTexturePoolInitialize(&pools[1],NULL,0,256));
+    tex_t decoy=texture(NVN_TEXTURE_TARGET_2D,NVN_FORMAT_RGBA8,1);
+    for(int i=0;i<2;i++) {
+        p_set_pool pool={.pool=(dpool_t *)&pools[i]};
+        mtl_reg_tex(nvn_dpool_base(pool.pool,1)+3,&x,NULL);
+        if(i) mtl_reg_tex(3,&decoy,NULL);
+        chain list={0}; emit(&list,OP_SET_TEX_POOL,&pool,sizeof pool);
+        p_bind_handles h={.stage=1,.n=1,.h={3}};
+        emit(&list,OP_BIND_TEX,&h,sizeof h);
+        bind(&list,&sample,3); faces_target(&list,&a,0,0); triangle(&list);
+        bind(&list,&writer,3); rt(&list,&x,-1,NULL); triangle(&list);
+        bind(&list,&sample,3); faces_target(&list,&c,0,0); triangle(&list);
+        execute(&list);
+        for(int j=0;j<g_sm_amp_n;j++) for(int k=0;k<2000;k++) {
+            os_unfair_lock_lock(&g_sm_amp_lock); int done=g_sm_amp[j].done; os_unfair_lock_unlock(&g_sm_amp_lock);
+            if(done) break;
+            usleep(1000);
+        }
+        layers_zero(&x,1,1);
+        list.n-=8;
+        uint64_t before=g_fsm_moved;
+        execute(&list);
+        CHECK("a repeated read after a write cannot move into the first draw's pass",g_fsm_moved==before);
+        const uint8_t black[]={0,0,0,0}, red[]={255,0,0,255};
+        CHECK("the first draw reads before the write",!layers_read(&a,0,0,black));
+        CHECK("the last draw reads after the write",!layers_read(&c,0,0,red));
+    }
 }
 
 static void hoists(id<MTLLibrary> lib) {
@@ -394,9 +443,11 @@ int main(int argc, char **argv) { @autoreleasepool {
         "fragment float4 red() { return float4(1,0,0,1); }\n"
         "struct Six { float4 c0 [[color(0)]]; float4 c1 [[color(1)]]; float4 c2 [[color(2)]]; float4 c3 [[color(3)]]; float4 c4 [[color(4)]]; float4 c5 [[color(5)]]; };\n"
         "fragment Six six() { Six o; o.c0=float4(0,1,1,1); o.c1=float4(0.2,0.8,1,1); o.c2=float4(0.4,0.6,1,1); o.c3=float4(0.6,0.4,1,1); o.c4=float4(0.8,0.2,1,1); o.c5=float4(1,0,1,1); return o; }\n"
+        "struct ReadArgs { texture2d<float> t [[id(0)]]; };\n"
+        "fragment Six six_read(constant ReadArgs &a [[buffer(0)]]) { float4 c=a.t.read(uint2(0)); return {c,c,c,c,c,c}; }\n"
         "struct Args { device uint *p [[id(0)]]; };\n"
         "kernel void compute_one(constant Args &a [[buffer(0)]]) { *a.p=73; }\n" options:nil error:&error];
     if(!lib) { fprintf(stderr,"%s\n",error.localizedDescription.UTF8String); return 2; }
-    slices(lib); faces(lib); merges(lib); hoists(lib); posts();
+    slices(lib); faces(lib); merges(lib); merge_read_order(lib); hoists(lib); posts();
     printf("performance ordering: %d checks, %d failed\n",checks,failed); return failed!=0;
 } }

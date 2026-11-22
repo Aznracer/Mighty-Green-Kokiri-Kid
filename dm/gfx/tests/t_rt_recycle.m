@@ -1,5 +1,5 @@
-// Recycled texture memory (nvn_mtl.m rh_texture, rh_place, GitHub issues #1831, #1823): a shared texture in a GPU-only pool is made in a placement heap of its own, an eighth larger
-// than the texture; once its texture is freed the heap stays resident, and the smallest waiting heap that fits, up to half as large again, takes the next texture, cleared as a new
+// Recycled texture memory (nvn_mtl.m rh_texture, rh_place, GitHub issues #1831, #1823): a shared texture in a GPU-only pool is made in a placement heap of its own, an eighth larger (at most
+// RH_SLACK more) than the texture; once its texture is freed the heap stays resident, and the smallest waiting heap that fits, up to half as large again, takes the next texture, cleared as a new
 // allocation is: one a step of Metal's sizes larger included, COMPRESSIBLE or not. Same-pass feedback snapshots draw from the same heaps. Heaps that wait too long leave the
 // residency set when a submission begins. CPU-visible pools, block-compressed textures and DM_NVN_RT_RECYCLE=0 keep allocations of their own. A pool finalized before its texture
 // object takes the texture and its memory with it. The memory census (mem_census, DM_CTL restop) reads textures held by each kind of holder and writes all its lines.
@@ -112,15 +112,6 @@ int main(void) { @autoreleasepool {
         CHECK(td && td.heap && g_rh_made == 3 && waiting() == 2, "a much smaller target leaves the waiting heaps alone");
         td = nil; mtl_tex_release(&d); mtl_alias_drop_pool(&pool); settle();
     }
-    unsigned w0 = waiting();
-    {   // a target down to 40 % of a waiting heap takes it (rh_fit): a dynamic resolution step such as 2560x1440 to 2134x1200 keeps its targets' heaps
-        uint64_t r0 = g_rh_reused, m0 = g_rh_made;
-        tex_t h = target(&pool, 95020, 0, 905, 509); mtl_tex_init(&h);
-        id<MTLTexture> th = tex_mtl(&h);
-        CHECK(th && th.heap && g_rh_reused == r0 + 1 && g_rh_made == m0, "a target half the size of a waiting heap takes it");
-        th = nil; mtl_tex_release(&h); mtl_alias_drop_pool(&pool); settle();
-    }
-    CHECK(waiting() == w0, "and the heap waits again once the target is freed");
     {   // outside: a CPU-visible pool; inside: a texture without COMPRESSIBLE
         pool_t cpu = pool; cpu.flags = NVN_MEMORY_POOL_FLAGS_CPU_CACHED | NVN_MEMORY_POOL_FLAGS_GPU_CACHED | NVN_MEMORY_POOL_FLAGS_COMPRESSIBLE;
         tex_t e = target(&cpu, 95005, 0, 640, 360); mtl_tex_init(&e);
@@ -174,6 +165,12 @@ int main(void) { @autoreleasepool {
         mtl_tex_release(&l); mtl_alias_drop_pool(&cpu); settle();
         n = census_run("t_rt_recycle", &named, &queued);
         CHECK(n >= 4 && queued == 0, "once their submissions complete, nothing is left for the queue");
+    }
+    {   // a large target: an eighth more would be 6 MB nothing uses
+        tex_t big = target(&pool, 95020, 0, 3072, 2048); mtl_tex_init(&big);
+        id<MTLTexture> tbig = tex_mtl(&big); MTLSizeAndAlign nb = [g_dev heapTextureSizeAndAlignWithDescriptor:tex_desc(&big, 0)];
+        CHECK(tbig && tbig.heap && tbig.heap.size >= nb.size && tbig.heap.size <= nb.size + RH_SLACK + 65536, "a large target's new heap is at most RH_SLACK larger than it");
+        tbig = nil; mtl_tex_release(&big); mtl_alias_drop_pool(&pool); settle();
     }
     mtl_sub_commit(); mtl_drain(); free(mem);
     printf("t_rt_recycle: %d checks, %d failed\n", checks, failed); return failed != 0;

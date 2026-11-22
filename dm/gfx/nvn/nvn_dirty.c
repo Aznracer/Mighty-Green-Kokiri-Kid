@@ -34,11 +34,7 @@ enum { BLK_SHIFT = 10, BLK = 1 << BLK_SHIFT, NBLK = 256, MAX_RANGE = BLK * NBLK 
 // without a fault. A stamp older than born therefore counts as written (nvn_dirty_since_cached, nvn_dirty_since_except).
 // pins: the lock-free readers (the fault hook, the host pre-write hook, the dirty checks, describe) pin a slot before they read its fields past base and end, and add_range rewrites a
 // retired slot for the next pool only once none holds it (pin). base and end are read before the pin, to pass over slots that cannot hold the address, so they are atomic
-// bgen: per block of BGEN_PAGES pages, the highest generation of its pages (stamp_page), so a check over a texture's pages (nvn_dirty_since_cached) passes over a block no page
-// of which was written since its stamp. A Mario Kart World race binds packaged textures of several MB, each checked page by page after any write to any tracked page (the game's
-// one or two a frame): about 3 % of the replay thread (M3 Max)
-enum { BGEN_SHIFT = 6, BGEN_PAGES = 1 << BGEN_SHIFT };
-typedef struct { _Atomic uintptr_t base, end; uintptr_t mem; _Atomic uint8_t *state; _Atomic uint64_t *gen, *bgen; _Atomic(_Atomic uint8_t *) sparse; size_t cap; _Atomic int live, pins; _Atomic uint64_t born; } range_t;   // sparse: per page, protected for a placement sparse tile (nvn_dirty_protect_sparse)
+typedef struct { _Atomic uintptr_t base, end; uintptr_t mem; _Atomic uint8_t *state; _Atomic uint64_t *gen; _Atomic(_Atomic uint8_t *) sparse; size_t cap; _Atomic int live, pins; _Atomic uint64_t born; } range_t;   // sparse: per page, protected for a placement sparse tile (nvn_dirty_protect_sparse)
 static inline uintptr_t rb(range_t *r) { return atomic_load_explicit(&r->base, memory_order_relaxed); }
 static inline uintptr_t re(range_t *r) { return atomic_load_explicit(&r->end, memory_order_relaxed); }
 static _Atomic(range_t *) g_blk[NBLK];
@@ -188,10 +184,7 @@ static range_t *pin_span(range_t *kept, uintptr_t a, size_t len) {
     return r;
 }
 static void stamp_page(range_t *r, uintptr_t p) {
-    uint64_t g = atomic_fetch_add(&g_now, 1) + 1;
-    atomic_store(&r->gen[p], g);
-    _Atomic uint64_t *bg = &r->bgen[p >> BGEN_SHIFT]; uint64_t was = atomic_load(bg);   // the block's highest: two writers may take their generations in one order and store them in the other
-    while (was < g && !atomic_compare_exchange_weak(bg, &was, g)) {}
+    atomic_store(&r->gen[p], atomic_fetch_add(&g_now, 1) + 1);
     // Publish completion after the generation: a checker may have cached "clean" using the incremented clock before the generation store. Both fault and host-write paths
     // must invalidate that cached clock, as the page stays writable until the next upload protects it again.
     atomic_fetch_add(&g_now, 1);
@@ -231,34 +224,6 @@ static int page_writable(uintptr_t a) {
     if (vm_region_64(mach_task_self(), &va, &vs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &obj) != KERN_SUCCESS || va > pg) return 0;
     return (bi.protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == VM_PROT_WRITE;
 }
-// Pages released ahead of a sequential write (DM_NVN_FAULT_AHEAD=<pages>, 32 by default, 0 off, ab alternates under DM_AB). A game that fills a pool's protected pages in order
-// (streamed data decompressed into texture storage) faulted on every page: Mario Kart World's races take 1,000-2,500 faults a second, 82-96 % of them on the page right after
-// the thread's last fault, at about 24 µs of CPU each (signal delivery, the range scan, an mprotect). A fault on the page a thread's last fault or release ahead ended at
-// releases the next pages of the same range too, a window that doubles with each such fault up to the limit, stopping at the first page not protected and before the range's
-// last page (it may be another range's first). A page released ahead counts as written (stamped), as one written at its own fault would: at worst a texture over it is uploaded
-// once more. Written later, after an upload protected it again, it faults as before. The handler's state is per thread, in a table by pthread_self (no thread-local storage there)
-enum { FA_SLOTS = 64 };
-static struct { _Atomic uintptr_t tid, next; _Atomic uint32_t k; } g_fa[FA_SLOTS];
-static _Atomic int g_fa_mode = -1, g_fa_max;   // read before any fault can come (nvn_dirty_add_range: fa_init)
-static _Atomic uint64_t g_fa_pages, g_fa_runs;
-// nvn_mtl.m's switches; without it (the tracking's own tests) a plain reading, as hle_thread.c's fallbacks
-__attribute__((weak)) int mtl_sw_mode(const char *name, int dflt) { const char *e = getenv(name); return e && *e ? strncmp(e, "ab", 2) && atoi(e) != 0 : dflt; }
-__attribute__((weak)) int mtl_sw_on(int m) { return m == 1; }
-static void fa_init(void) {
-    if (atomic_load(&g_fa_mode) >= 0) return;
-    const char *e = getenv("DM_NVN_FAULT_AHEAD"); int mx = e && *e && strncmp(e, "ab", 2) ? atoi(e) : 32; if (mx > 256) mx = 256; if (mx < 0) mx = 0;
-    atomic_store(&g_fa_max, mx); atomic_store(&g_fa_mode, mtl_sw_mode("DM_NVN_FAULT_AHEAD", 1));
-}
-static int fa_on(void) { int m = atomic_load_explicit(&g_fa_mode, memory_order_relaxed); return m == 1 || (m > 1 && mtl_sw_on(m)); }
-static uint32_t fa_release(range_t *r, uintptr_t p, uintptr_t q) {   // the protected pages p.. of r, at most to q, up to the first that is not: one mprotect, each stamped
-    uintptr_t i = p;
-    while (i <= q) { uint8_t st = PG_PROT; if (!atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY)) break; i++; }
-    if (i == p) return 0;
-    mp(rb(r) + (p << g_shift), (i - p) << g_shift, PROT_READ | PROT_WRITE);
-    for (uintptr_t k = p; k < i; k++) { stamp_page(r, k); sparse_note(r, k); atomic_store(&r->state[k], PG_NONE); }
-    atomic_fetch_add(&g_fa_pages, i - p); atomic_fetch_add(&g_fa_runs, 1); return (uint32_t)(i - p);
-}
-void nvn_dirty_ahead_stats(uint64_t *pages, uint64_t *runs) { *pages = atomic_load(&g_fa_pages); *runs = atomic_load(&g_fa_runs); }
 // A write that faulted on a protected page may be handled only after a pool over it was retired: nvn_dirty_remove_range makes the pages writable, then drops the range, and the
 // scan then found no range to claim the fault, so the crash handler stopped the host on a write that was the tracker's (t_dirty_reuse). So a fault no range claims is re-executed
 // when the page is writable by now; and when it is not, but a protection change of this module ran during the scan (a pool registered over the page and protected it, say),
@@ -266,17 +231,12 @@ void nvn_dirty_ahead_stats(uint64_t *pages, uint64_t *runs) { *pages = atomic_lo
 static int on_fault(void *addr, int is_write, void *uc) {
     (void)uc;
     if (!is_write) return 0;
-    uintptr_t a = (uintptr_t)addr, pa = a >> g_shift, self = (uintptr_t)pthread_self();
-    unsigned fs = (unsigned)((self >> 4) * 0x9E3779B97F4A7C15ull >> 58) & (FA_SLOTS - 1); uint32_t k = 0;   // pages to release ahead (fa_release)
-    if (fa_on() && atomic_load_explicit(&g_fa[fs].tid, memory_order_relaxed) == self && atomic_load_explicit(&g_fa[fs].next, memory_order_relaxed) == pa) {
-        uint32_t mx = (uint32_t)atomic_load_explicit(&g_fa_max, memory_order_relaxed); k = atomic_load_explicit(&g_fa[fs].k, memory_order_relaxed); k = k ? 2 * k : 1; if (k > mx) k = mx; }
+    uintptr_t a = (uintptr_t)addr;
     for (int tries = 0; tries < 1000; tries++) {
-        uint64_t done = atomic_load(&g_mp_done); int ours = 0, n = atomic_load(&g_nr); uint32_t got = 0, kk = k;
+        uint64_t done = atomic_load(&g_mp_done); int ours = 0, n = atomic_load(&g_nr);
         for (int i = 0; i < n; i++)   // Every range sharing the page must be released: releasing only one leaves the other range's state at "protected", and later writes no longer fault and are missed
-            { range_t *r = rg(i); if (live_at(i) && a >= rb(r) && a < re(r) && pin(r)) { if (a >= rb(r) && a < re(r)) { uintptr_t p = (a - rb(r)) >> g_shift, last = ((re(r) - rb(r)) >> g_shift) - 1; int mine = release_page(r, p, &g_faults); ours |= mine;
-                  if (mine && kk && p + 1 < last) { got = fa_release(r, p + 1, p + kk < last - 1 ? p + kk : last - 1); kk = 0; } }   // ahead in one range: the first whose page this is not the last of
-              unpin(r); } }
-        if (ours) { atomic_store_explicit(&g_fa[fs].tid, self, memory_order_relaxed); atomic_store_explicit(&g_fa[fs].next, pa + 1 + got, memory_order_relaxed); atomic_store_explicit(&g_fa[fs].k, k, memory_order_relaxed); return 1; }
+            { range_t *r = rg(i); if (live_at(i) && a >= rb(r) && a < re(r) && pin(r)) { if (a >= rb(r) && a < re(r)) ours |= release_page(r, (a - rb(r)) >> g_shift, &g_faults); unpin(r); } }
+        if (ours) return 1;
         if (page_writable(a)) return 1;
         if (atomic_load(&g_mp_begun) == done) return 0;   // none begun since the scan began, none in flight then: the page's protection is not this module's
     }
@@ -324,7 +284,6 @@ __attribute__((constructor)) static void dirty_init(void) {
 }
 
 void nvn_dirty_add_range(const void *mem, size_t size) {
-    fa_init();
     atomic_fetch_add(&g_adds_total, 1);
     pthread_mutex_lock(&g_slot_mu);
     int n = atomic_load(&g_nr);
@@ -349,19 +308,18 @@ void nvn_dirty_add_range(const void *mem, size_t size) {
     uintptr_t base = (uintptr_t)mem & ~(g_pg - 1), end = ((uintptr_t)mem + size + g_pg - 1) & ~(g_pg - 1);
     size_t np = (end - base) >> g_shift;
     _Atomic uint8_t *state = r->state;
-    _Atomic uint64_t *gen = r->gen, *bgen = r->bgen;
-    size_t nb = (np + BGEN_PAGES - 1) >> BGEN_SHIFT;
+    _Atomic uint64_t *gen = r->gen;
     if (r->cap < np) {
-        free((void *)state); free((void *)gen); free((void *)bgen); free((void *)atomic_load(&r->sparse));   // no reader holds them: none is pinned, and a reader pins before it reads the pointers
-        state = calloc(np, 1); gen = calloc(np, sizeof *gen); bgen = calloc(nb, sizeof *bgen);
-        if (!state || !gen || !bgen) die("dirty-page table allocation failed (%zu pages)", np);
+        free((void *)state); free((void *)gen); free((void *)atomic_load(&r->sparse));   // no reader holds them: none is pinned, and a reader pins before it reads the pointers
+        state = calloc(np, 1); gen = calloc(np, sizeof *gen);
+        if (!state || !gen) die("dirty-page table allocation failed (%zu pages)", np);
         atomic_store(&r->sparse, NULL);   // sized for the old cap
         r->cap = np;
     } else {
-        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen); memset((void *)bgen, 0, nb * sizeof *bgen);
+        memset((void *)state, 0, np); memset((void *)gen, 0, np * sizeof *gen);
         _Atomic uint8_t *sp = atomic_load(&r->sparse); if (sp) memset((void *)sp, 0, np);
     }
-    atomic_store_explicit(&r->base, base, memory_order_relaxed); atomic_store_explicit(&r->end, end, memory_order_relaxed); r->mem = (uintptr_t)mem; r->state = state; r->gen = gen; r->bgen = bgen;
+    atomic_store_explicit(&r->base, base, memory_order_relaxed); atomic_store_explicit(&r->end, end, memory_order_relaxed); r->mem = (uintptr_t)mem; r->state = state; r->gen = gen;
     atomic_store_explicit(&r->born, atomic_fetch_add(&g_now, 1) + 1, memory_order_relaxed); atomic_fetch_add(&g_now, 1);   // published by the release store of live below; stamps taken from now on are past it
     if (slot == n) atomic_store(&g_nr, n + 1);
     atomic_store_explicit(&r->live, 1, memory_order_release);
@@ -531,10 +489,7 @@ int nvn_dirty_since_cached(const void **span, const void *addr, size_t len, uint
     if (!r) return 1;   // When untracked, conservatively treat as dirty: better to upload more than to show stale content
     int w = stamp < atomic_load_explicit(&r->born, memory_order_relaxed);   // checked before this pool was registered over the memory: what was written there in between left no generation (born)
     uintptr_t p = (a - rb(r)) >> g_shift, q = (a + len - 1 - rb(r)) >> g_shift;
-    for (uintptr_t i = p; i <= q && !w; ) {   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
-        if (atomic_load(&r->bgen[i >> BGEN_SHIFT]) <= stamp) { i = ((i >> BGEN_SHIFT) + 1) << BGEN_SHIFT; continue; }   // no page of this block written since (bgen)
-        w = atomic_load(&r->gen[i]) > stamp; i++;
-    }
+    for (uintptr_t i = p; i <= q && !w; i++) w = atomic_load(&r->gen[i]) > stamp;   // The generation of the last write before upload is <= the stamp; any later write must be > the stamp
     unpin(r);
     return w;
 }
