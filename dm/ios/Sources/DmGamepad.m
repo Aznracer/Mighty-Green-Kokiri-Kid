@@ -3,7 +3,8 @@
 //   The menu button stays while a physical controller is connected, so the menu is there in every layout and with every controller.
 //   Native (native, layout 3): a mobile game's layout in very transparent glass, after the mock-up the player chose: a floating left stick (a thumb on the left half holds it,
 //     centred where it lands, or on the drawn ring), the camera (right stick) on any touch of the right half no key takes, and round icon keys whose button letter sits in a small
-//     chip (round for A B X Y + −, square for the shoulders R and ZL): B a sword, A a tap, R a shield, ZL a target, X a jump (two up arrows), Y a grid, + a menu, − a map; the menu button (…) at the top right.
+//     chip (round for A B X Y + −, square for the shoulders R and ZL): B a sword, A a tap, R a shield, ZL a target, X a jump (two up arrows), Y a grid, + the menu (a treasure chest, beside − at the top right), − a map; the menu button (…) next to them.
+//     In every layout a quick tap on ZL (L2) locks it on and the next touch on it releases it (K_ZL_TAP); a longer press is a plain hold.
 //     No D-pad, L, ZR, L3 or R3 (the 3D layout has them). Drawn with shape and gradient layers only (no live blur), so it costs the GPU nothing over the picture.
 //   Tap (touch): no control but the menu button, every other touch goes to the game's local touch viewport; offered only while the game is in handheld mode, the only one in which it reads the touch screen (Balatro, played by touch).
 //   2D (simple): top corners ZL above L (one column), ZR above R likewise, teardrops with the tip toward the screen corner; − and + side by side at the top centre; the left stick in the bottom-left corner (fixed ring, tilt measured from the ring centre, small dead zone);
@@ -138,7 +139,8 @@ static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2
 static NSString *const k_native_key = @"DmPadNativeOffered";   // a profile that starts in Native switches to it once, over a layout saved before Native existed
 // Native layout (in points of an 874 x 402 landscape screen, scaled by gu; x from the corner rectangle's edges, y from its top or bottom): centre, radius
 static const int k_nat[] = {B_B, B_A, B_R, B_ZL, B_X, B_Y, B_PLUS, B_MINUS, B_ZR, B_LEFT, B_UP, B_RIGHT, B_DOWN};   // native_oot.py: ZR and a D-pad added
-static const CGFloat N_RING_R = 62, N_KNOB_R = 27, N_STICK_X = 120, N_STICK_Y = 105, N_MENU_X = 80, N_TOP_Y = 32, N_TOP_R = 18;
+static const CGFloat N_RING_R = 62, N_KNOB_R = 27, N_STICK_X = 120, N_STICK_Y = 105, N_MENU_X = 126, N_TOP_Y = 32, N_TOP_R = 18;   // v10: + (the chest) beside − (the map) at the top right, the menu button (…) one place further in
+static const NSTimeInterval K_ZL_TAP = 0.3;   // ZL (L2) touched for less than this (seconds) locks it on, held until the next touch on it (cheemu21's kid-with-sword-remake Native layout)
 int dm_opmode(void);   // hle_oe.c: 0 = handheld
 
 @interface DmGamepad : UIView
@@ -173,6 +175,8 @@ static void pads_start(void);   // Physical controllers, below
     DmLayout _layout;
     UITouch *_game[16];                            // touches on the game's touch screen by finger slot
     BOOL _native;                                  // the Native layout is current
+    BOOL _zlLock, _zlShown; NSTimeInterval _zlDown;          // ZL (L2) locked on by a quick tap, held until the next tap on it; when the touch holding ZL landed
+    CALayer *_zlMark;                              // Native: the padlock badge on ZL, shown while it is locked
     CALayer *_nat, *_nk[B_N]; CAShapeLayer *_nbase[B_N];   // Native: its layers, one glass disc per key and the disc's base (its fill shows the press)
     CALayer *_nring, *_nknob; CAShapeLayer *_nknobBase;    // Native: the left stick's ring and knob
     CGPoint _lCentre;                              // Native: the left stick's centre while held (where its touch landed, or the ring)
@@ -272,6 +276,22 @@ static void glassSword(CALayer *g, CGFloat s) {
     CGPathAddEllipseInRect(p, &m, CGRectMake(-s * 0.13, s * 0.82, s * 0.26, s * 0.26));   // the pommel
     CAShapeLayer *l = [CAShapeLayer layer]; l.frame = g.bounds; l.path = p; l.fillColor = [UIColor colorWithWhite:1 alpha:0.95].CGColor;
     l.shadowColor = UIColor.blackColor.CGColor; l.shadowOpacity = 0.4; l.shadowRadius = 1.5; l.shadowOffset = CGSizeMake(0, 1); l.shadowPath = p;
+    CGPathRelease(p); [g addSublayer:l];
+}
+// The chest for + (the menu) in the Native layout, from cheemu21's kid-with-sword-remake A7 icons: white shapes with a soft shadow, in units of s (half the icon's size) around the
+// key's centre; even-odd, so the lid's hinges, the lock plate and the bands cut through
+static void iconChest(CALayer *g, CGFloat s) {
+    CGFloat r = g.bounds.size.width / 2; CGAffineTransform m = CGAffineTransformScale(CGAffineTransformMakeTranslation(r, r), s, s);
+    CGMutablePathRef p = CGPathCreateMutable();
+    CGPathMoveToPoint(p, &m, -0.88, -0.16); CGPathAddLineToPoint(p, &m, -0.88, -0.4);
+    CGPathAddQuadCurveToPoint(p, &m, -0.88, -0.82, 0, -0.82); CGPathAddQuadCurveToPoint(p, &m, 0.88, -0.82, 0.88, -0.4);
+    CGPathAddLineToPoint(p, &m, 0.88, -0.16); CGPathCloseSubpath(p);   // the lid
+    CGPathAddRoundedRect(p, &m, CGRectMake(-0.56, -0.62, 0.14, 0.4), 0.03, 0.03); CGPathAddRoundedRect(p, &m, CGRectMake(0.42, -0.62, 0.14, 0.4), 0.03, 0.03);
+    CGPathAddRoundedRect(p, &m, CGRectMake(-0.88, -0.06, 1.76, 0.82), 0.06, 0.06);   // the box
+    CGPathAddRoundedRect(p, &m, CGRectMake(-0.14, 0.0, 0.28, 0.3), 0.05, 0.05);       // the lock plate
+    CGPathAddRoundedRect(p, &m, CGRectMake(-0.56, 0.06, 0.14, 0.6), 0.03, 0.03); CGPathAddRoundedRect(p, &m, CGRectMake(0.42, 0.06, 0.14, 0.6), 0.03, 0.03);
+    CAShapeLayer *l = [CAShapeLayer layer]; l.frame = g.bounds; l.path = p; l.fillColor = [UIColor colorWithWhite:1 alpha:0.95].CGColor; l.fillRule = kCAFillRuleEvenOdd;
+    l.shadowColor = UIColor.blackColor.CGColor; l.shadowOpacity = 0.4; l.shadowRadius = 1.5; l.shadowOffset = CGSizeMake(0, 1);
     CGPathRelease(p); [g addSublayer:l];
 }
 // The button's letter: a small round glass chip at the lower right (face keys, + and −), or a rounded rectangle for a shoulder (R, ZL), so it never reads as a face key
@@ -439,7 +459,7 @@ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPoint
         case B_DOWN: x = L + 120 * g; y = Bt - 272 * v; rr = 17; break;   // clear of the game's hearts and item icons at the top left; up / down the context swaps (boots)
         case B_LEFT: x = L + 86 * g; y = Bt - 306 * v; rr = 17; break;    // the ocarina
         case B_RIGHT: x = L + 154 * g; y = Bt - 306 * v; rr = 17; break;  // Navi
-        case B_PLUS: x = L + 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;
+        case B_PLUS: x = R - 80 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // v10: beside the map (was the top left)
         default: x = R - 34 * g; y = T + N_TOP_Y * g; rr = N_TOP_R; break;   // −
     }
     *c = CGPointMake(x, y); *r = rr * g;
@@ -560,6 +580,7 @@ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); 
     for (UITouch *t in _owner) { uint64_t v = [_owner objectForKey:t].unsignedLongLongValue; int c = (int)(v & 0xff);
         if (c == C_BTN) btn |= 1ull << (v >> 8);
         else if (c == C_DPAD) dpad |= [self dpadAt:[t locationInView:self]]; }
+    if (_zlLock) btn |= 1ull << B_ZL;   // locked on: held with no touch on it
     int32_t ax[4] = {0};
     for (int i = 0; i < 2; i++) {
         CGPoint o = [self knobOffset:i]; CGFloat R = [self stickR:i], d = hypot(o.x, o.y), dz = R * K_DEAD;
@@ -567,14 +588,14 @@ static CGFloat dist(CGPoint a, CGPoint b) { return hypot(a.x - b.x, a.y - b.y); 
         CGFloat m = fmin((d - dz) / (R * K_FULL - dz), 1) / d;   // outside the dead zone: 0 rising to full at the full-tilt radius
         ax[i * 2] = (int32_t)lrint(o.x * m * 32767); ax[i * 2 + 1] = (int32_t)lrint(-o.y * m * 32767);   // host: up is positive; rounded so full tilt is exactly 32767
     }
-    BOOL changed = face != _faceBits || dpad != _dpadBits || btn != _btnBits;
+    BOOL changed = face != _faceBits || dpad != _dpadBits || btn != _btnBits || _zlLock != _zlShown;   // a tap that locks ZL keeps it held: only the badge changes
     uint64_t pressed = (face | dpad | btn) & ~(_faceBits | _dpadBits | _btnBits);
     unsigned gripping = (_stick[0] ? 1u : 0) | (_stick[1] ? 2u : 0);
     if (pressed || (gripping & ~_hapticSticks)) {
         [_touchFeedback impactOccurredWithIntensity:0.6]; [_touchFeedback prepare];
     }
     _hapticSticks = gripping;
-    _faceBits = face; _dpadBits = dpad; _btnBits = btn;
+    _faceBits = face; _dpadBits = dpad; _btnBits = btn; _zlShown = _zlLock;
     pthread_mutex_lock(&g_mu);
     g_touch_btn = face | dpad | btn; g_touch_lx = ax[0]; g_touch_ly = ax[1]; g_touch_rx = ax[2]; g_touch_ry = ax[3];
     pthread_mutex_unlock(&g_mu);
@@ -623,6 +644,8 @@ int front_web_touch(void);
         CGPoint p = [t locationInView:self];
         if (_layout.separated && !CGRectContainsPoint(_layout.controls, p)) { game |= [self gameBegin:t]; continue; }
         int hit = _tap ? -1 : [self btnAt:p];   // the menu button took its own touches (menuTakes)
+        if (hit == B_ZL && _zlLock) { _zlLock = NO; [_owner setObject:@(C_NONE) forKey:t]; continue; }   // a touch on a locked ZL releases it (and presses nothing)
+        if (hit == B_ZL) _zlDown = t.timestamp;
         if (hit >= 0) { [_owner setObject:@(C_BTN | (uint64_t)hit << 8) forKey:t]; continue; }
         if (_native) {   // Native: the left half holds the left stick (centred on its ring when the touch lands on it, else where it lands), the right half the camera
             int idx = p.x < CGRectGetMidX(_layout.controls) ? 0 : 1;
@@ -664,6 +687,7 @@ int front_web_touch(void);
     for (UITouch *t in ts) {
         uint64_t v = [_owner objectForKey:t].unsignedLongLongValue;
         if ((v & 0xff) == C_GAME && (v >> 8) < 16) { _game[v >> 8] = nil; game = YES; }
+        if (ended && v == (C_BTN | (uint64_t)B_ZL << 8) && t.timestamp - _zlDown < K_ZL_TAP) _zlLock = YES;   // a quick tap locks ZL on; a longer press stays a plain hold
         [_owner removeObjectForKey:t]; [_faceOf removeObjectForKey:t]; for (int i = 0; i < 2; i++) if (t == _stick[i]) _stick[i] = nil;
     }
     if (game) [self pushGame];
@@ -671,7 +695,7 @@ int front_web_touch(void);
 }
 - (void)touchesEnded:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:YES]; }
 - (void)touchesCancelled:(NSSet<UITouch *> *)ts withEvent:(UIEvent *)e { [self endTouches:ts tapped:NO]; }
-- (void)reset { [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
+- (void)reset { _zlLock = NO; [_owner removeAllObjects]; [_faceOf removeAllObjects]; _stick[0] = _stick[1] = nil; for (int i = 0; i < 16; i++) _game[i] = nil; [self pushGame]; [self recompute]; }
 
 // ---- Shapes ----
 static CGPathRef circlePath(CGPoint c, CGFloat r) { return CGPathCreateWithEllipseInRect(CGRectMake(c.x - r, c.y - r, 2 * r, 2 * r), NULL); }
@@ -760,8 +784,12 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     static NSString *const chip[B_N] = { [B_A] = @"A", [B_B] = @"B", [B_X] = @"X", [B_Y] = @"Y", [B_R] = @"R", [B_ZL] = @"ZL", [B_ZR] = @"ZR", [B_PLUS] = @"+", [B_MINUS] = @"\u2212" };
     for (int i = 0; i < (int)(sizeof k_nat / sizeof *k_nat); i++) { int b = k_nat[i]; CGPoint c; CGFloat r; [self nat:b centre:&c radius:&r];
         CAShapeLayer *base = nil; CALayer *d = glassDisc(r, &base); d.position = c;
-        if (b == B_Y) glassSword(d, 24 * g); else if (b == B_B) glassWords(d, @"Put\nAway", 9.5 * g, scale); else glassSymbol(d, sym[b], (b == B_A ? 17 : b == B_PLUS || b == B_MINUS || b >= B_LEFT ? 11 : b == B_X ? 14 : b == B_B ? 12 : 15) * g, scale);
+        if (b == B_Y) glassSword(d, 24 * g); else if (b == B_PLUS) iconChest(d, r * 0.52); else if (b == B_B) glassWords(d, @"Put\nAway", 9.5 * g, scale); else glassSymbol(d, sym[b], (b == B_A ? 17 : b == B_PLUS || b == B_MINUS || b >= B_LEFT ? 11 : b == B_X ? 14 : b == B_B ? 12 : 15) * g, scale);
         if (b < B_LEFT) glassChip(d, pad_label(b, chip[b]), b == B_R || b == B_ZL || b == B_ZR, scale);   // the D-pad keys carry their icon alone
+        if (b == B_ZL) {   // the lock badge: a small gold disc with a padlock at the key's upper right, shown while ZL is locked
+            CGFloat br = 9 * g; CALayer *m = glassDisc(br, NULL); ((CAShapeLayer *)m.sublayers.firstObject).fillColor = [UIColor colorWithRed:1 green:0.82 blue:0.3 alpha:0.9].CGColor;
+            glassSymbol(m, @"lock.fill", 8 * g, scale); m.position = CGPointMake(r + r * 0.72, r - r * 0.72); m.hidden = !_zlLock; [d addSublayer:m]; _zlMark = m;
+        }
         [_nat addSublayer:d]; _nk[b] = d; _nbase[b] = base; pad_cache(d, scale);
     }
 }
@@ -776,6 +804,7 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     if (_native) {   // pressed: the base turns light blue and the disc grows a little; the stick's ring sits where it is held, its knob follows the thumb
         for (int i = 0; i < (int)(sizeof k_nat / sizeof *k_nat); i++) { int b = k_nat[i]; BOOL on = (all >> b) & 1;
             _nbase[b].fillColor = (on ? g_glassOn : g_glassIdle).CGColor; _nk[b].transform = on ? CATransform3DMakeScale(1.06, 1.06, 1) : CATransform3DIdentity; }
+        _zlMark.hidden = !_zlLock; _nbase[B_ZL].strokeColor = _zlLock ? [UIColor colorWithRed:1 green:0.82 blue:0.3 alpha:0.95].CGColor : nil; _nbase[B_ZL].lineWidth = _zlLock ? 2.5 : 0;
         CGPoint c = [self stickCentre:0]; _nring.position = c; _nknob.position = CGPointMake(c.x + o.x, c.y + o.y);
         _nknobBase.fillColor = (_stick[0] ? g_glassOn : g_glassIdle).CGColor;
     }

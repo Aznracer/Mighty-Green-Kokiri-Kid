@@ -58,7 +58,9 @@ present_snap	on
 enc_thread	on
 # On the iPhone Duo the replay encodes itself instead (enc_thread_ios off): Castle Town dropped about half as many frames (34-40 fps against 24-33), Kakariko held its 40 fps,
 # and the real-time shares follow (hle_nvn.c rt_share: 0.25 acquire, 0.65 replay). DM_NVN_ENC_THREAD=1 or the launcher's Encode thread turns it back on
-enc_thread_ios	off
+# v10: on again. On v5's base (2026-11-22) the replay alone needed 25 ms a frame at 1.5 GHz in busy areas; cheemu21's L8.2 with the encode thread kept its threads at 5-10 ms,
+# mostly at 3-4 GHz, and the iPhone Duo got smoother with DM_NVN_ENC_THREAD=1 on v9. DM_NVN_ENC_THREAD=0 or the launcher's Encode thread turns it off
+enc_thread_ios	on
 # Screen shape (patches.py screen_shape): DM_SCREEN_ASPECT renders the iPhone Duo's 1.43:1 screen in its own shape, the display size's height from the screen's ratio
 # (2560x1792 docked) and the views' vertical angle widened so 16:9's sides stay in view (more above and below); the iOS launcher offers it (Picture shape)
 screen_aspect	on
