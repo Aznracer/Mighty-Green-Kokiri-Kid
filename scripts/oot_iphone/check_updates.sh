@@ -90,11 +90,17 @@ for p in new[-40:]:
     print(f"#{p['number']} {state(p):6} {p['user']['login']:18.18} | {p['title'][:150]}{tag}")
 if prs: open(lf, 'w').write(str(max(p['number'] for p in prs)))
 # Pull requests this build has taken in before upstream merged them: once one is merged, pull main instead
-watch = {2912: 'Mario Kart World CPU cost (merged into v4 by hand)', 2925: 'microphone input (merged into v4 by hand)', 2940: 'Ocarina DM_DRS_LEVEL (merged into v4 by hand)'}
+watch = {2940: 'Ocarina DM_DRS_LEVEL', 3176: 'blend fix-up specialized away (chain change)', 3180: 'write-fault loops on hot pages',
+         3184: 'Bluetooth audio: eight blocks in flight', 3195: 'Ocarina prewarm rows from a Mac player', 3209: 'Ocarina vertical view on taller screens (culling, shadows)'}
 seen = {p['number']: p for p in prs}
 print(); print('=== pull requests taken into v4 early')
 for n, what in watch.items():
     p = seen.get(n)
-    s = state(p) if p else 'not in the last 60 (look on GitHub)'
+    if not p:   # older than the last 60: ask for it alone
+        try:
+            import urllib.request
+            with urllib.request.urlopen(f'https://api.github.com/repos/seedds/nxnative/pulls/{n}', timeout=15) as r: p = json.load(r)
+        except Exception: p = None
+    s = state(p) if p else 'not found (look on GitHub)'
     print(f"  #{n} {what}: {s}" + ('  -> merged upstream: pull main' if p and p.get('merged_at') else ''))
 EOF
