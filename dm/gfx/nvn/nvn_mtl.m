@@ -574,7 +574,7 @@ static int mem_hot(void) {
     uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     if (at && now - at < 500000000ull) return atomic_load_explicit(&g_mem_hot, memory_order_relaxed);
     at = now;
-    if (cfg.high_mb < 0) { const char *h = getenv("DM_NVN_MEM_HIGH_MB"), *r = getenv("DM_NVN_MEM_ROOM_MB"); cfg.high_mb = h && *h ? atoll(h) : 0; cfg.room_mb = r && *r ? atoll(r) : 1200;   // v8: 1200 (cheemu21: 3000): the iPhone Duo plays with 1.6-1.9 GB of room in heavy areas, where 3000 kept the mode on for good and freed 481 of 625 recycled heaps unused (2026-11-22)
+    if (cfg.high_mb < 0) { const char *h = getenv("DM_NVN_MEM_HIGH_MB"), *r = getenv("DM_NVN_MEM_ROOM_MB"); cfg.high_mb = h && *h ? atoll(h) : 0; cfg.room_mb = r && *r ? atoll(r) : 2000;   // v9: 2000 (cheemu21: 3000; v8 1200): the iPhone Duo plays with 1.6-1.9 GB of room in heavy areas, where 3000 kept the mode on for good and freed 481 of 625 recycled heaps unused; at 1200 it never came on and the app was ended at 1.65 GB of room (iOS reset its media services first, 2026-11-22)
         MLOG("memory pressure mode: from a %lld MB footprint (DM_NVN_MEM_HIGH_MB, 0 = not by footprint) or under %lld MB of room to the iOS limit (DM_NVN_MEM_ROOM_MB, 0 = not by room)", (long long)cfg.high_mb, (long long)cfg.room_mb); }
     task_vm_info_data_t vi; mach_msg_type_number_t cnt = TASK_VM_INFO_COUNT; int64_t fp = 0, room = -1;
     if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &cnt) == KERN_SUCCESS) fp = (int64_t)(vi.phys_footprint >> 20);
