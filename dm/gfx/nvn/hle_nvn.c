@@ -3136,6 +3136,7 @@ static void fstep_tick(const win_t *o, int c) {
     g_fs.per_vsync = fstep_hz() / 60; g_fs.t120 = t120;
     if (fstep_floor()) { int um = fstep_up_ms(); g_fs.up_wait = um > 0 ? um * fstep_hz() / 1000.0 : 0.01; g_fs.up_fit = um / 25 > 1 ? um / 25 : 1;
                          const char *dlv = getenv("DM_FPS_DOWN_LATE"); g_fs.down_late = dlv && *dlv ? atoi(dlv) : 1;
+                         const char *tgv = getenv("DM_FPS_TRIAL_GRACE"); g_fs.tgrace = tgv && *tgv ? atoi(tgv) : 0;   // an iPhone paced at 40 runs the GPU at about 60 % of its clock (Hyrule Field, 2026-11-23: its tiny passes 12 us against 7.5): a try at 60 lasting 2 frames ended before the clock rose
                          const char *pv = getenv("DM_FPS_PREDICT"); g_fs.predict = pv && *pv ? atoi(pv) > 0 : 0; }   // 0: try 60 after every frame that fits it   // late frames at 60 that step to 40 (1-3)
     g_fs.link120 = t120 && mtl_link_active() && mtl_link_rate() == 120;   // 3 ticks show on the screen: a 60 target falls back to 40 before 30
     g_fs.smax = dm_fps_step_max;   // the stub's largest step (Mario Kart World: 2): frames held longer than the game steps would play in slow motion

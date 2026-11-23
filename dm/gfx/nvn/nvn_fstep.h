@@ -76,6 +76,7 @@ typedef struct {
     int predict;              // set by the caller (DM_FPS_PREDICT, default 0): with a 40 floor, scale the cost at 40 by r60 before a trial toward 60; 0 tries 60 after every frame
                               // whose cost fits it, so above 40 each frame shows when it is ready (VRR) and at 40 and below the frames keep a 40 target's pace
     int down_late;            // set by the caller (DM_FPS_DOWN_LATE): with a 40 floor, the late frames in a row at 60 that step to 40 (0 = 3)
+    int tgrace;               // set by the caller (DM_FPS_TRIAL_GRACE, Mighty Green Kokiri Kid): with a 40 floor, a try at 60's grace in frames, renewed as a probe's is while its frames get cheaper (0 = 2)
     double up_wait; int up_fit;   // set by the caller (DM_FPS_UP_MS): with a 40 floor, how long after the last change and after how many frames that fit 60 a trial tries 60
                               // (0 = FSTEP_HOLD0 and FSTEP_RUN)
     double r60, c40;          // 60 target with a 40 floor: how much a frame's cost grows from 40 to 60 (learned from the trials that failed, 1.3 to start), and the cost the last trial
@@ -162,9 +163,10 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     int scr = s->screen; s->screen = 0;
     int late = scr ? scr == 2 : shown > held + late_by + s->shown_slack || cost > held + late_by, grace = s->grace > 0;
     if (grace && !cap_probe) {   // the completed frame at the old cap does not consume the new hold's grace
-        if (s->grace > FSTEP_GRACE / 2) s->pa += cost; else s->pb += cost;
+        const int gw = s->probe || s->t40 ? FSTEP_GRACE : s->tgrace > 2 ? s->tgrace : 2;   // the window this grace was started with: a probe's, or a try at 60's with a 40 floor
+        if (s->grace > gw / 2) s->pa += cost; else s->pb += cost;
         s->plate += late; s->ptotal++;
-        if (!--s->grace && s->ramp && s->plate && s->ptotal + FSTEP_GRACE <= FSTEP_PROBE_MAX && s->pb <= (1 - FSTEP_RAMP) * s->pa) { s->grace = FSTEP_GRACE; s->pa = s->pb = 0; s->plate = 0; }   // still getting cheaper: another window
+        if (!--s->grace && s->ramp && gw > 2 && s->plate && s->ptotal + gw <= FSTEP_PROBE_MAX && s->pb <= (1 - FSTEP_RAMP) * s->pa) { s->grace = gw; s->pa = s->pb = 0; s->plate = 0; }   // still getting cheaper: another window
     }
     if (late) { s->late++; s->late_run = grace ? 0 : s->late_run + 1; s->fit_run = 0; } else s->late_run = 0;
     // The cost of the frames on time (a hitch is not what the scene costs): at kmin, and at the longer hold
@@ -227,12 +229,12 @@ static inline int nvn_fstep_next(nvn_fstep *s, double shown, double cost, int km
     // (with a 40 floor not while the CPU runs slowed: on the efficiency cores the queue replay thread alone took 15-18 ms a frame, and each try at 60 started the next frame
     // without 40's wait, so the work bunched up and frames slipped to 33 ms; 35-39 fps in Hyrule Field where a 40 target held)
     } else if (!(fl40 && s->cpu_slow) && s->fit_run >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 && s->up_fit > 0 ? s->up_fit : FSTEP_RUN)
-               && s->since >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 ? (s->up_wait > 0 ? s->up_wait : hold0) : s->hold) && !s->trial) { if (fl40) { s->c40 = fitc; s->grace = 2; s->pa = s->pb = 0; s->plate = s->ptotal = 0; } s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
+               && s->since >= (s->link120 && s->t120 && kmin == 2 && kmax == 3 ? (s->up_wait > 0 ? s->up_wait : hold0) : s->hold) && !s->trial) { if (fl40) { s->c40 = fitc; s->grace = s->tgrace > 2 ? s->tgrace : 2; s->pa = s->pb = 0; s->plate = s->ptotal = 0; } s->k -= qd; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0; }
     // A 40 floor without prediction: a try at 60 every 2 s even when the cost at 40 does not fit. An iPhone lowers the GPU clock to the longer hold, so at 40 a scene can read
     // 21-23 ms of GPU that fits 60 at 60's clock (the Deku Tree at resolution level 7: 8-12 ms at 60, 21-23 at 40 after the item screen, and nothing tried 60 again, the probes
     // being off with the floor). A try that misses costs one frame shown at 40's time
     else if (fl40 && !s->predict && !s->cpu_slow && s->k == 3 && !s->trial && s->since >= 2 * hold0) {
-        s->c40 = fitc; s->grace = 2; s->pa = s->pb = 0; s->plate = s->ptotal = 0; s->k = 2; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0;
+        s->c40 = fitc; s->grace = s->tgrace > 2 ? s->tgrace : 2; s->pa = s->pb = 0; s->plate = s->ptotal = 0; s->k = 2; s->downs++; s->trial = FSTEP_RUN; s->fit_run = 0;
     }
     // No probes with a 40 floor: a trial goes up as soon as a frame's cost scaled to 60 (r60) fits, and a probe, which tries 60 without that, failed 15 times in 50 s in
     // Hyrule Field with a 30-frame grace each (frames shown late that do not count)
