@@ -10042,6 +10042,58 @@ static const uint8_t *g_pso_lmap; static id<MTLFunction> g_pso_fsfn; static pso_
 static os_unfair_lock g_bf_fn_lock = OS_UNFAIR_LOCK_INIT;   // bf_fn: a shader's bflib and bffn (the submit thread and the warm-up both ask)
 static nvn_hmap g_pso = {.klen = sizeof(pso_key)}, g_dss;
 static nvn_hmap g_pso_fail = {.klen = sizeof(pso_key)};   // pipelines that failed to build: remembered and never retried (previously every draw recompiled it, over 10,000 times in one iPhone session)
+// DM_GPU_KEEPWARM=<threadgroups> (Mighty Green Kokiri Kid; 0, off, by default; 1 means 8): keeps the iPhone's GPU clock up by giving the GPU a short compute kernel of no use while
+// the game's own work has run out (rx_busy), so the governor sees the GPU busy most of the time. iOS lowers the GPU clock until a paced game's work fills about 70 % of the frame,
+// and Ocarina of Time waits for each frame's last fence before it starts the next, so the GPU idles while the CPU works: in Hyrule Field at 30 fps with frame generation the same
+// passes took 2.2 times as long once it had (its tiny passes 17.5 us against 7.5-8; frames 58 ms, 17 fps), at 40 fps about 1.5 times (11-12 us), and the tries at 60 failed on it
+// (iPhone Duo, 2026-11-23). DM_GPU_KEEPWARM_DUTY (default 75, percent): the share of each idle stretch it fills, in chunks of about 250 us, so the game's next work waits at most one.
+// Off in the background (present suspended) and on a lost GPU; needs the encode thread (DM_NVN_ENC_THREAD), whose commits it reads. More GPU power and heat: for a cooled phone
+static _Atomic int g_kw_started; static _Atomic uint64_t g_kw_chunks, g_kw_ns;
+static void *kw_thread(void *arg) {
+    (void)arg; pthread_setname_np("dm keepwarm");
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+    const char *e = getenv("DM_GPU_KEEPWARM"); int groups = e && *e ? atoi(e) : 0; if (groups == 1) groups = 8; if (groups > 256) groups = 256;
+    const char *dv = getenv("DM_GPU_KEEPWARM_DUTY"); int duty = dv && *dv ? atoi(dv) : 75; if (duty < 10) duty = 10; if (duty > 100) duty = 100;
+    @autoreleasepool {
+        NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
+            "kernel void dm_keepwarm(device uint *o [[buffer(0)]], constant uint &n [[buffer(1)]], uint id [[thread_position_in_grid]]) {\n"
+            "  float a = float(id) * 1e-6f, b = 1.0000001f; for (uint i = 0; i < n; i++) { a = fma(a, b, 1e-7f); b = fma(b, 0.9999999f, 1e-9f); }\n"
+            "  if (a == 12345.678f) o[0] = id; }\n";
+        NSError *err = nil; id<MTLLibrary> lib = [g_dev newLibraryWithSource:src options:nil error:&err];
+        id<MTLFunction> fn = [lib newFunctionWithName:@"dm_keepwarm"];
+        id<MTLComputePipelineState> ps = fn ? [g_dev newComputePipelineStateWithFunction:fn error:&err] : nil;
+        id<MTLCommandQueue> q = [g_dev newCommandQueue]; id<MTLBuffer> ob = [g_dev newBufferWithLength:16 options:MTLResourceStorageModePrivate];
+        if (!ps || !q || !ob) { MLOG("[RED] GPU keep-warm: could not make its kernel (%s); off", err.localizedDescription.UTF8String ?: "no error"); return NULL; }
+        MLOG("GPU keep-warm: on, %d threadgroups of 64 threads in chunks of about 250 us, filling %d %% of the time the game's work has run out (DM_GPU_KEEPWARM, DM_GPU_KEEPWARM_DUTY)", groups, duty);
+        uint32_t n = 2000; uint64_t last_log = bp_now();
+        for (;;) {
+            @autoreleasepool {
+                if (atomic_load(&g_gpu_lost)) { MLOG("GPU keep-warm: stopped, the GPU was lost"); return NULL; }
+                if (atomic_load(&g_present_suspended) || rx_busy()) { usleep(200); continue; }
+                id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+                [ce setComputePipelineState:ps]; [ce setBuffer:ob offset:0 atIndex:0]; [ce setBytes:&n length:sizeof n atIndex:1];
+                [ce dispatchThreadgroups:MTLSizeMake((NSUInteger)groups, 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)]; [ce endEncoding];
+                [cb commit]; [cb waitUntilCompleted];
+                double t = cb.GPUEndTime - cb.GPUStartTime;   // seconds
+                if (cb.status == MTLCommandBufferStatusCompleted && t > 0) {
+                    double k = 250e-6 / t; if (k > 4) k = 4; if (k < 0.25) k = 0.25;
+                    double nn = n * k; n = nn < 64 ? 64 : nn > 50000000 ? 50000000 : (uint32_t)nn;
+                    atomic_fetch_add(&g_kw_chunks, 1); atomic_fetch_add(&g_kw_ns, (uint64_t)(t * 1e9));
+                    if (duty < 100) usleep((useconds_t)(t * 1e6 * (100 - duty) / duty));
+                } else usleep(1000);
+                uint64_t now = bp_now();
+                if (now - last_log > 10000000000ull) { last_log = now;
+                    MLOG("GPU keep-warm: %llu chunks, %.0f ms of GPU time in all (chunk %u iterations)", (unsigned long long)atomic_load(&g_kw_chunks), atomic_load(&g_kw_ns) / 1e6, n); }
+            }
+        }
+    }
+}
+static void kw_kick(void) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_GPU_KEEPWARM"); on = e && *e && atoi(e) > 0; }
+    if (!on || atomic_exchange(&g_kw_started, 1)) return;
+    if (!rec_on()) { MLOG("[RED] GPU keep-warm: needs the encode thread (DM_NVN_ENC_THREAD=1); off"); return; }
+    pthread_t t; if (pthread_create(&t, NULL, kw_thread, NULL) == 0) pthread_detach(t);
+}
 // DM_PSO_PARK_SEC=n or DM_PSO_PARK_MIN=n (Mighty Green Kokiri Kid; 0, off, by default; at least 15 s): every n seconds (minutes) of play, the draw pipelines nothing asked for since the last time are released, and the rest
 // are parked: taken out of g_pso into g_pso_park, still alive. A lookup that misses g_pso takes its key back from the park (pso_cached), so a pipeline in use goes back at its
 // first draw and costs no compile; at the next period what is still parked goes. The prewarm builds every pipeline of the lists at the start (Ocarina of Time: 44,516 in 26 s, about
@@ -13787,6 +13839,7 @@ static void tu_tick(void) {   // when a submission begins; DM_NVN_RT_DEAD=0 keep
         else { g_tu_last = g_tu_now; os_unfair_lock_lock(&g_rmu); seen_stamp_used(g_tu_now, 1); os_unfair_lock_unlock(&g_rmu); }
     }
     pso_park_tick(g_tu_now);
+    kw_kick();
 }
 static id<MTLBuffer> dummy_buf(void) { static id<MTLBuffer> b; if (!b) { b = [g_dev newBufferWithLength:64 << 10 options:MTLResourceStorageModeShared]; res_add(b); } return b; }
 static uint64_t dummy_buf_gpu(void) { static uint64_t gpu; if (!gpu) gpu = dummy_buf().gpuAddress; return gpu; }
