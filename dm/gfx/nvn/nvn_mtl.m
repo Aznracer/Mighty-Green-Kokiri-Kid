@@ -6001,6 +6001,7 @@ static void *tex_mtl_resolve(const tex_t *ct, int *in_storage, id<MTLTexture> __
 // All integers (the frame hook runs on the guest thread's small stack, so no floating-point formatting).
 static _Atomic uint64_t g_gptr_bindings, g_gptr_reads, g_gptr_added, g_gptr_bytes;   // gmem_discover: bindings with sources, readable words, newly addressed logical pool/run ranges and bytes
 static _Atomic uint64_t g_lib_data_n, g_lib_data_bytes, g_lib_data_fails, g_lib_data_fail_bytes;
+static _Atomic uint64_t g_lib_whole_n, g_lib_whole_bytes;   // libraries Metal reads in place from the whole-image mapping (DM_MSL_WHOLE, lib_from_whole)
 void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
     static unsigned long long last_rss, last_gpu, last_frame, last_wired; static int lines; unsigned long long gpu = (unsigned long long)(g_dev.currentAllocatedSize >> 20);
     sys_mem_t sm = sys_mem();
@@ -6026,10 +6027,11 @@ void mtl_mem_stat(unsigned long long frame, unsigned long long rss_mb) {
 #if TARGET_OS_IPHONE
     snprintf(avail, sizeof avail, "%llu MB", (unsigned long long)(os_proc_available_memory() >> 20));
 #endif
-    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u kept by the sharing table alone, %llu MB, %llu MB of it drawn into or shader-written, the oldest idle %llu submissions; evicted with pools %llu (serial entries that went with them %llu), on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total (alive %llu, %llu MB; released when idle %llu, %llu MB in total), finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u, recycled texture heaps made %llu, reused %llu, freed %llu, waiting %u (%llu MB), shader library data %llu (%llu MB; failed %llu / %llu KB); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, au.entries, (unsigned long long)(au.bytes >> 20), (unsigned long long)(au.writable_bytes >> 20), (unsigned long long)au.oldest_idle, (unsigned long long)as.evicted, (unsigned long long)as.pool_entries, (unsigned long long)as.taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, (unsigned long long)g_arena_live, (unsigned long long)(g_arena_live_bytes >> 20), (unsigned long long)g_arena_freed, (unsigned long long)(g_arena_freed_bytes >> 20), nghost, (unsigned long long)ghost_puts, nwait,
+    MLOG("memory up to frame %llu: resident %llu MB, GPU allocated %llu MB, deferred-release queue %lu, residency set %lu, serial objects %u, memory pools %d (resident %d; peak %d / tracking table capacity %d; freed but alive %lu, %llu MB), shared textures %u (%u kept by the sharing table alone, %llu MB, %llu MB of it drawn into or shader-written, the oldest idle %llu submissions; evicted with pools %llu (serial entries that went with them %llu), on storage takeover %llu in total), texture re-uploads %llu in total, per-frame arena blocks created %llu in total (alive %llu, %llu MB; released when idle %llu, %llu MB in total), finalized textures still referenced %u (small table, %llu put in total), retired but held by a serial %u, recycled texture heaps made %llu, reused %llu, freed %llu, waiting %u (%llu MB), shader library data %llu (%llu MB; failed %llu / %llu KB), read in place from the image %llu (%llu MB of file pages); headroom to the system memory limit %s", frame, rss_mb, gpu, nd, nr, ns, live, pres, peak, cap, dead_n, dead_mb, ashared, au.entries, (unsigned long long)(au.bytes >> 20), (unsigned long long)(au.writable_bytes >> 20), (unsigned long long)au.oldest_idle, (unsigned long long)as.evicted, (unsigned long long)as.pool_entries, (unsigned long long)as.taken, (unsigned long long)g_pkg_reuploads, (unsigned long long)g_arena_made, (unsigned long long)g_arena_live, (unsigned long long)(g_arena_live_bytes >> 20), (unsigned long long)g_arena_freed, (unsigned long long)(g_arena_freed_bytes >> 20), nghost, (unsigned long long)ghost_puts, nwait,
          (unsigned long long)g_rh_made, (unsigned long long)g_rh_reused, (unsigned long long)g_rh_trimmed, rh_n, (unsigned long long)(rh_bytes >> 20),
          (unsigned long long)atomic_load_explicit(&g_lib_data_n, memory_order_relaxed), (unsigned long long)(atomic_load_explicit(&g_lib_data_bytes, memory_order_relaxed) >> 20),
-         (unsigned long long)atomic_load_explicit(&g_lib_data_fails, memory_order_relaxed), (unsigned long long)(atomic_load_explicit(&g_lib_data_fail_bytes, memory_order_relaxed) >> 10), avail);
+         (unsigned long long)atomic_load_explicit(&g_lib_data_fails, memory_order_relaxed), (unsigned long long)(atomic_load_explicit(&g_lib_data_fail_bytes, memory_order_relaxed) >> 10),
+         (unsigned long long)atomic_load_explicit(&g_lib_whole_n, memory_order_relaxed), (unsigned long long)(atomic_load_explicit(&g_lib_whole_bytes, memory_order_relaxed) >> 20), avail);
     if (sm.ok) { char pl[220]; mem_pressure_said(pl, sizeof pl);
         MLOG("system memory at frame %llu: free %llu MB, wired %llu MB, compressed %llu MB, file-backed %llu MB, purgeable %llu MB, of %llu MB; residency set %llu MB; %s", frame,
              (unsigned long long)sm.free, (unsigned long long)sm.wired, (unsigned long long)sm.compressed, (unsigned long long)sm.file, (unsigned long long)sm.purgeable, (unsigned long long)sm.total,
@@ -7408,10 +7410,43 @@ static id<MTLLibrary> lib_from_map(msl_map f, NSError **err) {
     }
     return lib;
 }
+// DM_MSL_WHOLE=1 (Mighty Green Kokiri Kid; off by default): the shader library image is mapped once, whole and read only, for the run, and Metal is given each library's bytes in
+// place, with no copy. The bytes stay clean file pages the system drops for free and reads back if Metal ever needs them again, where owned bytes are charged memory it has to
+// compress: 35,975 libraries, 1,775 MB of it after the prepare of Ocarina of Time on the iPhone Duo (2026-11-23), most for shaders the play never draws. One mapping in all, so the
+// task map that per-library mappings filled (#2965) gets one entry; with no room in the address space for the image the mapping fails and every library is copied as before
+static const char *msl_whole(const romfs_img *m) {
+    static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static const romfs_img *mapped_for; static const char *base; static int tried, on = -1;
+    if (on < 0) { const char *e = getenv("DM_MSL_WHOLE"); on = e && *e && atoi(e) != 0; }
+    if (!on || !m) return NULL;
+    pthread_mutex_lock(&mu);
+    if (mapped_for != m && !tried) {
+        tried = 1; struct stat st;
+        if (!fstat(m->fd, &st) && st.st_size > 0) {
+            void *p = mmap(NULL, (size_t)st.st_size, PROT_READ, MAP_SHARED, m->fd, 0);
+            if (p != MAP_FAILED) { base = p; mapped_for = m; MLOG("shader libraries: the image mapped whole, %.2f GB read only, libraries read in place from it (DM_MSL_WHOLE)", st.st_size / 1073741824.0); }
+            else MLOG("[RED] shader libraries: the image (%.2f GB) could not be mapped whole (errno %d): libraries are copied as before (DM_MSL_WHOLE)", st.st_size / 1073741824.0, errno);
+        }
+    }
+    const char *r = mapped_for == m ? base : NULL;
+    pthread_mutex_unlock(&mu);
+    return r;
+}
+static id<MTLLibrary> lib_from_whole(const char *base, const img_ent *x, NSError **err) {
+    const void *p = base + x->a; size_t sz = (size_t)x->b;
+    if (!sz) { if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:EINVAL userInfo:nil]; return nil; }
+    static dispatch_block_t keep; static dispatch_once_t once; dispatch_once(&once, ^{ keep = ^{}; });   // the mapping outlives every library: nothing to free
+    dispatch_data_t d = dispatch_data_create(p, sz, NULL, keep);
+    if (!d) { if (err) *err = [NSError errorWithDomain:NSPOSIXErrorDomain code:ENOMEM userInfo:nil]; return nil; }
+    id<MTLLibrary> lib = lib_tag([g_dev newLibraryWithData:d error:err], lib_digest(p, sz));
+    if (lib) { atomic_fetch_add_explicit(&g_lib_whole_n, 1, memory_order_relaxed); atomic_fetch_add_explicit(&g_lib_whole_bytes, (uint64_t)sz, memory_order_relaxed); }
+    return lib;
+}
 static id<MTLLibrary> lib_from_file(NSString *path, NSError **err) {
     int fd = open(path.fileSystemRepresentation, O_RDONLY); struct stat st;
     if (fd < 0) {   // not in the folder: the library's image, whose one descriptor is shared, and only this file's pages are mapped
         int open_errno = errno; romfs_img *img; const img_ent *x = msl_image_file(path, &img); msl_map f;
+        const char *whole = x ? msl_whole(img) : NULL;
+        if (whole) return lib_from_whole(whole, x, err);
         if (x && msl_image_map(img, x, &f)) return lib_from_map(f, err);
         NSString *live = !x ? live_artifact(path.lastPathComponent) : nil;
         if (live) {
@@ -10007,7 +10042,7 @@ static const uint8_t *g_pso_lmap; static id<MTLFunction> g_pso_fsfn; static pso_
 static os_unfair_lock g_bf_fn_lock = OS_UNFAIR_LOCK_INIT;   // bf_fn: a shader's bflib and bffn (the submit thread and the warm-up both ask)
 static nvn_hmap g_pso = {.klen = sizeof(pso_key)}, g_dss;
 static nvn_hmap g_pso_fail = {.klen = sizeof(pso_key)};   // pipelines that failed to build: remembered and never retried (previously every draw recompiled it, over 10,000 times in one iPhone session)
-// DM_PSO_PARK_MIN=n (Mighty Green Kokiri Kid; 0, off, by default): every n minutes of play, the draw pipelines nothing asked for since the last time are released, and the rest
+// DM_PSO_PARK_SEC=n or DM_PSO_PARK_MIN=n (Mighty Green Kokiri Kid; 0, off, by default; at least 15 s): every n seconds (minutes) of play, the draw pipelines nothing asked for since the last time are released, and the rest
 // are parked: taken out of g_pso into g_pso_park, still alive. A lookup that misses g_pso takes its key back from the park (pso_cached), so a pipeline in use goes back at its
 // first draw and costs no compile; at the next period what is still parked goes. The prewarm builds every pipeline of the lists at the start (Ocarina of Time: 44,516 in 26 s, about
 // 3.6 GB the system then compresses under pressure, iPhone Duo 2026-11-22); what the play has not drawn since goes, and a later draw builds it again from Metal's disk cache.
@@ -10020,14 +10055,16 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_unpark(const pso_key *
     g_park_back++; return (__bridge id)v;
 }
 static __unsafe_unretained id<MTLRenderPipelineState> pso_cached(const pso_key *k) { __unsafe_unretained id c = hm_get_id(&g_pso, k); return c ? c : g_pso_park.n ? pso_unpark(k) : nil; }
-static int park_min(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PSO_PARK_MIN"); v = e && *e ? atoi(e) : 0; if (v < 0) v = 0;
-    MLOG("pipeline park: %s (DM_PSO_PARK_MIN)", v ? [NSString stringWithFormat:@"every %d min, pipelines not drawn since the last period are released", v].UTF8String : "off"); } return v; }
+static int park_sec(void) {   // the period in seconds: DM_PSO_PARK_SEC, else DM_PSO_PARK_MIN minutes; 0 off
+    static int v = -1; if (v < 0) { const char *e = getenv("DM_PSO_PARK_SEC"), *m = getenv("DM_PSO_PARK_MIN"); v = e && *e ? atoi(e) : m && *m ? atoi(m) * 60 : 0; if (v < 0) v = 0;
+        if (v && v < 15) v = 15;
+        MLOG("pipeline park: %s (DM_PSO_PARK_SEC / DM_PSO_PARK_MIN)", v ? [NSString stringWithFormat:@"every %d s, pipelines not drawn since the last period are released", v].UTF8String : "off"); } return v; }
 static int pso_parkable(const pso_key *k) { uint64_t l; memcpy(&l, k->lmap, 8); return !k->fsfn && !l; }
 static void pso_park_tick(uint32_t now_ds) {   // now_ds: g_tu_now (deciseconds since the first submission)
-    int m = park_min(); if (!m) return;
-    static uint32_t next; if (!next) next = (uint32_t)m * 600;
+    int sec = park_sec(); if (!sec) return;
+    static uint32_t next; if (!next) next = (uint32_t)sec * 10;
     if (now_ds < next) return;
-    next = now_ds + (uint32_t)m * 600;
+    next = now_ds + (uint32_t)sec * 10;
     uint64_t t0 = bp_now(), freed = g_pso_park.n, kept = 0;
     nvn_hm_clear(&g_pso_park, hm_rel);   // nothing drew them for a whole period
     nvn_hmap keep = {.klen = sizeof(pso_key)};
@@ -10038,8 +10075,8 @@ static void pso_park_tick(uint32_t now_ds) {   // now_ds: g_tu_now (deciseconds 
     }
     free(g_pso.keys); free(g_pso.vals); g_pso = keep;
     g_park_freed += freed; g_park_n = g_pso_park.n;
-    MLOG("pipeline park at %u s: %llu released (not drawn for %d min), %llu parked, %llu kept (other kinds); %llu taken back in all, %llu released in all, %.1f ms",
-         now_ds / 10, (unsigned long long)freed, m, (unsigned long long)g_park_n, (unsigned long long)kept, (unsigned long long)g_park_back, (unsigned long long)g_park_freed, (bp_now() - t0) / 1e6);
+    MLOG("pipeline park at %u s: %llu released (not drawn for %d s), %llu parked, %llu kept (other kinds); %llu taken back in all, %llu released in all, %.1f ms",
+         now_ds / 10, (unsigned long long)freed, sec, (unsigned long long)g_park_n, (unsigned long long)kept, (unsigned long long)g_park_back, (unsigned long long)g_park_freed, (bp_now() - t0) / 1e6);
 }
 static const char g_tf_mark, g_amp_mark, g_discard_mark;
 static char g_geo_mark;
