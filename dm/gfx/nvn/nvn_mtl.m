@@ -9829,6 +9829,40 @@ static const uint8_t *g_pso_lmap; static id<MTLFunction> g_pso_fsfn; static pso_
 static os_unfair_lock g_bf_fn_lock = OS_UNFAIR_LOCK_INIT;   // bf_fn: a shader's bflib and bffn (the submit thread and the warm-up both ask)
 static nvn_hmap g_pso = {.klen = sizeof(pso_key)}, g_dss;
 static nvn_hmap g_pso_fail = {.klen = sizeof(pso_key)};   // pipelines that failed to build: remembered and never retried (previously every draw recompiled it, over 10,000 times in one iPhone session)
+// DM_PSO_PARK_MIN=n (Mighty Green Kokiri Kid; 0, off, by default): every n minutes of play, the draw pipelines nothing asked for since the last time are released, and the rest
+// are parked: taken out of g_pso into g_pso_park, still alive. A lookup that misses g_pso takes its key back from the park (pso_cached), so a pipeline in use goes back at its
+// first draw and costs no compile; at the next period what is still parked goes. The prewarm builds every pipeline of the lists at the start (Ocarina of Time: 44,516 in 26 s, about
+// 3.6 GB the system then compresses under pressure, iPhone Duo 2026-11-22); what the play has not drawn since goes, and a later draw builds it again from Metal's disk cache.
+// Only plain keys (no merged pass, no specialized or marked fragment function): the face-split, slice-merged and discard pipelines keep caches of their own. Submit thread only
+static nvn_hmap g_pso_park = {.klen = sizeof(pso_key)};
+static uint64_t g_park_n, g_park_back, g_park_freed;
+static __unsafe_unretained id<MTLRenderPipelineState> pso_unpark(const pso_key *k) {
+    void *v = nvn_hm_del(&g_pso_park, k); if (!v) return nil;
+    void *old = nvn_hm_put(&g_pso, k, v); if (old) CFRelease(old);   // the reference the park held goes back to g_pso as it is
+    g_park_back++; return (__bridge id)v;
+}
+static __unsafe_unretained id<MTLRenderPipelineState> pso_cached(const pso_key *k) { __unsafe_unretained id c = hm_get_id(&g_pso, k); return c ? c : g_pso_park.n ? pso_unpark(k) : nil; }
+static int park_min(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_PSO_PARK_MIN"); v = e && *e ? atoi(e) : 0; if (v < 0) v = 0;
+    MLOG("pipeline park: %s (DM_PSO_PARK_MIN)", v ? [NSString stringWithFormat:@"every %d min, pipelines not drawn since the last period are released", v].UTF8String : "off"); } return v; }
+static int pso_parkable(const pso_key *k) { uint64_t l; memcpy(&l, k->lmap, 8); return !k->fsfn && !l; }
+static void pso_park_tick(uint32_t now_ds) {   // now_ds: g_tu_now (deciseconds since the first submission)
+    int m = park_min(); if (!m) return;
+    static uint32_t next; if (!next) next = (uint32_t)m * 600;
+    if (now_ds < next) return;
+    next = now_ds + (uint32_t)m * 600;
+    uint64_t t0 = bp_now(), freed = g_pso_park.n, kept = 0;
+    nvn_hm_clear(&g_pso_park, hm_rel);   // nothing drew them for a whole period
+    nvn_hmap keep = {.klen = sizeof(pso_key)};
+    for (uint32_t i = 0; i < g_pso.cap; i++) {
+        void *v = g_pso.vals[i]; if (!v) continue;
+        const pso_key *k = (const pso_key *)(g_pso.keys + (size_t)i * g_pso.klen);
+        if (pso_parkable(k)) nvn_hm_put(&g_pso_park, k, v); else { nvn_hm_put(&keep, k, v); kept++; }
+    }
+    free(g_pso.keys); free(g_pso.vals); g_pso = keep;
+    g_park_freed += freed; g_park_n = g_pso_park.n;
+    MLOG("pipeline park at %u s: %llu released (not drawn for %d min), %llu parked, %llu kept (other kinds); %llu taken back in all, %llu released in all, %.1f ms",
+         now_ds / 10, (unsigned long long)freed, m, (unsigned long long)g_park_n, (unsigned long long)kept, (unsigned long long)g_park_back, (unsigned long long)g_park_freed, (bp_now() - t0) / 1e6);
+}
 static const char g_tf_mark, g_amp_mark, g_discard_mark;
 static char g_geo_mark;
 #define GEO_MARK ((const void *)&g_geo_mark)
@@ -11705,7 +11739,7 @@ static int pso_pend_kick_d(const pso_key *k, MTLRenderPipelineDescriptor *d, int
     return 1;
 }
 static int pso_pend_kick_budget(const pso_key *k, NvShader *vs, NvShader *fs, int spec, PsoPredictBudget *budget) {   // the submit thread
-    if (hm_get_id(&g_pso, k)) return 0;
+    if (pso_cached(k)) return 0;
     PD("J pipeline source=predict key=%016llx vs=%s fs=%s depth=%u stencil=%u samples=%u", (unsigned long long)nvn_hm_hash(k, sizeof *k), vs->key, fs ? fs->key : "-", k->dfmt, k->sfmt, k->samples);
     return pso_pend_kick_d(k, pso_desc(k, vs, fs, nil, 0), spec, budget);
 }
@@ -11728,7 +11762,7 @@ static void demand_record(const pso_key *k, NvShader *vs, NvShader *fs) {
 }
 // The build a hybrid draw asked for while it draws with its stand-in: outside the speculative limit, on pp_bg_queue
 static int pso_pend_demand(const pso_key *k, NvShader *vs, NvShader *fs) {
-    if (hm_get_id(&g_pso, k)) return 0;
+    if (pso_cached(k)) return 0;
     pthread_mutex_lock(&g_pp_mu); uint32_t gen = 0; int slot = pso_pend_slot(k, 0, &gen); pthread_mutex_unlock(&g_pp_mu);
     if (slot < 0) return 0;
     pso_pend_start(slot, gen, pso_desc(k, vs, fs, nil, 0), pso_off(k, fs, 0), pp_bg_queue());
@@ -11812,7 +11846,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pull_pso(const pso_key *k,
     __unsafe_unretained id<MTLRenderPipelineState> h = hm_get_id(&g_pso_hy, k);
     if (h) return h;
     if (hm_get_id(&g_pso_pull_fail, k)) return nil;
-    if (hybrid_on() && hm_get_id(&g_pso, k)) return hybrid_get(k, vs, fs);
+    if (hybrid_on() && pso_cached(k)) return hybrid_get(k, vs, fs);
     MTLRenderPipelineDescriptor *d = pso_desc_pull(k, vs, fs);
     NSError *e = nil; uint64_t t0 = bp_now(); id<MTLRenderPipelineState> ps = d ? pso_build(d, pso_off(k, fs, 0), &e) : nil;
     g_bp_pso_n++; g_bp_pso_ns += bp_now() - t0;
@@ -12203,7 +12237,7 @@ static __unsafe_unretained id<MTLRenderPipelineState> pso_get_(NvProg *pr, MTLRe
           __unsafe_unretained id<MTLRenderPipelineState> h = pull_conversion(vs, &k) ? pull_pso(&k, vs, fs) : all && hybrid_on() ? hybrid_get(&k, vs, fs) : nil;
           if (h) { g_pso_pull = 1; return h; }
       } }
-    __unsafe_unretained id<MTLRenderPipelineState> cached = hm_get_id(&g_pso, &k);
+    __unsafe_unretained id<MTLRenderPipelineState> cached = pso_cached(&k);
     PD("J pipeline source=draw pass=%llu key=%016llx cache=%d vs=%s fs=%s depth=%u stencil=%u samples=%u", g_pass.serial,
        (unsigned long long)nvn_hm_hash(&k, sizeof k), cached != nil, vs->key, fs ? fs->key : "-", k.dfmt, k.sfmt, k.samples);
     if (cached) return cached;
@@ -13521,6 +13555,7 @@ static void tu_tick(void) {   // when a submission begins; DM_NVN_RT_DEAD=0 keep
         if (sw_on(tu_mode())) tu_pass();
         else { g_tu_last = g_tu_now; os_unfair_lock_lock(&g_rmu); seen_stamp_used(g_tu_now, 1); os_unfair_lock_unlock(&g_rmu); }
     }
+    pso_park_tick(g_tu_now);
 }
 static id<MTLBuffer> dummy_buf(void) { static id<MTLBuffer> b; if (!b) { b = [g_dev newBufferWithLength:64 << 10 options:MTLResourceStorageModeShared]; res_add(b); } return b; }
 static uint64_t dummy_buf_gpu(void) { static uint64_t gpu; if (!gpu) gpu = dummy_buf().gpuAddress; return gpu; }
@@ -14906,7 +14941,7 @@ static void pso_predict_rest_(void) {
                 pso_key k; pso_key_fill(&k, vs, fs, cf, dv[v], sv[v], samples, 0);
                 // A key with a stand-in already drew with it and asked for its own build then (pso_pend_demand): it is no candidate. Without this a prediction proposed
                 // each such key again until its build landed, a pso_base_made descriptor on the submit thread each (issue #2438)
-                if (hm_get_id(&g_pso, &k) || hm_get_id(&g_pp_easy, &k) || hm_get_id(&g_pso_hy, &k)) continue;
+                if (pso_cached(&k) || hm_get_id(&g_pp_easy, &k) || hm_get_id(&g_pso_hy, &k)) continue;
                 int dup = 0; for (int i = 0; i < (v ? nb : na) && !dup; i++) dup = !memcmp(&(v ? qb : qa)[i].k, &k, sizeof k);
                 if (dup) continue;
                 if (!v && na < QN) { qa[na].k = k; qa[na].vs = (__bridge void *)vs; qa[na].fs = (__bridge void *)fs; na++; }
@@ -14927,7 +14962,7 @@ static void pso_predict_rest_(void) {
     PsoPredictBudget *budget = [PsoPredictBudget new];
     for (int i = 0; i < na + nb && (i < na || admitted < PSO_PREDICT_BUDGET); i++) {
         const pso_key *qk = i < na ? &qa[i].k : &qb[i - na].k; NvShader *qv = (__bridge NvShader *)(i < na ? qa[i].vs : qb[i - na].vs), *qf = (__bridge NvShader *)(i < na ? qa[i].fs : qb[i - na].fs);
-        if (hm_get_id(&g_pso, qk)) continue;
+        if (pso_cached(qk)) continue;
         MTLRenderPipelineDescriptor *d = nil; pbase_key bk; int bk_ok = 0;
         if (pso_base_made_d(qk, qv, qf, &d, &bk, &bk_ok)) { hm_put_id(&g_pp_easy, qk, NSNull.null); continue; }
         if (hy && d && bk_ok) {
@@ -18983,7 +19018,7 @@ static uint64_t g_present_ser;   // the serial of the texture present_now last s
 uint64_t mtl_present_count(void) { return g_present_n; }   // Actual present count (heat attribution DM_HEAT computes the present frame rate)
 void mtl_res_snapshot(mtl_res_count *out) {
     memset(out, 0, sizeof *out);
-    out->pso = g_pso.n;
+    out->pso = g_pso.n + g_pso_park.n;
     out->cps = g_cps.n;
     out->dss = g_dss.n;
     out->shaders = (uint32_t)(g_shcache ? g_shcache.count : 0);
