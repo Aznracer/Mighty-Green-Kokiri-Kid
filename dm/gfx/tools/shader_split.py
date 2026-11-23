@@ -50,6 +50,8 @@
 #   · PDAT (the engine with the namespace phx, Kirby Air Riders): flatbuffer records tagged PMAP, zstd frames in the .dat archives, each holding a program's control sections and code areas, see pdat_jobs and pdat_shaders
 #   · Unreal Engine 3 (Batman: Arkham Knight): shader records in its global shader cache (BMSG) and in the packages (the combined shader cache), whose compressed chunks are Oodle blocks decoded by the game's own decoder in the Mac host, see ue3_body and ue3_shaders
 #   · CIVBSF (Firaxis, Civilization VI / VII): indexed NVBC / GLSLC or code/control payloads, see civbsf_shaders
+#   · Anvil forges (Ubisoft's Anvil, Immortals Fenyx Rising): 'GPUCODEONLY' shader records (code area, then control section) in the forge files' Oodle containers (decoded by the game's own
+#     decoder in the Mac host) and in the loose ShaderDataNVN.bin, see forge_jobs and anvil_shaders
 #   · IPK (Ubisoft's UbiArt, Rayman Legends: Definitive Edition v7, Just Dance 2022 v5): whole GLSLC outputs in the .fxb effect files of bundle_*.ipk (zlib entries), see ipk_shaders
 #   · NXSD (TETRIS THE GRAND MASTER 4): descriptor-referenced NVN control sections and code areas, one stage per entry; see nxsd_shaders
 #   · MVGL / NXSH (Media.Vision, Digimon Story Time Stranger): MDB1 archives (wide 64-bit LZ4 or legacy 32-bit doboz, mvgl.py) whose .shad entries and embedded main records are NXVS / NXFS / NXCS containers with control and code spans; see mvgl_jobs and nxsh_shader
@@ -3113,6 +3115,87 @@ def frostbite_shaders(path, rel, ents, out):
             if why: print(f'[RED] {label}: {why}; left out', flush=True); continue
             out.append((label, st, ctl, code))
 
+FORGE, FORGE_DATA, ANVIL_CODE = b'scimitar\0', bytes.fromhex('33aafb5799fa0410'), b'GPUCODEONLY\0'
+ANVIL_FORGE = 'Anvil forge'
+
+def forge_entries(f, label):
+    """The files of an Anvil forge (Ubisoft's Anvil, Immortals Fenyx Rising: version 28): 'scimitar\\0', u32 version, u64 data header offset; the data header holds the u32 file count,
+    and at +0x24 the offset of the first index header {u32 count, u32, u64 index table offset, u64 next index header or -1}; each index table row is {u64 offset, u64 file ID, u32 size}.
+    → [(offset, size, file ID), …]; the counts of the chained index headers must add up to the data header's"""
+    f.seek(0); h = f.read(0x15)
+    if h[:9] != FORGE: red(f'{label}: not an Anvil forge')
+    ver, dh = struct.unpack_from('<IQ', h, 9)
+    if ver != 28: red(f'{label}: forge version {ver}, only version 28 (Immortals Fenyx Rising) is known')
+    f.seek(dh); d = f.read(0x2c); total = field(d, '<I', 0, label)[0]; ih = field(d, '<Q', 0x24, label)[0]
+    out, seen = [], set()
+    while ih != 0xffffffffffffffff:
+        if ih in seen: red(f'{label}: index header {ih:#x} chained twice')
+        seen.add(ih); f.seek(ih); cnt, _, tab, nxt = field(f.read(0x18), '<IIQQ', 0, f'{label}: index header {ih:#x}')
+        f.seek(tab); t = f.read(20 * cnt)
+        if len(t) != 20 * cnt: red(f'{label}: index table at {tab:#x} runs past the end')
+        out += [(o, s, i) for o, i, s in struct.iter_unpack('<QQI', t)]; ih = nxt
+    if len(out) != total: red(f'{label}: the index tables list {len(out)} files, the data header {total}')
+    return out
+
+def forge_container(d, o, label):
+    """One Anvil compressed data container at o: 33 AA FB 57 99 FA 04 10, u16 version, u8 compression, u32 chunk size, u32 chunk count, per chunk {u32 raw size, u32 stored size},
+    then per chunk {u32 checksum, data}; a chunk whose two sizes are equal is stored, the others are Oodle (8C 0A), decoded with the game's own decoder. → (the decoded bytes, end offset)"""
+    if d[o:o + 8] != FORGE_DATA: red(f'{label}: no data container at {o:#x}')
+    n = field(d, '<I', o + 15, label)[0]; tab = span(d, o + 19, 8 * n, f'{label}: chunk table at {o:#x}'); p = o + 19 + 8 * n
+    out = []
+    for u, c in struct.iter_unpack('<II', tab):
+        blk = span(d, p + 4, c, f'{label}: chunk at {p:#x}'); p += 4 + c
+        out.append(blk if u == c else oodle(blk, u))
+    return b''.join(out), p
+
+def forge_jobs(files, parts=64):
+    """Anvil forges (Immortals Fenyx Rising: 372 forges in the game, its update and its DLC, 15 GB): their files, each a small metadata container and the resource's own container,
+    Oodle-compressed. → ([(forge path, rel, (ANVIL_FORGE, ((offset, size, file ID), …))), …] in about equal stored sizes, the forges taken)"""
+    jobs, taken, ents = [], set(), []
+    for p, r in files:
+        if not p.endswith('.forge'): continue
+        with open(p, 'rb') as f:
+            if f.read(9) != FORGE: continue
+            ents.append((p, r, sorted(forge_entries(f, '/' + r))))
+        taken.add(p)
+    if not ents: return jobs, taken
+    step = sum(s for _, _, e in ents for _, s, _ in e) / parts
+    for p, r, e in ents:
+        cur, size = [], 0
+        for x in e:
+            cur.append(x); size += x[1]
+            if size >= step: jobs.append((p, r, (ANVIL_FORGE, tuple(cur)))); cur, size = [], 0
+        if cur: jobs.append((p, r, (ANVIL_FORGE, tuple(cur))))
+    return jobs, taken
+
+def anvil_shaders(d, label):
+    """Anvil's shader records (Immortals Fenyx Rising), in its material, UI and entity resources and in the loose ShaderDataNVN.bin: 'GPUCODEONLY\\0', u32 code area length, the code area,
+    u32 control section length, the control section. Labels: <label>#GPUCODEONLY@<offset>"""
+    out = []
+    for m in re.finditer(re.escape(ANVIL_CODE), d):
+        o = m.start(); where = f'{label}#GPUCODEONLY@{o:x}'
+        n = field(d, '<I', o + 12, where)[0]; code = span(d, o + 16, n, where)
+        k = field(d, '<I', o + 16 + n, where)[0]; ctl = span(d, o + 20 + n, k, where)
+        if ctl[:4] != CTL_MAGIC: red(f'{where}: no control section after the {n:#x}-byte code area')
+        st = glslc_stage(ctl, code)
+        why = check(where, st, ctl, code) if st else 'no stage in the code area header'
+        if why: red(f'{where}: {why}')
+        out.append((where, st, ctl, code))
+    return out
+
+def forge_shaders(path, rel, ents, out):
+    """A range of one forge's files (forge_jobs): each file's containers decoded and its shader records read (anvil_shaders). Labels: /<forge>#<file ID>#GPUCODEONLY@<offset>"""
+    from romfs import mmap
+    with open(path, 'rb') as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as d:
+        for off, size, fid in ents:
+            label = f'/{rel}#{fid:x}'
+            if off + size > len(d): red(f'{label}: {size} bytes at {off:#x} run past the forge')
+            p, end = off, off + size
+            while p < end and d[p:p + 8] == FORGE_DATA:   # a metadata container, then the resource's (a few files have only one)
+                b, p = forge_container(d, p, label)
+                if ANVIL_CODE in b: out += anvil_shaders(b, label)
+            if p > end: red(f'{label}: its containers run {p - end} bytes past its index size')
+
 def smash_arc_jobs(files, parts=128):
     """Super Smash Bros. Ultimate's data.arc (17.6 GB, smash_arc.py): the game's current files, in ranges of about equal stored size. → ([(path, rel, entries), …], the paths taken)"""
     import smash_arc
@@ -4285,6 +4368,9 @@ def scan_file_in(args):
     if len(args) > 2 and args[2][0] == FB_CAS:   # CompiledBytecode resources of a Frostbite cas file (frostbite_jobs)
         frostbite_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if len(args) > 2 and args[2][0] == ANVIL_FORGE:   # files of an Anvil forge (forge_jobs)
+        forge_shaders(path, rel, args[2][1], found)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and head[:4] == RPF6 and args[2][0] == RPF6:   # files of a Rockstar RPF6 archive (rpf_jobs)
         rpf_shaders(path, rel, args[2][1], args[2][2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -4411,7 +4497,7 @@ def scan_file_in(args):
         try: pairs = unity_shaders(d, '/' + rel, found, trees if not TREES else dict(TREES))
         except unityfs.NoTree: return rel, {}, set(), 'defer'
         return rel, uniq_keys(found), var_pairs(found) | {(a, b, 'prog') for a, b in pairs}, trees
-    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] != b'MSHD' and d[:4] != b'NDSR' and d[:4] != b'NARC' and d[:4] != b'NDVE' and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d and NEEDLE not in d and d[:8] != PACX4 and d[:8] != SUMO_MUX and SUMO_NX not in d and NVNSH not in d: return rel, {}, set(), {}   # a SARC may hold Yaz0 members, a NARC packed ones (cra.undo)
+    elif b'BNSH\0\0\0\0' not in d and b'BAHS' not in d and d[:4] != b'MSHD' and d[:4] != b'NDSR' and d[:4] != b'NARC' and d[:4] != b'NDVE' and not (d[:4] == b'SARC' and b'Yaz0' in d) and b'\x91\x68\x86\x19' not in d and MGFX not in d and NEEDLE not in d and d[:8] != PACX4 and d[:8] != SUMO_MUX and SUMO_NX not in d and NVNSH not in d and d[:12] != ANVIL_CODE: return rel, {}, set(), {}   # a SARC may hold Yaz0 members, a NARC packed ones (cra.undo)
     else:
         scan_blob(d, '/' + rel, found)
         # whole GLSLC outputs in a file no other reader takes (FINAL FANTASY TACTICS - The Ivalice Chronicles: its engine's technique files, resources_nx/…/shader/*.tec, 261 outputs beside
@@ -4539,6 +4625,7 @@ def plan_jobs(files, heads, romfs_v, main_v):
     zp_jobs, zips = zip_jobs(starting(ZIP, VZIP))   # Portal's game.zip (Deflate members)
     ah_jobs, arhs = arh_jobs(files)   # Monolith's ARH1/ARH2 indexes and embedded XBC1/HCPS programs
     fb_jobs, fbs = frostbite_jobs(files)   # EA SPORTS FC 27's Frostbite bundles, Oodle Leviathan decoded by the game's own decoder in the Mac host
+    fg_jobs, forges = forge_jobs(files)   # Immortals Fenyx Rising's Anvil forges, Oodle decoded by the game's own decoder in the Mac host
     pd_jobs, pdats = pdat_jobs(starting(PDAT))   # Kirby Air Riders' PDAT archives: the PMAP records in byte ranges
     rp_jobs, rpfs = rpf_jobs(starting(RPF6), main_v)   # Red Dead Redemption's RPF6 archives, their tables decrypted with the key in main (rpf6.py)
     ea_work, ea_paths = ea_jobs(files, heads, romfs_v, main_v)   # EA BIG4 / EASF / NXSHADER archives; keys come from their own version's main
