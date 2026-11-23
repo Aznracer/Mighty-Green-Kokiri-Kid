@@ -20,7 +20,8 @@
 #include <os/proc.h>   // os_proc_available_memory
 #endif
 
-#define SWITCH_ALIAS DM_SWITCH_ALIAS   // a Switch's alias region: 64 GB
+#define SWITCH_ALIAS  DM_SWITCH_ALIAS    // a Switch's alias region: 64 GB
+#define SWITCH2_ALIAS DM_SWITCH2_ALIAS   // a Switch 2's alias region on Mac: 128 GB
 // Reserve one whole block of guest address space, partitioned the Horizon way (address values are the real addresses returned by the host's mmap).
 // It only takes address space, not memory.
 // Size 5 GB: the game needs the first 1 GB (alias region, stacks) + one whole heap block (application memory pool of 3285 MiB, see APP_POOL below),
@@ -318,10 +319,11 @@ static void mem_init_once(void) {
         DM_GAME_MEM_STACK > RESERVE - 0x10000000 - DM_GAME_MEM_ALIAS ||
         ((RESERVE | DM_GAME_MEM_ALIAS | DM_GAME_MEM_STACK) & (pg - 1)))
         die("guest address-space profile has invalid native boundaries");
-    // The alias region is the Switch's 64 GB on the Mac (or the profile's, when larger): games lay their regions out for that much, and what the profile can give an iPhone (one
-    // reservation of at most 6 GB) crashed Trails in the Sky 1st Chapter at launch and Just Dance within a minute. It is address space, not memory: the application pool bounds
-    // what is mapped. DM_ALIAS_SIZE=<bytes> sets another size, the heap and stacks as they are; the profile's value reproduces an iPhone's address space on the Mac (the NSP script's heap check)
-    size_t alias = dm_alias_size();
+    // The alias region is the console's on the Mac (64 GB for Switch 1, 128 GB for Switch 2; or the profile's, when larger): games lay their regions out for that much, and what the
+    // profile can give an iPhone (one reservation of at most 6 GB) crashed Trails in the Sky 1st Chapter at launch, Just Dance within a minute, and Xenoblade Chronicles 2 Switch 2
+    // Edition (two 60 GB reservations) at start. It is address space, not memory: the application pool bounds what is mapped. DM_ALIAS_SIZE=<bytes> sets another size, the heap and
+    // stacks as they are; the profile's value reproduces an iPhone's address space on the Mac (the NSP script's heap check)
+    size_t alias = dm_alias_size_for(dm_sdk_ounce());
     g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
     g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
     if (g_as == MAP_FAILED) {
@@ -381,6 +383,13 @@ static _Atomic int64_t g_alias_mapped;   // bytes mapped in the alias region (pa
 // SetHeapSize charged the rewritten modules' size instead (their patch areas and key pages included), which GetInfo never reported: a game whose modules were larger than mem_used was
 // refused the heap the host had just offered (ResultLimitReached; MIO: Memories in Orbit, 68 MB of modules against the default 64 MB, aborted in nninitStartup, GitHub issue #941).
 // mem_used only sets what the game sees (its heap size, as on hardware); the host's own module copies (patch areas, key pages) are not the Switch's to count
+// Whether MapPhysicalMemory and GetInfo(UsedMemorySize) enforce the application pool limit:
+// explicit mem_map_limit on/off (1/0) wins; unset (-1) enforces Horizon's limit for Switch 2 (spec: Ounce),
+// while keeping Switch 1 off by default for legacy profiles with an artificially reduced app_pool (Ace Attorney Investigations Collection).
+static int mem_map_limit_on(void) {
+    int cfg = DM_GAME_MEM_MAP_LIMIT;
+    return cfg < 0 ? dm_sdk_ounce() : cfg != 0;
+}
 // The room maps get past the application pool (profile mem_map_room; DM_MAP_ROOM_MB=<MB> overrides, read once)
 static int64_t map_room(void) {
     static _Atomic int64_t v = -1;
@@ -388,11 +397,11 @@ static int64_t map_room(void) {
     if (r < 0) {
         const char *e = getenv("DM_MAP_ROOM_MB");
         r = e && *e ? (int64_t)strtoull(e, NULL, 10) << 20 : (int64_t)DM_GAME_MEM_MAP_ROOM;
-        if (atomic_exchange(&v, r) < 0 && r && DM_GAME_MEM_MAP_LIMIT) LOG("[mem] maps may go %.2f GB past the application pool (%s)", r / 1073741824.0, e && *e ? "DM_MAP_ROOM_MB" : "profile mem_map_room");
+        if (atomic_exchange(&v, r) < 0 && r && mem_map_limit_on()) LOG("[mem] maps may go %.2f GB past the application pool (%s)", r / 1073741824.0, e && *e ? "DM_MAP_ROOM_MB" : "profile mem_map_room");
     }
     return r;
 }
-static uint64_t used_beside_heap(void) { return (uint64_t)DM_GAME_MEM_USED + big_bss_bytes() + (DM_GAME_MEM_MAP_LIMIT ? (uint64_t)atomic_load(&g_alias_mapped) : 0); }
+static uint64_t used_beside_heap(void) { return (uint64_t)DM_GAME_MEM_USED + big_bss_bytes() + (mem_map_limit_on() ? (uint64_t)atomic_load(&g_alias_mapped) : 0); }
 
 // For memory accounting (memstat.m): the range of the whole guest address space block (base = NULL when not initialized)
 void svc_guest_range(uint8_t **base, size_t *size) { *base = g_as; *size = g_reserve; }
@@ -1182,12 +1191,12 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         if (num == 0x2D && (map_source_busy(a, size) || device_shared(a, size, "UnmapPhysicalMemory"))) { pthread_mutex_unlock(&g_map_lock); regs[0] = 0xD401; return 0; }
         uint64_t off = a - (uintptr_t)g_alias;
         int64_t need = alias_unmapped(off, size) * 4096;
-        // Profile mem_map_limit: a map that would take the process past the application pool fails with ResultLimitReached, as on Horizon (the pool less the used memory GetInfo reports).
+        // Profile mem_map_limit (default on for Switch 2, off for Switch 1): a map that would take the process past the application pool fails with ResultLimitReached, as on Horizon (the pool less the used memory GetInfo reports).
         // Pokémon Legends: Z-A's nninitStartup allocates and frees everything allocatable (pool − 64 MB, mapped at the top of its StandardAllocator region: 12 GB, 4 GB after the cut in its patches.py); the SDK keeps the freed pages mapped
         // and maps new ones for later allocations, until a map fails: then it unmaps the cached block and retries (measured on the Mac: the refused 4 MB map at +0x43e2c000 was followed by
         // UnmapPhysicalMemory of the 3.15 GB block and the same map again). Without the limit the mapped total went past the pool in the first minute and the freed block stayed mapped.
-        // Off by default: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
-        if (DM_GAME_MEM_MAP_LIMIT && num == 0x2C) {
+        // Off by default on Switch 1: Ace Attorney Investigations Collection maps a little more than the 1 GB pool its profile reports
+        if (mem_map_limit_on() && num == 0x2C) {
             int64_t room = (int64_t)APP_POOL - (int64_t)(g_heap_cur + used_beside_heap());   // used_beside_heap holds the mapped pages with mem_map_limit
             // Profile mem_map_room / DM_MAP_ROOM_MB: maps may go that far past the pool before they are refused (heap growth and GetInfo are not changed). Ocarina of Time sizes its heap to the
             // pool and needs 3.3 GB mapped at the time skip after the Master Sword, past what the pool leaves (2.74 GB); with no limit at all its mapped total grew to 6.8 GB in 21 minutes
