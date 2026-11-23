@@ -204,7 +204,7 @@ BINDING = [
     {'what': 'screen shape: taller render targets, cameras, Layout2 panes and a 16:9 movie viewport (DM_SCREEN_ASPECT)', 'now': 'game', 'goal': 'game', 'purpose': 'rendering',
      'why': "the game's own display setup, camera, pane and movie code; installed together after every function matches. Indexed pane edits verify the authored name, class and dimensions they use",
      'checked': 'v131072 main: one function per fingerprint, free registers read at each site; indexed pane names, classes and dimensions checked against the UIL records. PR #3037 measured Vert+ framing and the movie aspect on Mac; final iPad title retest pending'},
-    {'what': 'animation-container list guard: a corrupt list head takes the not-found path', 'now': 'game', 'goal': 'game', 'purpose': 'crash fix',
+    {'what': 'animation-container list guard: a corrupt list head takes the not-found path', 'now': 'game', 'goal': 'game', 'purpose': 'runtime',
      'why': "the game's own animation-container function, found by its function's fingerprint on any build that keeps the function; the check reuses that function's own not-found path and touches nothing else",
      'checked': 'v131072 main: one function with this fingerprint; the hook site, the sentinel compare, the not-found rejoin (the natural second-list-exhausted target), the continue and the free registers read by disassembly; the stub emission simulated (all branch targets verified) and the forged build byte-checked by the rewriter (2026-11-21)'},
 ]
