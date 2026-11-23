@@ -23,9 +23,11 @@ zip_store	.zs:.bwav:.webm:.metallib
 
 # ---- Memory ----
 # The Switch 2 leaves games 9 GB of its 12 GB (Donkey Kong Bananza's figure). The NPDM declares 48 MB of system resource, so virtual address memory is on.
-# 256 MiB in front + 8 GiB heap + 256 MiB stacks + 8 GiB alias region. At 4 GiB the Chamber of Sages transition runs out of room for a 50.03 MiB address region (#3103).
-mem_reserve	0x420000000
-mem_alias	0x200000000
+# 256 MiB in front + 8 GiB heap + 256 MiB stacks + 16 GiB alias region. At 4 GiB the Chamber of Sages transition runs out of room for a 50.03 MiB address region (#3103);
+# at 8 GiB a long session (ranch, field, Castle Town, Temple of Time) reached +7.75 GiB and the Master Sword's return to the past stayed white, and at 16 GiB the same route
+# reached +9.00 GiB and went through (iPhone Duo, 2026-11-23). Address space only: the application pool bounds what is mapped
+mem_reserve	0x620000000
+mem_alias	0x400000000
 mem_map_limit	on
 # mem_map_limit on with 1 GB of room past the pool (v4): with no limit (cheemu21's L6.1, as above but without the limit) the time skip played, but in a 21-minute run the game's mapped memory grew
 # to 6.77 GB (it keeps freed pages mapped while maps succeed) and the iPhone ran out of memory in Hyrule Field. The time skip needs 3.28 GB mapped; the pool leaves 2.74 GB
