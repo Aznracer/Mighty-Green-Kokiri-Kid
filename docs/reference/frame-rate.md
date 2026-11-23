@@ -863,6 +863,12 @@ Frame pacing: the host's frame step, engine frame limiters, present intervals an
 - **Fix:** in `hle_nvn.c`, for every game. The ranges are kept sorted in a fixed table (`g_vpr`, up to 1,024) rewritten under `g_vp_mu` whenever a pool reserves or drops its range, behind a sequence count (a seqlock: odd while written). `nvn_sparse_alias` and `nvn_host_readable` search it without the lock (the ranges never overlap, each being its own reservation, so the first range that ends past the query decides) and take the lock as before only when the table is being written, holds more than 1,024 ranges, or the address is in a range (`nvn_host_readable` then looks at the mapped runs).
 - **Check:** the graphics tests of sparse and virtual pools (`t_copy_alias`, `t_vpool_first_map`, `t_sparse_tiles`, `t_sparse_copy`, `t_sparse_pool_cache`, `t_pool_standin_sparse`, `t_large_mdi`, `t_nvn` and others) pass. Time Profiler at the 60 fps cap, handheld, 10 s each (M3 Max): `nvn_sparse_alias` went from 47 to 6 of the replay thread's samples (2,742 and 2,659 in all) and `tex_storage_overlap` from 28 to 5, about 0.06 ms of a frame.
 - **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md), Mac, a few dozen such pools in a race.
+### Per-draw checks walked every reflected binding
+
+- **Symptom:** `fb_prepare`, `fb_depth_rule`, `ubd_conflict_textures` and `ubd_conflict_sh` in the replay thread's samples, mostly in their own loops.
+- **Cause:** each walked all of the shader's reflected bindings at every draw and skipped the kinds it does not handle. A material's fragment shader has samplers and more beside each texture.
+- **Fix:** each shader keeps, made once, the indices of its texture and image bindings and of the bindings `ubd_conflict_sh` looks at (`sh_lists_make` in `nvn_mtl.m`). The loops walk those lists with the same conditions inside, and a shader with no texture binding skips `ubd_conflict_textures`' lock. The lists are published by a release store of `tl_nb`, read with acquire.
+- **Found on:** [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md#found-on-this-game): 45 bindings at the 90th percentile, a third of them textures; the walks were about 7 % of the replay thread on Layer 1400 (a Metal System Trace's time profile of the replay thread before these changes).
 
 ### Main guest thread keeps inherited default QoS
 
