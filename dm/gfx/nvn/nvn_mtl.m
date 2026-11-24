@@ -10058,6 +10058,9 @@ static nvn_hmap g_pso_fail = {.klen = sizeof(pso_key)};   // pipelines that fail
 // (iPhone Duo, 2026-11-23). DM_GPU_KEEPWARM_DUTY (default 75, percent): the share of each idle stretch it fills, in chunks of about 250 us, so the game's next work waits at most one.
 // Off in the background (present suspended) and on a lost GPU; needs the encode thread (DM_NVN_ENC_THREAD), whose commits it reads. More GPU power and heat: for a cooled phone
 static _Atomic int g_kw_started; static _Atomic uint64_t g_kw_chunks, g_kw_ns;
+// DM_GPU_KEEPWARM_THERMAL=<state> (default 2, serious; 0 never): at or above that iOS thermal state the keep-warm pauses. At serious iOS caps the GPU clock itself, so the kernel only adds heat:
+// on the iPhone Duo a 19-minute tour on the wireless charger reached serious at 358 s and stayed there, the keep-warm still running (2026-11-24)
+int dm_thermal_now(void);   // front_ios.m: NSProcessInfo's thermalState; hle_nvn.c's weak default -1 elsewhere
 static void *kw_thread(void *arg) {
     (void)arg; pthread_setname_np("dm keepwarm");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
@@ -10078,6 +10081,10 @@ static void *kw_thread(void *arg) {
         for (;;) {
             @autoreleasepool {
                 if (atomic_load(&g_gpu_lost)) { MLOG("GPU keep-warm: stopped, the GPU was lost"); return NULL; }
+                { static int lim = -1, paused; if (lim < 0) { const char *tv = getenv("DM_GPU_KEEPWARM_THERMAL"); lim = tv && *tv ? atoi(tv) : 2; }
+                  int th = lim > 0 ? dm_thermal_now() : -1, hot = th >= lim && lim > 0;
+                  if (hot != paused) { paused = hot; MLOG("GPU keep-warm: %s (thermal state %d, DM_GPU_KEEPWARM_THERMAL %d)", hot ? "paused, iOS caps the GPU clock itself now" : "on again", th, lim); }
+                  if (hot) { usleep(100000); continue; } }
                 if (atomic_load(&g_present_suspended) || rx_busy()) { usleep(200); continue; }
                 id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
                 [ce setComputePipelineState:ps]; [ce setBuffer:ob offset:0 atIndex:0]; [ce setBytes:&n length:sizeof n atIndex:1];
