@@ -31,7 +31,9 @@ mem_alias	0x400000000
 mem_map_limit	on
 # mem_map_limit on with 1 GB of room past the pool (v4): with no limit (cheemu21's L6.1, as above but without the limit) the time skip played, but in a 21-minute run the game's mapped memory grew
 # to 6.77 GB (it keeps freed pages mapped while maps succeed) and the iPhone ran out of memory in Hyrule Field. The time skip needs 3.28 GB mapped; the pool leaves 2.74 GB
-mem_map_room	0x40000000
+# 2 GB since 2026-11-23: at 1 GB (3.74 GB mapped) the young-to-adult time skip was refused, the SDK retried for good with OptimizeChangeBank spinning a core, and the white
+# fade stayed; at 2 GB it played, and 7 minutes of Hyrule Field after it peaked at 4.50 GB mapped, footprint 5.4-5.8 GB, 2.76 GB of headroom (iPhone Duo, DM_MSL_WHOLE on)
+mem_map_room	0x80000000
 mem_stack	0x10000000
 app_pool	0x240000000
 sys_resource	0x3000000
