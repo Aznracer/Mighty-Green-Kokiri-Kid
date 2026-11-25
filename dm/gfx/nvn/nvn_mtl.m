@@ -258,6 +258,11 @@ static uint64_t g_cm_op[64], g_cm_opn[64], g_cm_sub_n, g_cm_sub_sum, g_cm_sub_ma
 static int allocprof_level(void) { if (g_allocprof < 0) { const char *e = getenv("DM_NVN_ALLOCPROF"); g_allocprof = e ? (atoi(e) > 1 ? 2 : 1) : 0; } return g_allocprof; }
 // Diagnostic only: inclusive wall/CPU time on the replay thread. No GPU waits
 // are added, and no clocks are read when DM_NVN_CPUPROF is absent or zero.
+// Counters stay thread-local on the replay thread and cp_report runs at the end
+// of mtl_sub_commit (when no phase is open), so each 5 s window has one exact
+// publish/reset boundary with no cross-thread synchronization or split samples.
+// With DM_NVN_ENC_THREAD=1, phases measure replay/recording on the replay thread
+// (dm-encode does not record into these counters).
 typedef struct { uint64_t wall, cpu; } cp_stamp;
 // Shared by every thread that replays or encodes (the queue replay and encode threads record, the present path reports): per-thread totals were never seen by the reporting thread
 static _Atomic uint64_t g_cp_wall[8], g_cp_cpu[8], g_cp_calls[8]; static uint64_t g_cp_last;
@@ -3322,6 +3327,7 @@ uint64_t mtl_sub_commit(void) {
     defer_idle_commit();   // a feedback handler that drained since this submission's own commit saw it open
     g_commit_blocks = nil;
     objc_autoreleasePoolPop(g_sub_pool); g_sub_pool = NULL;
+    cp_report();
     return fence;
 }
 
@@ -23220,7 +23226,7 @@ void mtl_present_wait(uint64_t tk) {
 // Wait until all queued presents have been processed (used by mtl_finish = nvnQueueFinish etc.): goes through mtl_present_wait, so there is still a fallback when the display link stops (real device: the game called QueueFinish once while the display link was stopped,
 // and this used to wait here without a timeout; nobody took the 3 queued frames and the game stalled; those two runs on Mac did not hit this call)
 void mtl_present_flush(void) { pthread_mutex_lock(&g_pq_mu); uint64_t h = g_pq_in; pthread_mutex_unlock(&g_pq_mu); mtl_present_wait(h); }
-void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = g_stat_pass; *draws = g_stat_draw; cp_report(); }
+void mtl_stats(uint64_t *passes, uint64_t *draws) { *passes = g_stat_pass; *draws = g_stat_draw; }
 void mtl_args_stats(uint64_t *enc, uint64_t *reuse, uint64_t *patch) { *enc = g_stat_args_enc; *reuse = g_stat_args_reuse; *patch = g_stat_args_patch; }
 void mtl_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip, uint64_t *copies, uint64_t *copy_bytes) {
     *resolve = g_vbuf_resolve; *reuse = g_vbuf_reuse; *set = g_vbuf_set; *skip = g_vbuf_skip; *copies = g_vbuf_copies; *copy_bytes = g_vbuf_copy_bytes;
