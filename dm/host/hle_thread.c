@@ -965,13 +965,16 @@ static void clock_wait(thr_t *me, uint64_t sig, uint64_t now, int predict);
 // spinning: it is the frame's critical path, and a main thread that slept looked idle to iOS and stayed on the efficiency cores (NX18, Tears of the Kingdom). NX18's measurement, iPhone
 // 18 Pro Max on battery: CPU time in tight runs of yields 4.1-5.3 -> 1.2-1.7 s a window, 43-53 -> 45-58 fps, 38-107 -> 6-89 frames dropped a window. 0 / off: the yield path as before
 #define YS_GAP_NS 2000
+#ifndef DM_GAME_YIELD_STORM
+#define DM_GAME_YIELD_STORM 0   // a fixture's game_profile.h without the key (the profile's yield_storm, game.py)
+#endif
 static _Atomic int g_ys_mode = -1;   // 0 off, 1 count, 2 sleep; published after g_ys_start and g_ys_cap
 static uint64_t g_ys_start = 500000, g_ys_cap = 50000;
 // Parsed into locals and published once: a thread making its first yield meanwhile sees -1 and parses too (the same values), never a half-set mode
 static void ystorm_init(void) {
     const char *e = getenv("DM_YIELD_STORM");
-    int mode = 1; uint64_t start = 500000, cap = 50000;
-    if (!e || !*e) e = NULL;
+    int mode = DM_GAME_YIELD_STORM ? 2 : 1; uint64_t start = 500000, cap = 50000;
+    if (!e || !*e) { if (mode == 2) LOG("yield storms: the game profile's yield_storm sleep: after %llu µs of yields with no other work, each yield of a worker (not the thread that acquires the window texture) sleeps up to %llu µs", (unsigned long long)(start / 1000), (unsigned long long)(cap / 1000)); e = NULL; }
     else if (!strcmp(e, "count")) mode = 1;
     else if (!strcmp(e, "0") || !strcmp(e, "off")) mode = 0;
     else if (!strcmp(e, "sleep") || !strcmp(e, "1")) mode = 2;

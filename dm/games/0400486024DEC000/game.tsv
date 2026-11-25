@@ -36,6 +36,10 @@ mem_map_limit	on
 # fade stayed; at 2 GB it played, and 7 minutes of Hyrule Field after it peaked at 4.50 GB mapped, footprint 5.4-5.8 GB, 2.76 GB of headroom (iPhone Duo, DM_MSL_WHOLE on)
 mem_map_room	0x80000000
 mem_stack	0x10000000
+# Yield storms (ported from kencalx/NX18, whose iPhone 18 Pro Max battery runs of this game measured it): after a save load its threads spent 4.1-5.3 s of CPU a 300-frame
+# window in runs of yields with no other work, 43-53 fps, 38-107 frames dropped; with storm sleeps 1.2-1.7 s, 45-58 fps, 6-89 dropped. sleep: once a worker's yields have run
+# 500 us with no other work, each further yield sleeps up to 50 us; the thread that acquires the window texture keeps spinning (hle_thread.c ystorm_note). DM_YIELD_STORM=count turns it off
+yield_storm	sleep
 app_pool	0x240000000
 sys_resource	0x3000000
 
