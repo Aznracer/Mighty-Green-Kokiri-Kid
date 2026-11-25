@@ -10780,6 +10780,12 @@ static void *kw_thread(void *arg) {
     const char *hv = getenv("DM_GPU_KEEPWARM_HI"); int duty_hi = hv && *hv ? atoi(hv) : 0; if (duty_hi > 100) duty_hi = 100; if (duty_hi && duty_hi < duty) duty_hi = 0;
     double hi_ms = 27, lo_ms = 21; { const char *mv = getenv("DM_GPU_KEEPWARM_HI_MS"); if (mv && *mv) { hi_ms = atof(mv); const char *c = strchr(mv, ','); lo_ms = c ? atof(c + 1) : hi_ms * 0.75; } if (lo_ms > hi_ms) lo_ms = hi_ms; }
     int duty_base = duty, gpu_bound = 0, streak = 0; uint64_t kw_switches = 0, kw_look = 0, kw_hi_at = 0;
+    // DM_GPU_KEEPWARM_STEP=<up %>,<down %>,<seconds> (off by default): with DM_GPU_KEEPWARM_HI the duty slides between DM_GPU_KEEPWARM_DUTY and DM_GPU_KEEPWARM_HI in place of the
+    // two-level switch: up a step after two looks 0.5 s apart at DM_GPU_KEEPWARM_HI_MS's first value or more, down a step under its second once <seconds> have passed since the last
+    // change, held between the two. It looks for the lowest duty that keeps the GPU clock up, leaving the CPU what it can of the performance cores
+    int st_up = 0, st_dn = 0; uint64_t st_ns = 0, kw_change = 0;
+    { const char *sv = getenv("DM_GPU_KEEPWARM_STEP"); if (sv && *sv && duty_hi) { st_up = atoi(sv); const char *c = strchr(sv, ','); st_dn = c ? atoi(c + 1) : st_up / 2; c = c ? strchr(c + 1, ',') : NULL;
+        double secs = c ? atof(c + 1) : 5; st_ns = (uint64_t)((secs < 0.5 ? 0.5 : secs) * 1e9); if (st_up < 1) st_up = 0; if (st_dn < 1) st_dn = 1; } }
     @autoreleasepool {
         NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
             "kernel void dm_keepwarm(device uint *o [[buffer(0)]], constant uint &n [[buffer(1)]], uint id [[thread_position_in_grid]]) {\n"
@@ -10791,7 +10797,8 @@ static void *kw_thread(void *arg) {
         id<MTLCommandQueue> q = [g_dev newCommandQueue]; id<MTLBuffer> ob = [g_dev newBufferWithLength:16 options:MTLResourceStorageModePrivate];
         if (!ps || !q || !ob) { MLOG("[RED] GPU keep-warm: could not make its kernel (%s); off", err.localizedDescription.UTF8String ?: "no error"); return NULL; }
         MLOG("GPU keep-warm: on, %d threadgroups of 64 threads in chunks of about 250 us, filling %d %% of the time the game's work has run out (DM_GPU_KEEPWARM, DM_GPU_KEEPWARM_DUTY)", groups, duty);
-        if (duty_hi) MLOG("GPU keep-warm: %d %% while the game's GPU time a frame averages %.0f ms or more, back to %d %% under %.0f ms (DM_GPU_KEEPWARM_HI, DM_GPU_KEEPWARM_HI_MS)", duty_hi, hi_ms, duty_base, lo_ms);
+        if (st_up) MLOG("GPU keep-warm: sliding from %d %% to %d %%, up %d points while the game's GPU time a frame averages %.0f ms or more, down %d every %.1f s under %.0f ms (DM_GPU_KEEPWARM_STEP)", duty_base, duty_hi, st_up, hi_ms, st_dn, st_ns / 1e9, lo_ms);
+        else if (duty_hi) MLOG("GPU keep-warm: %d %% while the game's GPU time a frame averages %.0f ms or more, back to %d %% under %.0f ms (DM_GPU_KEEPWARM_HI, DM_GPU_KEEPWARM_HI_MS)", duty_hi, hi_ms, duty_base, lo_ms);
         uint32_t n = 2000; uint64_t last_log = bp_now();
         for (;;) {
             @autoreleasepool {
@@ -10800,7 +10807,15 @@ static void *kw_thread(void *arg) {
                   int th = lim > 0 ? dm_thermal_now() : -1, hot = th >= lim && lim > 0;
                   if (hot != paused) { paused = hot; MLOG("GPU keep-warm: %s (thermal state %d, DM_GPU_KEEPWARM_THERMAL %d)", hot ? "paused, iOS caps the GPU clock itself now" : "on again", th, lim); }
                   if (hot) { usleep(100000); continue; } }
-                if (duty_hi && bp_now() - kw_look >= 500000000ull) {   // looked at every 0.5 s; a change needs two looks in a row
+                if (st_up && bp_now() - kw_look >= 500000000ull) {   // the sliding duty: up fast, down slowly
+                    kw_look = bp_now();
+                    double g = atomic_load_explicit(&g_kw_gpu_us, memory_order_relaxed) / 1000.0;
+                    int d = duty;
+                    if (g >= hi_ms) { if (++streak >= 2) { streak = 0; d = duty + st_up > duty_hi ? duty_hi : duty + st_up; } }
+                    else { streak = 0; if (g < lo_ms && kw_look - kw_change >= st_ns) d = duty - st_dn < duty_base ? duty_base : duty - st_dn; }
+                    if (d != duty) { duty = d; kw_change = kw_look; kw_switches++;
+                        if (kw_switches <= 40 || kw_switches % 50 == 0) MLOG("GPU keep-warm: %d %% (the game's GPU time %.1f ms a frame: %s) (#%llu)", duty, g, g >= hi_ms ? "the GPU is the limit" : "the GPU keeps up", (unsigned long long)kw_switches); }
+                } else if (duty_hi && bp_now() - kw_look >= 500000000ull) {   // looked at every 0.5 s; a change needs two looks in a row
                     kw_look = bp_now();
                     double g = atomic_load_explicit(&g_kw_gpu_us, memory_order_relaxed) / 1000.0;
                     int b = gpu_bound ? g >= lo_ms || kw_look - kw_hi_at < 15000000000ull : g >= hi_ms;   // the higher duty stays at least 15 s: at it the GPU time falls under 21 ms at once
