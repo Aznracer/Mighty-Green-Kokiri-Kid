@@ -34,7 +34,9 @@ mem_map_limit	on
 # to 6.77 GB (it keeps freed pages mapped while maps succeed) and the iPhone ran out of memory in Hyrule Field. The time skip needs 3.28 GB mapped; the pool leaves 2.74 GB
 # 2 GB since 2026-11-23: at 1 GB (3.74 GB mapped) the young-to-adult time skip was refused, the SDK retried for good with OptimizeChangeBank spinning a core, and the white
 # fade stayed; at 2 GB it played, and 7 minutes of Hyrule Field after it peaked at 4.50 GB mapped, footprint 5.4-5.8 GB, 2.76 GB of headroom (iPhone Duo, DM_MSL_WHOLE on)
-mem_map_room	0x80000000
+# 4 GB since 2026-11-25: a longer session at 2 GB was refused at 4.74 GB mapped on the young-to-adult skip with the same white fade; at 4 GB it played, then the Temple of
+# Time, Castle Town, Hyrule Field and Lon Lon Ranch peaked at 6.74 GB mapped, footprint 6.3 GB, 2.95 GB of headroom, no critical memory warning (iPhone Duo, v29)
+mem_map_room	0x100000000
 mem_stack	0x10000000
 # Yield storms (ported from kencalx/NX18, whose iPhone 18 Pro Max battery runs of this game measured it): after a save load its threads spent 4.1-5.3 s of CPU a 300-frame
 # window in runs of yields with no other work, 43-53 fps, 38-107 frames dropped; with storm sleeps 1.2-1.7 s, 45-58 fps, 6-89 dropped. sleep: once a worker's yields have run
