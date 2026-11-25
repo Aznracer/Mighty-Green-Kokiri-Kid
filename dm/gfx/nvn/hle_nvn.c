@@ -1950,6 +1950,7 @@ static void gfx_enter(void) { pthread_mutex_lock(&g_susp_mu); while (g_susp) pth
 static void gfx_leave(void) { dm_host_work--; pthread_mutex_lock(&g_susp_mu); g_inflight_api--; pthread_cond_broadcast(&g_susp_cv); pthread_mutex_unlock(&g_susp_mu); }
 void dm_gfx_enter(void) { gfx_enter(); }   // the same gate for the Vulkan layer's submits and presents (dm/gfx/vk)
 void dm_gfx_leave(void) { gfx_leave(); }
+__attribute__((weak)) void dm_thread_acquire_mark(void) {}   // hle_thread.c: the calling guest thread acquires the window texture, so DM_YIELD_STORM=sleep leaves its yield storms spinning; nothing in graphics unit tests
 __attribute__((weak)) void dm_vk_drain(void) {}   // dm/gfx/vk/hle_vk.m: wait for the Vulkan layer's queue (the graphics unit tests do not link it)
 __attribute__((weak)) void dm_gl_drain(void) {}   // dm/gfx/gl/hle_gl.m: the same for the GL layer
 static void gfx_resume_locked(void) {
@@ -2198,6 +2199,7 @@ static void fwg_frame(uint64_t period_ns) {   // on the acquiring thread, once p
     static int said; if (r && !said++) LOG("[nvn] frame workgroup: [RED] interval start failed (errno %d)", r);
 }
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
+    dm_thread_acquire_mark();   // DM_YIELD_STORM=sleep: this thread's yield storms keep spinning
     win_t *o = (win_t *)w;
     int n = window_active(o);
     *idx = n ? o->next++ % n : 0;

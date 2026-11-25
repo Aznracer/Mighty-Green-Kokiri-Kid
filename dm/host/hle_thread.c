@@ -82,6 +82,8 @@ typedef struct thr {
     uint64_t cpu_seen_us;                     // CPU time (µs) at the last power report (dm_thread_cpu)
     uint64_t yrun_svc, yrun_t0, yrun_sig, yrun_sig2, poll_ret;   // Current run of yields: nsvc of the last yield, when the run began, and the caller's x19–x28 at the last two yields (a run lasts while no other SVC comes between two yields and those registers match one of the last two, thr_yield); when the last yield or short timed-out wait returned (poll_wait_begin)
     uint64_t yrun_clk;                        // dm_clock_reads at the last yield: a pass that read the clock since makes the yield a clock wait (thr_yield)
+    uint64_t ys_svc, ys_t0, ys_last, ys_ret; int ys_in;   // Current yield storm (ystorm_note): nsvc of the last yield, when the run of yields began, when its last yield began and returned; past the storm start
+    uint64_t nstorm, nstorm_seen, storm_ns, storm_ns_seen, nstsleep, nstsleep_seen, nmoved, nmoved_seen;   // Yield storms, the time in them, their sleeps (sleep mode) and yields that moved on, with the counts at the last power report
     uint64_t cw_sig, cw_run, cw_last, cw_end, cw_per, cw_per2, cw_wake, ncwpred, ncwpred_seen;   // The clock wait followed (clock_wait): its x19–x28, the run it was last seen in, when its last yield returned,
     int cw_ok, cw_pred, cw_after, cw_trip;    // when its last wait ended, the last two periods between ends, when the predicted sleep ended, predicted sleeps (and at the last power report); periods in a row that matched, a predicted sleep in this run, yields after it, waits in a row that ended at the first poll after it
     mach_port_t mport;         // Host thread port (to get CPU time)
@@ -450,7 +452,9 @@ static void *thread_main(void *p) {
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
 }
+static thr_t *_Atomic g_ys_acq;   // the thread that last acquired the window texture (dm_thread_acquire_mark): it never takes a storm sleep
 static void thr_free(thr_t *t) {   // Holding G; unlink from the all-threads chain and free
+    { thr_t *e = t; atomic_compare_exchange_strong(&g_ys_acq, &e, NULL); }   // the acquire mark never outlives its thread: a new thread at this address is a worker
     for (int i = 0; i < t_nwdef; ) if (t_wdef[i] == t) { atomic_fetch_sub_explicit(&t->sig_pend, 1, memory_order_relaxed); t_wdef[i] = t_wdef[--t_nwdef]; } else i++;   // its own list: nothing left to wake
     while (atomic_load_explicit(&t->sig_pend, memory_order_acquire)) sched_yield();   // another waker's signal after its unlock (it needs no G)
     for (thr_t **p = &g_all; *p; p = &(*p)->all) if (*p == t) { *p = t->all; break; }
@@ -894,6 +898,7 @@ static uint64_t yield_backoff_ns(uint64_t run_ns, int clock) {
     return s < (uint64_t)g_bo_cap ? s : (uint64_t)g_bo_cap;
 }
 static void sleep_precise(uint64_t dl);
+#define SP_NEAR_NS 20000   // sleep_precise returns without a nanosleep this near its deadline (its loop's 20 µs)
 // One back-off sleep of bo ns, counted for the power line
 static void backoff_sleep(thr_t *me, uint64_t bo) { me->nbackoff++; me->sleeping = 1; struct timespec ts = {0, (long)bo}; nanosleep(&ts, 0); me->sleeping = 0; }
 // DM_YIELD_SWITCH=1 (off by default): a guest yield's host yield is thread_switch with no option instead of sched_yield. Darwin's sched_yield (swtch_pri) drops the thread's
@@ -926,6 +931,63 @@ static void yield_for(thr_t *me, uint64_t run_ns, int clock) {
 // in each pass's wait for the nifm request (w23 = 2,000, its retry count), and spun a host core as one that moved on at every yield.
 // A wait whose pass reads the system clock (dm_clock_reads moved since the last yield of the run) waits for a time, not for another thread's handoff: a clock wait (clock_wait).
 static void clock_wait(thr_t *me, uint64_t sig, uint64_t now, int predict);
+// Yield storms (DM_YIELD_STORM; ported from kencalx/NX18 ef44c572, 0c92025d, 3f9b5e6a): a thread that yields again and again with no other SVC and under YS_GAP_NS of guest work
+// between two yields, for more than g_ys_start (500 µs). The back-off above cannot see such a storm: it sleeps only after 2 ms of one run, and a run starts again at every other SVC and
+// at every yield whose x19–x28 differ from the last two yields' (that yield returns at once, with no host call). Ocarina of Time's main thread and ModuleSystem workers yield 10-20
+// million times per 300 frames on the iPhone Duo with almost no back-off sleep, keeping cores busy, while iOS runs the game on the efficiency cores.
+// count (the default): counts the storms and their time per thread for the power line (dm_yield_top), with the yields that moved on; nothing else changes.
+// sleep (DM_YIELD_STORM=sleep or 1; =<cap µs>:<start µs> sets both): once a storm is past its start, each further yield of a worker sleeps an eighth of the run so far, at least 10 µs and
+// at most g_ys_cap (50 µs), until the thread does other work. The thread that acquires the window texture each frame (g_ys_acq, from hle_nvn.c through dm_thread_acquire_mark) keeps
+// spinning: it is the frame's critical path, and a main thread that slept looked idle to iOS and stayed on the efficiency cores (NX18, Tears of the Kingdom). NX18's measurement, iPhone
+// 18 Pro Max on battery: CPU time in tight runs of yields 4.1-5.3 -> 1.2-1.7 s a window, 43-53 -> 45-58 fps, 38-107 -> 6-89 frames dropped a window. 0 / off: the yield path as before
+#define YS_GAP_NS 2000
+static _Atomic int g_ys_mode = -1;   // 0 off, 1 count, 2 sleep; published after g_ys_start and g_ys_cap
+static uint64_t g_ys_start = 500000, g_ys_cap = 50000;
+// Parsed into locals and published once: a thread making its first yield meanwhile sees -1 and parses too (the same values), never a half-set mode
+static void ystorm_init(void) {
+    const char *e = getenv("DM_YIELD_STORM");
+    int mode = 1; uint64_t start = 500000, cap = 50000;
+    if (!e || !*e) e = NULL;
+    else if (!strcmp(e, "count")) mode = 1;
+    else if (!strcmp(e, "0") || !strcmp(e, "off")) mode = 0;
+    else if (!strcmp(e, "sleep") || !strcmp(e, "1")) mode = 2;
+    else if (strchr(e, ':') && atoll(e) > 0 && atoll(strchr(e, ':') + 1) > 0) { mode = 2; cap = (uint64_t)atoll(e) * 1000; start = (uint64_t)atoll(strchr(e, ':') + 1) * 1000; }
+    else { LOG("DM_YIELD_STORM=%s: not count, sleep, 1, 0, off or <cap µs>:<start µs>; counting", e); e = NULL; }
+    if (e && mode == 2) LOG("DM_YIELD_STORM: after %llu µs of yields with no other work, each yield of a worker (not the thread that acquires the window texture) sleeps up to %llu µs", (unsigned long long)(start / 1000), (unsigned long long)(cap / 1000));
+    else if (e) LOG("DM_YIELD_STORM=%s: yield storms %s", e, mode ? "counted" : "neither counted nor slept (the yield path as before)");
+    g_ys_start = start; g_ys_cap = cap;
+    atomic_store_explicit(&g_ys_mode, mode, memory_order_release);
+}
+static int ystorm_mode(void) {
+    int m = atomic_load_explicit(&g_ys_mode, memory_order_acquire);
+    if (m < 0) { ystorm_init(); m = atomic_load_explicit(&g_ys_mode, memory_order_acquire); }
+    return m;
+}
+// The calling thread acquires the window texture (hle_nvn.c nvnWindowAcquireTexture, every acquire): its storms keep spinning
+void dm_thread_acquire_mark(void) {
+    thr_t *me = pthread_getspecific(g_keythr);
+    if (atomic_load_explicit(&g_ys_acq, memory_order_relaxed) != me) atomic_store_explicit(&g_ys_acq, me, memory_order_relaxed);
+}
+// One yield starting at y0, counted into the thread's storm; -> the sleep it takes in sleep mode (0: none)
+static uint64_t ystorm_note(thr_t *me, uint64_t y0) {
+    int mode = ystorm_mode();
+    if (!mode) return 0;
+    int cont = me->ys_svc + 1 == me->nsvc && me->ys_ret && y0 >= me->ys_ret && y0 - me->ys_ret < YS_GAP_NS;   // no other SVC and next to no guest work since the last yield
+    me->ys_svc = me->nsvc;
+    if (!cont) { me->ys_t0 = y0; me->ys_in = 0; }
+    else if (me->ys_in) me->storm_ns += y0 - me->ys_last;
+    else if (y0 - me->ys_t0 >= g_ys_start) { me->ys_in = 1; me->nstorm++; me->storm_ns += y0 - me->ys_t0; }
+    me->ys_last = y0;
+    if (mode != 2 || !me->ys_in || atomic_load_explicit(&g_ys_acq, memory_order_relaxed) == me) return 0;
+    uint64_t s = (y0 - me->ys_t0) / 8; if (s < 10000) s = 10000;
+    return s < g_ys_cap ? s : g_ys_cap;
+}
+static void ystorm_sleep(thr_t *me, uint64_t ns) {
+    me->nstsleep++; me->sleeping = 1;
+    if (ns > SP_NEAR_NS) sleep_precise(now_ns() + ns);
+    else { struct timespec ts = {0, (long)ns}; nanosleep(&ts, 0); }   // sleep_precise takes no nanosleep this near its deadline
+    me->sleeping = 0;
+}
 static void thr_yield(thr_t *me, const uint64_t *regs) {
     if (!me) { host_yield(); return; }
     static int clock_on = -1;   // DM_YIELD_CLOCK: 0 = clock waits are yields as any other, 1 = they back off from their start but sleep to no predicted end, 2 (the default) = both
@@ -936,9 +998,11 @@ static void thr_yield(thr_t *me, const uint64_t *regs) {
     int moved = same && me->yrun_sig != sig && me->yrun_sig2 != sig;   // the loop moved on since its last two yields
     int clock = clock_on && same && !moved && dm_clock_reads != me->yrun_clk;   // a wait whose pass read the clock
     me->nyield++; if (!same || moved) me->yrun_t0 = y0; me->yrun_svc = me->nsvc; me->yrun_sig2 = me->yrun_sig; me->yrun_sig = sig; me->yrun_clk = dm_clock_reads;
+    uint64_t st = ystorm_note(me, y0);   // 0 unless DM_YIELD_STORM sleeps
     if (clock) { me->nclkyield++; clock_wait(me, sig, y0, clock_on == 2 && !dm_detclock_enabled()); }
-    else if (!moved) yield_for(me, y0 - me->yrun_t0, 0);
-    me->poll_ret = now_ns();
+    else if (!moved) { uint64_t bo = yield_backoff_ns(y0 - me->yrun_t0, 0); if (bo) backoff_sleep(me, bo); else if (st) ystorm_sleep(me, st); else host_yield(); }   // yield_for, or a storm's sleep
+    else { me->nmoved++; if (st) ystorm_sleep(me, st); }
+    me->poll_ret = me->ys_ret = now_ns();
     if (clock && sig == me->cw_sig) me->cw_last = me->poll_ret;
     if (me->handle == 0x1001) { g_main_yield_ns += me->poll_ret - y0; g_main_yield_n++; }
 }
@@ -1057,19 +1121,27 @@ static void poll_sleep(thr_t *me, int64_t ns) {
 // The threads that yielded or passed through spin waits most since the last call (the power line every 300 frames, hle_nvn.c): "handle name N (back-off sleeps M)", at most two,
 // N the yields (spin wait passes that yielded among them), with the clock waits' yields among them ("; clock waits C"), the spin wait passes and the last one's site ("; spin passes K, last at main+0x…")
 void dm_yield_top(char *out, size_t n) {
-    thr_t *top[2] = {0}; uint64_t d[2] = {0}, b[2] = {0}, c[2] = {0}, cp[2] = {0}, s[2] = {0}, r[2] = {0};
+    typedef struct { thr_t *t; uint64_t y, bo, ck, pr, sp, k, mv, ns, nt, sl; } row;
+    row top[2] = {{0}};
+    int mode = ystorm_mode();
     g_lock();
     for (thr_t *t = g_all; t; t = t->all) {
-        uint64_t y = t->nyield - t->nyield_seen, bo = t->nbackoff - t->nbackoff_seen, ck = t->nclkyield - t->nclkyield_seen, pr = t->ncwpred - t->ncwpred_seen, sp = t->nspin - t->nspin_seen, k = y + sp;
+        row r = {t, t->nyield - t->nyield_seen, t->nbackoff - t->nbackoff_seen, t->nclkyield - t->nclkyield_seen, t->ncwpred - t->ncwpred_seen, t->nspin - t->nspin_seen, 0,
+                 t->nmoved - t->nmoved_seen, t->nstorm - t->nstorm_seen, t->storm_ns - t->storm_ns_seen, t->nstsleep - t->nstsleep_seen};
+        r.k = r.y + r.sp;
         t->nyield_seen = t->nyield; t->nbackoff_seen = t->nbackoff; t->nclkyield_seen = t->nclkyield; t->ncwpred_seen = t->ncwpred; t->nspin_seen = t->nspin;
-        if (k > r[0]) { top[1] = top[0]; d[1] = d[0]; b[1] = b[0]; c[1] = c[0]; cp[1] = cp[0]; s[1] = s[0]; r[1] = r[0]; top[0] = t; d[0] = y; b[0] = bo; c[0] = ck; cp[0] = pr; s[0] = sp; r[0] = k; }
-        else if (k > r[1]) { top[1] = t; d[1] = y; b[1] = bo; c[1] = ck; cp[1] = pr; s[1] = sp; r[1] = k; }
+        t->nmoved_seen = t->nmoved; t->nstorm_seen = t->nstorm; t->storm_ns_seen = t->storm_ns; t->nstsleep_seen = t->nstsleep;
+        if (r.k > top[0].k) { top[1] = top[0]; top[0] = r; }
+        else if (r.k > top[1].k) top[1] = r;
     }
     size_t o = 0; char nb[32];
-    for (int i = 0; i < 2 && top[i] && o < n; i++) {
-        o += snprintf(out + o, n - o, "%s%#x '%s' %llu times (back-off sleeps %llu", i ? ", " : "", top[i]->handle, thr_name(top[i], nb, sizeof nb), (unsigned long long)d[i], (unsigned long long)b[i]);
-        if (o < n && c[i]) o += snprintf(out + o, n - o, "; clock waits %llu, %llu of them slept to a predicted end", (unsigned long long)c[i], (unsigned long long)cp[i]);
-        if (o < n && s[i]) o += snprintf(out + o, n - o, "; spin passes %llu, last at %s+%#llx", (unsigned long long)s[i], top[i]->spin_mod, (unsigned long long)top[i]->spin_site);
+    for (int i = 0; i < 2 && top[i].t && o < n; i++) {
+        const row *r = &top[i];
+        o += snprintf(out + o, n - o, "%s%#x '%s' %llu times (back-off sleeps %llu", i ? ", " : "", r->t->handle, thr_name(r->t, nb, sizeof nb), (unsigned long long)r->y, (unsigned long long)r->bo);
+        if (o < n && mode) o += snprintf(out + o, n - o, "; moved on %llu; yield storms %llu, %.0f ms", (unsigned long long)r->mv, (unsigned long long)r->ns, r->nt / 1e6);
+        if (o < n && mode == 2) o += snprintf(out + o, n - o, "; storm sleeps %llu%s", (unsigned long long)r->sl, atomic_load_explicit(&g_ys_acq, memory_order_relaxed) == r->t ? ", acquiring thread: spins" : "");
+        if (o < n && r->ck) o += snprintf(out + o, n - o, "; clock waits %llu, %llu of them slept to a predicted end", (unsigned long long)r->ck, (unsigned long long)r->pr);
+        if (o < n && r->sp) o += snprintf(out + o, n - o, "; spin passes %llu, last at %s+%#llx", (unsigned long long)r->sp, r->t->spin_mod, (unsigned long long)r->t->spin_site);
         if (o < n) o += snprintf(out + o, n - o, ")");
     }
     g_unlock();
