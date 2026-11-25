@@ -10792,9 +10792,14 @@ static void *kw_thread(void *arg) {
     // The way down stops at the learned level while the CPU is light (2026-11-25, the Forest Temple): with the game's CPU work at about one core a lower duty won the CPU no
     // fast cores (29-34 % on performance cores at 10 % and at 30 %), and between 17 and 21 ms the slide went back to 10 % every time, the GPU clock sank, frame generation took
     // 9-11 ms a frame where 6-7 at the higher duty, and the real frame rate swung 23-30 fps, the slide climbing ten times. Below DM_GPU_KEEPWARM_CPU cores (default 1.8; the
-    // ranch ran 2.5, where the fast cores matter) it holds at the learned level; 4 ms or more under the line it still goes down, as in menus
+    // ranch ran 2.5, where the fast cores matter) it holds at the learned level; under 8 ms a frame it still goes down, as in menus
     int st_up = 0, st_dn = 0, kw_need = 0, kw_climb = 0, kw_last_up = 0, kw_held = 0; uint64_t st_ns = 0, kw_change = 0;
     double kw_cpu_min = 1.8, kw_cores = -1; uint64_t kw_ru_ns = 0, kw_ru_at = 0;
+    // Lon Lon Ranch's night-to-day change (2026-11-25): the GPU time stayed at 28-31 ms while the slide climbed 18, 26, 38, 52 and 65 %, then 60 % went on to the 2 minutes after,
+    // the ranch's GPU time sitting at 19.6-21.0 ms from 10 to 60 % (its work, not the clock), the way down waiting for under 21 ms; at 30-60 % 25-38 % of the CPU time on
+    // performance cores and 24-26 fps, at 10-20 % 44-48 % and 27-29. A busy GPU leaves the keep-warm no idle time to fill, so a further step in a climb needs the last one to have
+    // lowered the GPU time by 1 ms (or, once a climb, 6 s), and a climb is learned only if a step lowered it or its first step ended it within 4 s; and with the CPU busy (DM_GPU_KEEPWARM_CPU cores or more) the way down starts 3 ms under DM_GPU_KEEPWARM_HI_MS's first value
+    double kw_up_g = 0; int kw_helped = 0, kw_steps = 0, kw_futile = 0;
     { const char *cv = getenv("DM_GPU_KEEPWARM_CPU"); if (cv && *cv) kw_cpu_min = atof(cv); }
     { const char *sv = getenv("DM_GPU_KEEPWARM_STEP"); if (sv && *sv && duty_hi) { st_up = atoi(sv); const char *c = strchr(sv, ','); st_dn = c ? atoi(c + 1) : st_up / 2; c = c ? strchr(c + 1, ',') : NULL;
         double secs = c ? atof(c + 1) : 5; st_ns = (uint64_t)((secs < 0.5 ? 0.5 : secs) * 1e9); if (st_up < 1) st_up = 0; if (st_dn < 1) st_dn = 1; } }
@@ -10829,17 +10834,21 @@ static void *kw_thread(void *arg) {
                         kw_ru_ns = c; kw_ru_at = kw_look; } }
                     if (g >= hi_ms) {
                         int settle = kw_last_up && since < 1500000000ull && g < hi_ms + 6;
+                        if (kw_climb && g <= kw_up_g - 1.0) kw_helped = 1;
+                        int futile = kw_climb && g > kw_up_g - 1.0; if (futile && !settle && (since < 6000000000ull || kw_futile)) settle = 1;   // the last step did not lower it: the GPU is busy, not slow
                         if (++streak >= 2 && !settle) { streak = 0;
                             double f = (g - hi_ms + 1) / 5; if (f > 1) f = 1; int step = (int)(st_up * f + 0.5), smin = st_up / 3 < 1 ? 1 : st_up / 3; if (step < smin) step = smin;
                             d = duty + step; why = "the GPU is the limit";
                             if (!kw_climb && kw_need > d) { d = kw_need; why = "the GPU is the limit; straight to the level that worked before"; }
-                            if (d > duty_hi) d = duty_hi; kw_climb = 1; }
+                            if (d > duty_hi) d = duty_hi; if (!kw_climb) kw_helped = 0, kw_steps = 0, kw_futile = 0; else if (futile) kw_futile = 1; kw_climb = 1; kw_steps++; kw_up_g = g; }
                     } else { streak = 0;
-                        if (kw_climb) { kw_climb = 0; kw_need = kw_need ? (kw_need * 3 + duty + 2) / 4 : duty; }   // the level that brought it back under the line
+                        if (kw_climb) { kw_climb = 0; if (kw_helped || (kw_steps == 1 && since < 4000000000ull)) kw_need = kw_need ? (kw_need * 3 + duty + 2) / 4 : duty; }   // the level that brought it back under the line
                         uint64_t gap = g < lo_ms - 4 ? 1000000000ull : st_ns;
-                        if (g < lo_ms && since >= gap) { d = duty - st_dn < duty_base ? duty_base : duty - st_dn; why = g < lo_ms - 4 ? "the GPU keeps up with room" : "the GPU keeps up";
-                            int light = kw_cores >= 0 && kw_cores < kw_cpu_min && kw_cpu_min > 0;
-                            if (light && g >= lo_ms - 4 && duty >= kw_need && d < kw_need) { d = kw_need;
+                        int light = kw_cores >= 0 && kw_cores < kw_cpu_min && kw_cpu_min > 0;
+                        double down_ms = light || kw_cpu_min <= 0 || hi_ms - 3 < lo_ms ? lo_ms : hi_ms - 3;
+                        if (g < down_ms && since >= gap) { d = duty - st_dn < duty_base ? duty_base : duty - st_dn; why = g < lo_ms - 4 ? "the GPU keeps up with room" : "the GPU keeps up";
+                            if (g >= lo_ms) { snprintf(whyb, sizeof whyb, "the GPU keeps up; the CPU busy (%.1f cores) wants the fast cores", kw_cores); why = whyb; }
+                            if (light && g >= 8 && duty >= kw_need && d < kw_need) { d = kw_need;
                                 if (!kw_held) { kw_held = 1; snprintf(whyb, sizeof whyb, "the GPU keeps up; held at the learned level, the CPU light (%.1f cores)", kw_cores); why = whyb;
                                     if (d == duty) MLOG("GPU keep-warm: %d %% held (the game's GPU time %.1f ms a frame; the CPU %.1f cores, under DM_GPU_KEEPWARM_CPU %.1f)", duty, g, kw_cores, kw_cpu_min); } }
                             else kw_held = 0; } }
