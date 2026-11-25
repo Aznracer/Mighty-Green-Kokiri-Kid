@@ -138,7 +138,7 @@ static const int k_btns[] = {B_ZL, B_L, B_ZR, B_R, B_MINUS, B_PLUS, B_LS, B_RS};
 static NSString *const k_layout_key = @"DmPadLayout";   // NSUserDefaults: 0 = 2D, 1 = 3D, 2 = Tap, 3 = Native (DM_GAME_PAD_LAYOUT's numbers)
 static NSString *const k_native_key = @"DmPadNativeOffered";   // a profile that starts in Native switches to it once, over a layout saved before Native existed
 // Native layout (in points of an 874 x 402 landscape screen, scaled by gu; x from the corner rectangle's edges, y from its top or bottom): centre, radius
-static const int k_nat[] = {B_B, B_A, B_R, B_ZL, B_X, B_Y, B_PLUS, B_MINUS, B_ZR, B_LEFT, B_UP, B_RIGHT, B_DOWN};   // native_oot.py: ZR and a D-pad added
+static const int k_nat[] = {B_B, B_A, B_R, B_L, B_ZL, B_X, B_Y, B_PLUS, B_MINUS, B_ZR, B_LEFT, B_UP, B_RIGHT, B_DOWN};   // native_oot.py: ZR and a D-pad added; L (L1) beside ZL as R beside ZR
 static const CGFloat N_RING_R = 62, N_KNOB_R = 27, N_STICK_X = 120, N_STICK_Y = 105, N_MENU_X = 126, N_TOP_Y = 32, N_TOP_R = 18;   // v10: + (the chest) beside − (the map) at the top right, the menu button (…) one place further in
 static const NSTimeInterval K_ZL_TAP = 0.3;   // ZL (L2) touched for less than this (seconds) locks it on, held until the next touch on it (cheemu21's kid-with-sword-remake Native layout)
 int dm_opmode(void);   // hle_oe.c: 0 = handheld
@@ -450,7 +450,8 @@ static CGPoint side(CGRect s, int right, CGFloat dx, CGFloat y) { return CGPoint
     switch (b) {
         case B_Y: x = R - 92 * g; y = Bt - 88 * v; rr = 44; break;   // native_oot.py: Ocarina of Time's sword is Y, so Y takes the big key and B (put away) the small one
         case B_A: x = R - 180 * g; y = Bt - 74 * v; rr = 30; break;
-        case B_R: x = R - 226 * g; y = Bt - 196 * v; rr = 25; break;   // native_oot4.py: R (quick select) and ZR (the active item) swapped
+        case B_R: x = R - 218 * g; y = Bt - 194 * v; rr = 25; break;   // native_oot4.py: R (quick select) and ZR (the active item) swapped; v24: up and left of ZR, closer to it (was 226, 196)
+        case B_L: x = R - 160 * g; y = Bt - 228 * v; rr = 25; break;   // v24: L (L1), up and left of ZL as R is of ZR, R's icon
         case B_ZL: x = R - 106 * g; y = Bt - 188 * v; rr = 25; break;
         case B_X: x = R - 40 * g; y = Bt - 172 * v; rr = 23; break;
         case B_B: x = R - 40 * g; y = Bt - 238 * v; rr = 21; break;
@@ -779,13 +780,13 @@ static void placeLabel(CATextLayer *t, CGPoint c, CGFloat fs) {
     CGFloat g = self.gu;
     _nring = glassDisc(N_RING_R * g, NULL); _nring.position = self.natStickHome; [_nat addSublayer:_nring];
     CAShapeLayer *kb = nil; _nknob = glassDisc(N_KNOB_R * g, &kb); _nknobBase = kb; _nknob.position = self.natStickHome; [_nat addSublayer:_nknob]; pad_cache(_nring, scale); pad_cache(_nknob, scale);
-    static NSString *const sym[B_N] = { [B_A] = @"figure.run", [B_B] = @"xmark", [B_X] = @"chevron.up.2", [B_R] = @"square.grid.2x2", [B_ZL] = @"scope", [B_ZR] = @"figure.archery", [B_PLUS] = @"line.3.horizontal", [B_MINUS] = @"map",
+    static NSString *const sym[B_N] = { [B_A] = @"figure.run", [B_B] = @"xmark", [B_X] = @"chevron.up.2", [B_R] = @"square.grid.2x2", [B_L] = @"square.grid.2x2", [B_ZL] = @"scope", [B_ZR] = @"figure.archery", [B_PLUS] = @"line.3.horizontal", [B_MINUS] = @"map",
                                         [B_LEFT] = @"music.note", [B_RIGHT] = @"sparkles", [B_UP] = @"chevron.up", [B_DOWN] = @"chevron.down" };   // native_oot.py: Ocarina of Time's actions
-    static NSString *const chip[B_N] = { [B_A] = @"A", [B_B] = @"B", [B_X] = @"X", [B_Y] = @"Y", [B_R] = @"R", [B_ZL] = @"ZL", [B_ZR] = @"ZR", [B_PLUS] = @"+", [B_MINUS] = @"\u2212" };
+    static NSString *const chip[B_N] = { [B_A] = @"A", [B_B] = @"B", [B_X] = @"X", [B_Y] = @"Y", [B_R] = @"R", [B_L] = @"L", [B_ZL] = @"ZL", [B_ZR] = @"ZR", [B_PLUS] = @"+", [B_MINUS] = @"\u2212" };
     for (int i = 0; i < (int)(sizeof k_nat / sizeof *k_nat); i++) { int b = k_nat[i]; CGPoint c; CGFloat r; [self nat:b centre:&c radius:&r];
         CAShapeLayer *base = nil; CALayer *d = glassDisc(r, &base); d.position = c;
         if (b == B_Y) glassSword(d, 24 * g); else if (b == B_PLUS) iconChest(d, r * 0.52); else if (b == B_B) glassWords(d, @"Put\nAway", 9.5 * g, scale); else glassSymbol(d, sym[b], (b == B_A ? 17 : b == B_PLUS || b == B_MINUS || b >= B_LEFT ? 11 : b == B_X ? 14 : b == B_B ? 12 : 15) * g, scale);
-        if (b < B_LEFT) glassChip(d, pad_label(b, chip[b]), b == B_R || b == B_ZL || b == B_ZR, scale);   // the D-pad keys carry their icon alone
+        if (b < B_LEFT) glassChip(d, pad_label(b, chip[b]), b == B_R || b == B_L || b == B_ZL || b == B_ZR, scale);   // the D-pad keys carry their icon alone
         if (b == B_ZL) {   // the lock badge: a small gold disc with a padlock at the key's upper right, shown while ZL is locked
             CGFloat br = 9 * g; CALayer *m = glassDisc(br, NULL); ((CAShapeLayer *)m.sublayers.firstObject).fillColor = [UIColor colorWithRed:1 green:0.82 blue:0.3 alpha:0.9].CGColor;
             glassSymbol(m, @"lock.fill", 8 * g, scale); m.position = CGPointMake(r + r * 0.72, r - r * 0.72); m.hidden = !_zlLock; [d addSublayer:m]; _zlMark = m;
