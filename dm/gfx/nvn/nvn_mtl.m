@@ -6886,6 +6886,10 @@ void mtl_dbnd_stats(uint64_t *ops, uint64_t *draws, uint64_t *calls, uint64_t *e
 static int g_enc_vis, g_enc_has_vis;   // This encoder's current visibility count mode (0 off / slot number + 1), and whether a visibility buffer is attached
 static int g_pso_dirty = 1, g_dss_dirty = 1;   // Pipeline / depth-stencil related state was changed during replay
 static uint64_t g_stat_args_enc, g_stat_args_reuse, g_stat_args_patch;   // Argument buffer: new-encode / reuse / patched (only CBUF slots written again) counts
+// Why a block was written whole (encode_args_full): 0 no block yet or another stage's, 1 a new pass, 2 a binding of the stage changed, 3 base instance (drv_read), 4 pool tables replaced (g_psnap_gen),
+// 5 only uniforms changed but the shader reads them other than as uniforms (not patchable), 6 pass dump or a stage never reused; with mach time of whole writes and patches (g_args_why_t[0], [1])
+static uint64_t g_args_why[8], g_args_why_t[2];
+void mtl_args_why(uint64_t *out) { for (int i = 0; i < 7; i++) out[i] = g_args_why[i]; out[7] = g_args_why_t[0]; out[8] = g_args_why_t[1]; }
 static uint64_t g_stat_draw, g_stat_pass, g_bw_load, g_bw_store, g_pass_full_rw, g_udc_saved_bytes;   // Bandwidth ledger: attachment load / store bytes, number of full load-store passes
 // DM_NVN_PASSDUMP: records pass attachments / samples / presents one by one (textures by serial) for offline data-flow analysis; the pass numbers of P / D / R / S lines agree (= g_stat_pass after the pass is opened)
 // DM_NVN_PASSDUMP=frame number, or start-end (inclusive at both ends)
@@ -15738,6 +15742,9 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
     if (sh->rf.ngptr) gmem_discover(sh, nvn_stage);
     args_sync_dirty();
     int reusable = !passdump() && sh->ab_gen == g_args_gen[nvn_stage] && sh->ab_pass == g_pass.serial && sh->ab_buf && nvn_stage != 5 && nvn_stage != NVN_RT_RESOURCE_STAGE && !(sh->rf.drv_read[0] && sh->ab_binst != g_draw_binst) && !((sh->rf.pool || sh->rf.htab) && sh->ab_pgen != g_psnap_gen);
+    int why = reusable ? 5 : passdump() || nvn_stage == 5 || nvn_stage == NVN_RT_RESOURCE_STAGE ? 6 : !sh->ab_buf ? 0 : sh->ab_pass != g_pass.serial ? 1 : sh->ab_gen != g_args_gen[nvn_stage] ? 2
+            : sh->rf.drv_read[0] && sh->ab_binst != g_draw_binst ? 3 : 4;   // the first reason that holds (g_args_why); 5: decided below
+    uint64_t why_t0 = mach_absolute_time();
     if (reusable && sh->ab_ugen == g_args_ugen[nvn_stage]) {
         bind_args(en, nvn_stage, metal_vertex, sh->ab_buf, sh->ab_gpu, sh->ab_off, sh->rf.abi);
         g_stat_args_reuse++;
@@ -15756,7 +15763,7 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
             za_check(p[b->aid], "argument block address slot", b->aid); }
         bind_args(en, nvn_stage, metal_vertex, ab, ab_gpu, off, sh->rf.abi);
         sh->ab_buf = ab; sh->ab_gpu = ab_gpu; sh->ab_off = off; sh->ab_ugen = g_args_ugen[nvn_stage]; g_args_wrote[nvn_stage] = g_args_seq;   // pass, base instance, pool and binding generations are the ones the copied block was encoded for
-        g_stat_args_patch++;
+        g_stat_args_patch++; g_args_why_t[1] += mach_absolute_time() - why_t0;
         return 1;
     }
     int gmem_aid = -1; id<MTLBuffer> raw_map = nil; int gml_taken = 0;   // the slot that holds the raw pool table (gmem_slot_note), and the table this block's log and table slot share
@@ -16134,7 +16141,7 @@ static int encode_args_full(id<MTLCommandEncoder> en, NvShader *sh, int nvn_stag
     if (gmem_aid >= 0) gmem_slot_note((uint64_t *)(void *)at.cpu + gmem_aid, gml_taken ? (__bridge void *)g_gml_last : NULL);   // the arena's own CPU address (no contents message: see ubo_read)
     bind_args(en, nvn_stage, metal_vertex, ab, at.gpu, off, sh->rf.abi);
     sh->ab_buf = ab; sh->ab_gpu = at.gpu; sh->ab_off = off; sh->ab_pass = g_pass.serial; sh->ab_binst = g_draw_binst; sh->ab_pgen = g_psnap_gen; sh->ab_gen = g_args_gen[nvn_stage]; sh->ab_ugen = g_args_ugen[nvn_stage]; g_args_wrote[nvn_stage] = g_args_seq;
-    g_stat_args_enc++;
+    g_stat_args_enc++; g_args_why[why]++; g_args_why_t[0] += mach_absolute_time() - why_t0;
     return 1;
 }
 static id<MTLBuffer> g_quad_ib; static uint64_t g_quad_gpu;

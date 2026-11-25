@@ -2400,6 +2400,14 @@ static void power_line(uint64_t frame) {
                 frame, (ps[0] - pps[0]) / nf, (ps[1] - pps[1]) / 1e3 / nf, (ps[2] - pps[2]) / nf, (ps[3] - pps[3]) / nf, (ps[4] - pps[4]) / nf, (ps[5] - pps[5]) / nf,
                 into / nf, into ? (double)(ps[7] - pps[7]) / (double)into : 0.0, whole / nf, (ps[8] - pps[8]) / nf, (ps[9] - pps[9]) / nf, (ps[10] - pps[10]) / nf, (ps[11] - pps[11]) / 1e3 / nf, ps[12] / 1048576.0, ps[13] / 1048576.0); }
         memcpy(pps, ps, sizeof pps);
+        { void mtl_args_stats(uint64_t *, uint64_t *, uint64_t *); void mtl_args_why(uint64_t *);
+          static uint64_t pae, par, pap, pw[9]; uint64_t ae, ar, ap, w[9]; mtl_args_stats(&ae, &ar, &ap); mtl_args_why(w);
+          static mach_timebase_info_data_t tbw; if (!tbw.denom) mach_timebase_info(&tbw);
+          double tw = (double)(w[7] - pw[7]) * tbw.numer / tbw.denom / 1e6, tp = (double)(w[8] - pw[8]) * tbw.numer / tbw.denom / 1e6;   // ms in the window
+          if (ae != pae) LOG("[nvn] argument blocks up to frame %llu, per frame: %.0f reused, %.0f patched (%.3f ms), %.0f written whole (%.3f ms, %.2f us each); written because: none yet %.0f, a new pass %.0f, a binding changed %.0f, base instance %.0f, pool tables replaced %.0f, uniforms not patchable %.0f, never reused %.0f",
+              frame, (ar - par) / nf, (ap - pap) / nf, tp / nf, (ae - pae) / nf, tw / nf, ae != pae ? tw * 1e3 / (double)(ae - pae) : 0.0,
+              (w[0] - pw[0]) / nf, (w[1] - pw[1]) / nf, (w[2] - pw[2]) / nf, (w[3] - pw[3]) / nf, (w[4] - pw[4]) / nf, (w[5] - pw[5]) / nf, (w[6] - pw[6]) / nf);
+          pae = ae; par = ar; pap = ap; memcpy(pw, w, sizeof pw); }
         void mtl_gsb_stats(uint64_t *, uint64_t *); static uint64_t pgn, pgb; uint64_t gn, gb; mtl_gsb_stats(&gn, &gb);   // GPU textures' writes stored into their storage (nvn_mtl.m gsb_store)
         if (gn != pgn) LOG("[nvn] GPU texture storage up to frame %llu: %llu regions, %.1f MB written into their storage on the GPU (%.2f regions, %.2f MB per frame)",
             frame, (unsigned long long)(gn - pgn), (gb - pgb) / 1048576.0, (gn - pgn) / nf, (gb - pgb) / 1048576.0 / nf);
