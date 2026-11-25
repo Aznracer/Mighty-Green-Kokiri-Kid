@@ -101,6 +101,8 @@ SWITCH_BINDING = [
      'why': "the game maps more than its pool while the time travel plays (iPhone Duo); the room is measured per game"}),
     ('yield_storm', '', {'what': 'yield storms of workers sleep', 'now': 'game', 'goal': 'host', 'purpose': 'power',
      'why': 'measured per game first (NX18, Ocarina of Time on an iPhone 18 Pro Max); a default for every game needs runs of others'}),
+    ('keepwarm', '', {'what': 'GPU keep-warm duty and slide', 'now': 'game', 'goal': 'host', 'purpose': 'performance',
+     'why': 'measured per game and phone (Ocarina of Time on an iPhone Duo): how much the GPU clock sinks and the CPU loses the fast cores differs by game; a default for every game needs runs of others'}),
     ('pad_theme', '', {'what': 'pad theme (this fork)', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': 'a fork setting for this game'}),
     ('alloc_big_align', '', {'what': "StandardAllocator blocks of 64 KB and more aligned to 64 KB", 'now': 'game', 'goal': 'host', 'purpose': 'memory',
      'why': "the cause is a memory pool's GPU address, big-page aligned on hardware and the CPU address here: pool GPU addresses aligned as hardware does, or this alignment for every game"}),

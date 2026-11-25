@@ -10777,8 +10777,14 @@ static void *kw_thread(void *arg) {
     (void)arg; pthread_setname_np("dm keepwarm");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
     const char *e = getenv("DM_GPU_KEEPWARM"); int groups = e && *e ? atoi(e) : 0; if (groups == 1) groups = 8; if (groups > 256) groups = 256;
-    const char *dv = getenv("DM_GPU_KEEPWARM_DUTY"); int duty = dv && *dv ? atoi(dv) : 75; if (duty < 1) duty = 1; if (duty > 100) duty = 100;
-    const char *hv = getenv("DM_GPU_KEEPWARM_HI"); int duty_hi = hv && *hv ? atoi(hv) : 0; if (duty_hi > 100) duty_hi = 100; if (duty_hi && duty_hi < duty) duty_hi = 0;
+#ifndef DM_GAME_KEEPWARM
+#define DM_GAME_KEEPWARM ""   // a fixture's game_profile.h without the key (the profile's keepwarm, game.py)
+#endif
+    // The profile's keepwarm (<duty>,<high duty>,<up>,<down>,<seconds>) stands in for each of DM_GPU_KEEPWARM_DUTY, _HI and _STEP the env leaves unset
+    int pf_duty = 0, pf_hi = 0; char pf_step[48] = "";
+    { const char *pk = DM_GAME_KEEPWARM; if (*pk) { pf_duty = atoi(pk); const char *c = strchr(pk, ','); if (c) { pf_hi = atoi(c + 1); c = strchr(c + 1, ','); if (c) snprintf(pf_step, sizeof pf_step, "%s", c + 1); } } }
+    const char *dv = getenv("DM_GPU_KEEPWARM_DUTY"); int duty = dv && *dv ? atoi(dv) : pf_duty ? pf_duty : 75; if (duty < 1) duty = 1; if (duty > 100) duty = 100;
+    const char *hv = getenv("DM_GPU_KEEPWARM_HI"); int duty_hi = hv && *hv ? atoi(hv) : pf_hi; if (duty_hi > 100) duty_hi = 100; if (duty_hi && duty_hi < duty) duty_hi = 0;
     double hi_ms = 27, lo_ms = 21; { const char *mv = getenv("DM_GPU_KEEPWARM_HI_MS"); if (mv && *mv) { hi_ms = atof(mv); const char *c = strchr(mv, ','); lo_ms = c ? atof(c + 1) : hi_ms * 0.75; } if (lo_ms > hi_ms) lo_ms = hi_ms; }
     int duty_base = duty, gpu_bound = 0, streak = 0; uint64_t kw_switches = 0, kw_look = 0, kw_hi_at = 0;
     // DM_GPU_KEEPWARM_STEP=<up %>,<down %>,<seconds> (off by default): with DM_GPU_KEEPWARM_HI the duty slides between DM_GPU_KEEPWARM_DUTY and DM_GPU_KEEPWARM_HI in place of the
@@ -10801,7 +10807,7 @@ static void *kw_thread(void *arg) {
     // lowered the GPU time by 1 ms (or, once a climb, 6 s), and a climb is learned only if a step lowered it or its first step ended it within 4 s; and with the CPU busy (DM_GPU_KEEPWARM_CPU cores or more) the way down starts 3 ms under DM_GPU_KEEPWARM_HI_MS's first value
     double kw_up_g = 0; int kw_helped = 0, kw_steps = 0, kw_futile = 0;
     { const char *cv = getenv("DM_GPU_KEEPWARM_CPU"); if (cv && *cv) kw_cpu_min = atof(cv); }
-    { const char *sv = getenv("DM_GPU_KEEPWARM_STEP"); if (sv && *sv && duty_hi) { st_up = atoi(sv); const char *c = strchr(sv, ','); st_dn = c ? atoi(c + 1) : st_up / 2; c = c ? strchr(c + 1, ',') : NULL;
+    { const char *sv = getenv("DM_GPU_KEEPWARM_STEP"); if (!(sv && *sv) && *pf_step) sv = pf_step; if (sv && *sv && duty_hi) { st_up = atoi(sv); const char *c = strchr(sv, ','); st_dn = c ? atoi(c + 1) : st_up / 2; c = c ? strchr(c + 1, ',') : NULL;
         double secs = c ? atof(c + 1) : 5; st_ns = (uint64_t)((secs < 0.5 ? 0.5 : secs) * 1e9); if (st_up < 1) st_up = 0; if (st_dn < 1) st_dn = 1; } }
     @autoreleasepool {
         NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"

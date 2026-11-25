@@ -42,6 +42,10 @@ mem_stack	0x10000000
 # window in runs of yields with no other work, 43-53 fps, 38-107 frames dropped; with storm sleeps 1.2-1.7 s, 45-58 fps, 6-89 dropped. sleep: once a worker's yields have run
 # 500 us with no other work, each further yield sleeps up to 50 us; the thread that acquires the window texture keeps spinning (hle_thread.c ystorm_note). DM_YIELD_STORM=count turns it off
 yield_storm	sleep
+# GPU keep-warm (with DM_GPU_KEEPWARM=1; iPhone Duo, frame generation at 30 -> 60): duty 10 % while the CPU is the limit (Lon Lon Ranch: 44-49 % of the CPU time on the
+# performance cores, 26-29 fps; iOS moves the game's CPU work to the efficiency cores while the GPU clock runs high), sliding up to 100 % while the game's GPU time a frame is
+# 27 ms or more (the Forest Temple's GPU clock sank to 30 ms a frame, 17 fps, at 10 %): up to 15 points a second, down 5 every 3 s. The env lines DM_GPU_KEEPWARM_DUTY, _HI, _STEP override
+keepwarm	10,100,15,5,3
 app_pool	0x240000000
 sys_resource	0x3000000
 
