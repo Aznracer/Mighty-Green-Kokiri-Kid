@@ -18,6 +18,8 @@ uint64_t nvn_dirty_own_writes(void);                               // CPU and GP
 void nvn_dirty_gpu_written(uintptr_t addr, size_t len);             // Replayed or completed buffer writes bypass CPU page protection
 void nvn_dirty_touch(void);                                        // Moves the generation as a write does, with no page written: whoever remembers "nothing written since" by it asks its pages again
 uint64_t nvn_dirty_now(void);                                      // Current generation: take the content's stamp before nvn_dirty_protect and before reading it
+uint64_t nvn_dirty_clock(void);                                    // The generation without nvn_dirty_now's tick while a page is write-pending
+int nvn_dirty_hot(void);                                           // Any page write-pending now (its writes do not fault, so they do not move the clock)
 int nvn_dirty_since(const void *addr, size_t len, uint64_t stamp); // Covered pages were written after the stamp -> 1
 const void *nvn_dirty_span(const void *addr, size_t len);          // The tracked range holding the span (a handle to keep; NULL = untracked)
 int nvn_dirty_since_cached(const void **span, const void *addr, size_t len, uint64_t stamp);   // nvn_dirty_since keeping the last range found in *span

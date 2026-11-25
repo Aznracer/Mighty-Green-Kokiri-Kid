@@ -15156,8 +15156,15 @@ static int fb_image_view(int tid, const nvn_rbind *b, id<MTLTexture> t) {
 static uint64_t g_args_reg_seen, g_args_dirty_seen, g_args_ser_seen;
 // A reused block holds resource IDs: it is stale after a registration change, a guest write, or a serial's Metal object replaced (g_ser_gen: an upgraded or re-uploaded packaged texture,
 // an alias taken or evicted) with the same program and bindings (MacNativeGames e49aa55)
+// DM_NVN_ARGS_FRAME=1: while a page is write-pending nvn_dirty_now ticks at every call (nvn_dirty.c g_hot_pages), and Ocarina of Time holds some all the time, so every draw
+// wrote every block whole (iPhone Duo, v28: 0 reused, 2,000-4,800 blocks a frame, 6-16 ms of the submit thread). With the switch the blocks follow the clock as it stands
+// (writes that fault) and, while a page is write-pending, the presented frame: a write to a write-pending page reaches the blocks (and the packaged textures they look at
+// again) at the next frame at the latest, not at the next draw. 0 (the default): the ticking clock, as before
+static int args_frame_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("DM_NVN_ARGS_FRAME"); v = e && atoi(e) > 0; if (v) MLOG("argument blocks: reused across draws while pages are write-pending, looked at again each frame (DM_NVN_ARGS_FRAME)"); } return v; }
 static inline void args_sync_dirty(void) {
-    uint64_t reg = g_reg_gen, dirty = nvn_dirty_now(), ser = g_ser_gen;
+    uint64_t reg = g_reg_gen, ser = g_ser_gen, dirty;
+    if (args_frame_on()) dirty = nvn_dirty_clock() * 2 + (nvn_dirty_hot() ? (atomic_load(&g_cur_frame) << 1 | 1) : 0);   // stands still within a frame unless a write faults
+    else dirty = nvn_dirty_now();
     if (reg != g_args_reg_seen || dirty != g_args_dirty_seen || ser != g_args_ser_seen) {
         g_args_reg_seen = reg; g_args_dirty_seen = dirty; g_args_ser_seen = ser; args_dirty_all();
     }

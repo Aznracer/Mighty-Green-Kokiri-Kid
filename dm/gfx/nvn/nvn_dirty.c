@@ -546,7 +546,10 @@ void nvn_dirty_protect_sparse(const void *addr, size_t len) {
     pthread_mutex_unlock(&g_slot_mu);
 }
 uint64_t nvn_dirty_sparse_writes(void) { return atomic_load(&g_sparse_writes); }
-uint64_t nvn_dirty_now(void) { return atomic_load_explicit(&g_hot_pages, memory_order_relaxed) > 0 ? atomic_fetch_add(&g_now, 1) + 1 : atomic_load(&g_now); }   // ticks while a page is write-pending (g_hot_pages)
+uint64_t nvn_dirty_now(void) { return atomic_load_explicit(&g_hot_pages, memory_order_relaxed) > 0 ? atomic_fetch_add(&g_now, 1) + 1 : atomic_load(&g_now); }
+// The clock as it stands, without the tick nvn_dirty_now takes while a page is write-pending, and whether any page is (nvn_mtl.m args_sync_dirty with DM_NVN_ARGS_FRAME)
+uint64_t nvn_dirty_clock(void) { return atomic_load(&g_now); }
+int nvn_dirty_hot(void) { return atomic_load_explicit(&g_hot_pages, memory_order_relaxed) > 0; }   // ticks while a page is write-pending (g_hot_pages)
 // A GPU blit does not fault on CPU page protection. Keep the protection in place for the next CPU write.
 void nvn_dirty_gpu_written(uintptr_t addr, size_t len) {
     if (!len) return;
