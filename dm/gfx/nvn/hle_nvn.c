@@ -1950,6 +1950,8 @@ static void gfx_enter(void) { pthread_mutex_lock(&g_susp_mu); while (g_susp) pth
 static void gfx_leave(void) { dm_host_work--; pthread_mutex_lock(&g_susp_mu); g_inflight_api--; pthread_cond_broadcast(&g_susp_cv); pthread_mutex_unlock(&g_susp_mu); }
 void dm_gfx_enter(void) { gfx_enter(); }   // the same gate for the Vulkan layer's submits and presents (dm/gfx/vk)
 void dm_gfx_leave(void) { gfx_leave(); }
+static _Atomic uint64_t g_fs_settle_seq;   // upstream #3174's settle count: this fork's frame step (FRAME_STEP_120) does not use it yet
+void dm_fstep_settle(void) { atomic_fetch_add(&g_fs_settle_seq, 1); }
 __attribute__((weak)) void dm_thread_acquire_mark(void) {}   // hle_thread.c: the calling guest thread acquires the window texture, so DM_YIELD_STORM=sleep leaves its yield storms spinning; nothing in graphics unit tests
 __attribute__((weak)) void dm_vk_drain(void) {}   // dm/gfx/vk/hle_vk.m: wait for the Vulkan layer's queue (the graphics unit tests do not link it)
 __attribute__((weak)) void dm_gl_drain(void) {}   // dm/gfx/gl/hle_gl.m: the same for the GL layer
