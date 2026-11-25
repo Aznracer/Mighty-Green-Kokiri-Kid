@@ -10783,7 +10783,12 @@ static void *kw_thread(void *arg) {
     // DM_GPU_KEEPWARM_STEP=<up %>,<down %>,<seconds> (off by default): with DM_GPU_KEEPWARM_HI the duty slides between DM_GPU_KEEPWARM_DUTY and DM_GPU_KEEPWARM_HI in place of the
     // two-level switch: up a step after two looks 0.5 s apart at DM_GPU_KEEPWARM_HI_MS's first value or more, down a step under its second once <seconds> have passed since the last
     // change, held between the two. It looks for the lowest duty that keeps the GPU clock up, leaving the CPU what it can of the performance cores
-    int st_up = 0, st_dn = 0; uint64_t st_ns = 0, kw_change = 0;
+    // The slide learns (2026-11-25, Lon Lon Ranch and the Forest Temple): steps of 15 a second overshot, the averaged GPU time lagging the clock, so a climb reached 40 % where
+    // 20-25 % was enough, and above about 20 % iOS moved the game's CPU work to the efficiency cores (2 % on performance cores, 22 fps) for the 30 s the way down took. So a step
+    // up is sized by how far the GPU time is over the line (a fifth of it at the line, all of it 4 ms over); after a step up the next waits 1.5 s for the average to catch up
+    // (not when 6 ms or more over); the level that brought the GPU time back under the line is kept, averaged over the climbs, and the next climb starts there; and the way
+    // down takes a step a second while the GPU time is 4 ms or more under DM_GPU_KEEPWARM_HI_MS's second value, every <seconds> nearer it
+    int st_up = 0, st_dn = 0, kw_need = 0, kw_climb = 0, kw_last_up = 0; uint64_t st_ns = 0, kw_change = 0;
     { const char *sv = getenv("DM_GPU_KEEPWARM_STEP"); if (sv && *sv && duty_hi) { st_up = atoi(sv); const char *c = strchr(sv, ','); st_dn = c ? atoi(c + 1) : st_up / 2; c = c ? strchr(c + 1, ',') : NULL;
         double secs = c ? atof(c + 1) : 5; st_ns = (uint64_t)((secs < 0.5 ? 0.5 : secs) * 1e9); if (st_up < 1) st_up = 0; if (st_dn < 1) st_dn = 1; } }
     @autoreleasepool {
@@ -10810,11 +10815,20 @@ static void *kw_thread(void *arg) {
                 if (st_up && bp_now() - kw_look >= 500000000ull) {   // the sliding duty: up fast, down slowly
                     kw_look = bp_now();
                     double g = atomic_load_explicit(&g_kw_gpu_us, memory_order_relaxed) / 1000.0;
-                    int d = duty;
-                    if (g >= hi_ms) { if (++streak >= 2) { streak = 0; d = duty + st_up > duty_hi ? duty_hi : duty + st_up; } }
-                    else { streak = 0; if (g < lo_ms && kw_look - kw_change >= st_ns) d = duty - st_dn < duty_base ? duty_base : duty - st_dn; }
-                    if (d != duty) { duty = d; kw_change = kw_look; kw_switches++;
-                        if (kw_switches <= 40 || kw_switches % 50 == 0) MLOG("GPU keep-warm: %d %% (the game's GPU time %.1f ms a frame: %s) (#%llu)", duty, g, g >= hi_ms ? "the GPU is the limit" : "the GPU keeps up", (unsigned long long)kw_switches); }
+                    int d = duty; uint64_t since = kw_look - kw_change; const char *why = NULL;
+                    if (g >= hi_ms) {
+                        int settle = kw_last_up && since < 1500000000ull && g < hi_ms + 6;
+                        if (++streak >= 2 && !settle) { streak = 0;
+                            double f = (g - hi_ms + 1) / 5; if (f > 1) f = 1; int step = (int)(st_up * f + 0.5), smin = st_up / 3 < 1 ? 1 : st_up / 3; if (step < smin) step = smin;
+                            d = duty + step; why = "the GPU is the limit";
+                            if (!kw_climb && kw_need > d) { d = kw_need; why = "the GPU is the limit; straight to the level that worked before"; }
+                            if (d > duty_hi) d = duty_hi; kw_climb = 1; }
+                    } else { streak = 0;
+                        if (kw_climb) { kw_climb = 0; kw_need = kw_need ? (kw_need * 3 + duty + 2) / 4 : duty; }   // the level that brought it back under the line
+                        uint64_t gap = g < lo_ms - 4 ? 1000000000ull : st_ns;
+                        if (g < lo_ms && since >= gap) { d = duty - st_dn < duty_base ? duty_base : duty - st_dn; why = g < lo_ms - 4 ? "the GPU keeps up with room" : "the GPU keeps up"; } }
+                    if (d != duty) { kw_last_up = d > duty; duty = d; kw_change = kw_look; kw_switches++;
+                        if (kw_switches <= 60 || kw_switches % 50 == 0) MLOG("GPU keep-warm: %d %% (the game's GPU time %.1f ms a frame: %s; learned level %d %%) (#%llu)", duty, g, why, kw_need, (unsigned long long)kw_switches); }
                 } else if (duty_hi && bp_now() - kw_look >= 500000000ull) {   // looked at every 0.5 s; a change needs two looks in a row
                     kw_look = bp_now();
                     double g = atomic_load_explicit(&g_kw_gpu_us, memory_order_relaxed) / 1000.0;
