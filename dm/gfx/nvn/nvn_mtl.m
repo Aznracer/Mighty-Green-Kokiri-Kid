@@ -10762,11 +10762,24 @@ static _Atomic int g_kw_started; static _Atomic uint64_t g_kw_chunks, g_kw_ns;
 // DM_GPU_KEEPWARM_THERMAL=<state> (default 2, serious; 0 never): at or above that iOS thermal state the keep-warm pauses. At serious iOS caps the GPU clock itself, so the kernel only adds heat:
 // on the iPhone Duo a 19-minute tour on the wireless charger reached serious at 358 s and stayed there, the keep-warm still running (2026-11-24)
 int dm_thermal_now(void);   // front_ios.m: NSProcessInfo's thermalState; hle_nvn.c's weak default -1 elsewhere
+// DM_GPU_KEEPWARM_HI=<duty %> (0, off, by default): the keep-warm fills DM_GPU_KEEPWARM_DUTY of the idle time while the CPU is the limit and this higher duty while the GPU is.
+// On the iPhone Duo a GPU kept at full clock leaves the game's CPU work on the efficiency cores (Ocarina of Time, Lon Lon Ranch: 75 % duty 0-9 % of CPU time on performance
+// cores and 18-24 fps; 10 % duty 45-49 % and 26-29 fps, frame generation 6-7 ms a frame), but 10 % let the GPU clock sink in the Forest Temple: GPU 30 ms a frame, 17 fps,
+// until the item menu reset it. The duty follows the game's GPU time a frame (hle_nvn.c, 8 frames late), averaged: up at DM_GPU_KEEPWARM_HI_MS's first value (27 ms: with frame generation about
+// 6-7 ms of a 33 ms frame go to its frames), back down under its second (21 ms; the ranch at 10 % ran 21-24 ms) after at least 15 s at the higher duty, each after two looks 0.5 s apart
+static _Atomic uint64_t g_kw_gpu_us;   // the game's GPU time a frame, averaged over about 16 frames, in µs
+void mtl_kw_gpu_note(double ms) {
+    uint64_t o = atomic_load_explicit(&g_kw_gpu_us, memory_order_relaxed), v = (uint64_t)(ms * 1000);
+    atomic_store_explicit(&g_kw_gpu_us, o ? (o * 15 + v) / 16 : v, memory_order_relaxed);
+}
 static void *kw_thread(void *arg) {
     (void)arg; pthread_setname_np("dm keepwarm");
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
     const char *e = getenv("DM_GPU_KEEPWARM"); int groups = e && *e ? atoi(e) : 0; if (groups == 1) groups = 8; if (groups > 256) groups = 256;
-    const char *dv = getenv("DM_GPU_KEEPWARM_DUTY"); int duty = dv && *dv ? atoi(dv) : 75; if (duty < 10) duty = 10; if (duty > 100) duty = 100;
+    const char *dv = getenv("DM_GPU_KEEPWARM_DUTY"); int duty = dv && *dv ? atoi(dv) : 75; if (duty < 1) duty = 1; if (duty > 100) duty = 100;
+    const char *hv = getenv("DM_GPU_KEEPWARM_HI"); int duty_hi = hv && *hv ? atoi(hv) : 0; if (duty_hi > 100) duty_hi = 100; if (duty_hi && duty_hi < duty) duty_hi = 0;
+    double hi_ms = 27, lo_ms = 21; { const char *mv = getenv("DM_GPU_KEEPWARM_HI_MS"); if (mv && *mv) { hi_ms = atof(mv); const char *c = strchr(mv, ','); lo_ms = c ? atof(c + 1) : hi_ms * 0.75; } if (lo_ms > hi_ms) lo_ms = hi_ms; }
+    int duty_base = duty, gpu_bound = 0, streak = 0; uint64_t kw_switches = 0, kw_look = 0, kw_hi_at = 0;
     @autoreleasepool {
         NSString *src = @"#include <metal_stdlib>\nusing namespace metal;\n"
             "kernel void dm_keepwarm(device uint *o [[buffer(0)]], constant uint &n [[buffer(1)]], uint id [[thread_position_in_grid]]) {\n"
@@ -10778,6 +10791,7 @@ static void *kw_thread(void *arg) {
         id<MTLCommandQueue> q = [g_dev newCommandQueue]; id<MTLBuffer> ob = [g_dev newBufferWithLength:16 options:MTLResourceStorageModePrivate];
         if (!ps || !q || !ob) { MLOG("[RED] GPU keep-warm: could not make its kernel (%s); off", err.localizedDescription.UTF8String ?: "no error"); return NULL; }
         MLOG("GPU keep-warm: on, %d threadgroups of 64 threads in chunks of about 250 us, filling %d %% of the time the game's work has run out (DM_GPU_KEEPWARM, DM_GPU_KEEPWARM_DUTY)", groups, duty);
+        if (duty_hi) MLOG("GPU keep-warm: %d %% while the game's GPU time a frame averages %.0f ms or more, back to %d %% under %.0f ms (DM_GPU_KEEPWARM_HI, DM_GPU_KEEPWARM_HI_MS)", duty_hi, hi_ms, duty_base, lo_ms);
         uint32_t n = 2000; uint64_t last_log = bp_now();
         for (;;) {
             @autoreleasepool {
@@ -10786,6 +10800,14 @@ static void *kw_thread(void *arg) {
                   int th = lim > 0 ? dm_thermal_now() : -1, hot = th >= lim && lim > 0;
                   if (hot != paused) { paused = hot; MLOG("GPU keep-warm: %s (thermal state %d, DM_GPU_KEEPWARM_THERMAL %d)", hot ? "paused, iOS caps the GPU clock itself now" : "on again", th, lim); }
                   if (hot) { usleep(100000); continue; } }
+                if (duty_hi && bp_now() - kw_look >= 500000000ull) {   // looked at every 0.5 s; a change needs two looks in a row
+                    kw_look = bp_now();
+                    double g = atomic_load_explicit(&g_kw_gpu_us, memory_order_relaxed) / 1000.0;
+                    int b = gpu_bound ? g >= lo_ms || kw_look - kw_hi_at < 15000000000ull : g >= hi_ms;   // the higher duty stays at least 15 s: at it the GPU time falls under 21 ms at once
+                    streak = b != gpu_bound ? streak + 1 : 0;
+                    if (streak >= 2) { streak = 0; gpu_bound = b; duty = b ? duty_hi : duty_base; kw_switches++; if (b) kw_hi_at = kw_look;
+                        if (kw_switches <= 20 || kw_switches % 50 == 0) MLOG("GPU keep-warm: %d %% (the game's GPU time %.1f ms a frame: %s) (#%llu)", duty, g, b ? "the GPU is the limit" : "the GPU keeps up", (unsigned long long)kw_switches); }
+                }
                 if (atomic_load(&g_present_suspended) || rx_busy()) { usleep(200); continue; }
                 id<MTLCommandBuffer> cb = [q commandBuffer]; id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
                 [ce setComputePipelineState:ps]; [ce setBuffer:ob offset:0 atIndex:0]; [ce setBytes:&n length:sizeof n atIndex:1];
