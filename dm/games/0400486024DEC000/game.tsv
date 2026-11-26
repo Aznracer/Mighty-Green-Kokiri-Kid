@@ -44,8 +44,10 @@ mem_stack	0x10000000
 yield_storm	sleep
 # GPU keep-warm (with DM_GPU_KEEPWARM=1; iPhone Duo, frame generation at 30 -> 60): duty 10 % while the CPU is the limit (Lon Lon Ranch: 44-49 % of the CPU time on the
 # performance cores, 26-29 fps; iOS moves the game's CPU work to the efficiency cores while the GPU clock runs high), sliding up to 100 % while the game's GPU time a frame is
-# 27 ms or more (the Forest Temple's GPU clock sank to 30 ms a frame, 17 fps, at 10 %): up to 15 points a second, down 5 every 3 s. The env lines DM_GPU_KEEPWARM_DUTY, _HI, _STEP override
-keepwarm	10,100,15,5,3
+# 27 ms or more (the Forest Temple's GPU clock sank to 30 ms a frame, 17 fps, at 10 %): up to 15 points a second, down 5 every 3 s. Paused only at the critical thermal state (3):
+# at serious the clock was not capped, it sank (Death Mountain Crater: 16-17 fps, frame generation 15.4 ms a frame, back to 30 fps and 5 ms after the item menu), and with it on there
+# the Fire Temple held 29.0 fps on average for 47 minutes, 37 of them at serious. The env lines DM_GPU_KEEPWARM_DUTY, _HI, _STEP, _THERMAL override
+keepwarm	10,100,15,5,3,3
 app_pool	0x240000000
 sys_resource	0x3000000
 

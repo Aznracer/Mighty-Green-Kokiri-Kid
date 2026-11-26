@@ -168,7 +168,7 @@ def header_one(g):
     fm = g.get('fps_max', '60')   # the highest rate fps_target and the player's Frame rate may take: 120 only for a game checked at that speed (hle_nvn.c fps_high)
     if fm not in ('60', '120'): sys.exit(f'{g.id}: fps_max must be 60 or 120: {fm}')
     kwp = g.get('keepwarm', '')   # GPU keep-warm tuning: <duty %>,<high duty %>,<step up>,<step down>,<seconds> (nvn_mtl.m kw_thread; the DM_GPU_KEEPWARM_DUTY / _HI / _STEP env lines override)
-    if kwp and not re.fullmatch(r'\d+,\d+,\d+,\d+,\d+(\.\d+)?', kwp): sys.exit(f'{g.id}: keepwarm must be <duty>,<high>,<up>,<down>,<seconds>: {kwp}')
+    if kwp and not re.fullmatch(r'\d+,\d+,\d+,\d+,\d+(\.\d+)?(,[0-3])?', kwp): sys.exit(f'{g.id}: keepwarm must be <duty>,<high>,<up>,<down>,<seconds>[,<thermal state>]: {kwp}')
     yst = g.get('yield_storm', 'count')   # runs of yields with no other work past 500 µs (hle_thread.c ystorm_note; DM_YIELD_STORM overrides): count (counted for the power line) / sleep (each further yield of a worker sleeps up to 50 µs)
     if yst not in ('count', 'sleep'): sys.exit(f'{g.id}: yield_storm must be count or sleep: {yst}')
     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off

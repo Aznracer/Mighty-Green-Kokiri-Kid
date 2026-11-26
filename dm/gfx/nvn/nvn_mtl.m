@@ -10793,8 +10793,9 @@ static void *kw_thread(void *arg) {
 #define DM_GAME_KEEPWARM ""   // a fixture's game_profile.h without the key (the profile's keepwarm, game.py)
 #endif
     // The profile's keepwarm (<duty>,<high duty>,<up>,<down>,<seconds>) stands in for each of DM_GPU_KEEPWARM_DUTY, _HI and _STEP the env leaves unset
-    int pf_duty = 0, pf_hi = 0; char pf_step[48] = "";
-    { const char *pk = DM_GAME_KEEPWARM; if (*pk) { pf_duty = atoi(pk); const char *c = strchr(pk, ','); if (c) { pf_hi = atoi(c + 1); c = strchr(c + 1, ','); if (c) snprintf(pf_step, sizeof pf_step, "%s", c + 1); } } }
+    int pf_duty = 0, pf_hi = 0, pf_thermal = -1; char pf_step[48] = "";   // a sixth value: the thermal state at which it pauses (DM_GPU_KEEPWARM_THERMAL)
+    { const char *pk = DM_GAME_KEEPWARM; if (*pk) { pf_duty = atoi(pk); const char *c = strchr(pk, ','); if (c) { pf_hi = atoi(c + 1); c = strchr(c + 1, ','); if (c) snprintf(pf_step, sizeof pf_step, "%s", c + 1); }
+        int nc = 0; for (const char *q = pk; *q; q++) if (*q == ',' && ++nc == 5) { pf_thermal = atoi(q + 1); break; } } }
     const char *dv = getenv("DM_GPU_KEEPWARM_DUTY"); int duty = dv && *dv ? atoi(dv) : pf_duty ? pf_duty : 75; if (duty < 1) duty = 1; if (duty > 100) duty = 100;
     const char *hv = getenv("DM_GPU_KEEPWARM_HI"); int duty_hi = hv && *hv ? atoi(hv) : pf_hi; if (duty_hi > 100) duty_hi = 100; if (duty_hi && duty_hi < duty) duty_hi = 0;
     double hi_ms = 27, lo_ms = 21; { const char *mv = getenv("DM_GPU_KEEPWARM_HI_MS"); if (mv && *mv) { hi_ms = atof(mv); const char *c = strchr(mv, ','); lo_ms = c ? atof(c + 1) : hi_ms * 0.75; } if (lo_ms > hi_ms) lo_ms = hi_ms; }
@@ -10845,7 +10846,7 @@ static void *kw_thread(void *arg) {
         for (;;) {
             @autoreleasepool {
                 if (atomic_load(&g_gpu_lost)) { MLOG("GPU keep-warm: stopped, the GPU was lost"); return NULL; }
-                { static int lim = -1, paused; if (lim < 0) { const char *tv = getenv("DM_GPU_KEEPWARM_THERMAL"); lim = tv && *tv ? atoi(tv) : 2; }
+                { static int lim = -1, paused; if (lim < 0) { const char *tv = getenv("DM_GPU_KEEPWARM_THERMAL"); lim = tv && *tv ? atoi(tv) : pf_thermal >= 0 ? pf_thermal : 2; }
                   int th = lim > 0 ? dm_thermal_now() : -1, hot = th >= lim && lim > 0;
                   if (hot != paused) { paused = hot; MLOG("GPU keep-warm: %s (thermal state %d, DM_GPU_KEEPWARM_THERMAL %d)", hot ? "paused, iOS caps the GPU clock itself now" : "on again", th, lim); }
                   if (hot) { usleep(100000); continue; } }
