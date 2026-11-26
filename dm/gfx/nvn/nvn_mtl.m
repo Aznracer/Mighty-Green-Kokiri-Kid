@@ -10813,7 +10813,12 @@ static void *kw_thread(void *arg) {
     // 9-11 ms a frame where 6-7 at the higher duty, and the real frame rate swung 23-30 fps, the slide climbing ten times. Below DM_GPU_KEEPWARM_CPU cores (default 1.8; the
     // ranch ran 2.5, where the fast cores matter) it holds at the learned level; under 8 ms a frame it still goes down, as in menus
     int st_up = 0, st_dn = 0, kw_need = 0, kw_climb = 0, kw_last_up = 0, kw_held = 0; uint64_t st_ns = 0, kw_change = 0;
-    double kw_cpu_min = 1.8, kw_cores = -1; uint64_t kw_ru_ns = 0, kw_ru_at = 0;
+    double kw_cpu_min = 1.8, kw_cores = -1, kw_fast = -1; uint64_t kw_ru_ns = 0, kw_ru_p = 0, kw_ru_at = 0; int kw_light = 0;
+    // The CPU on the efficiency cores (2026-11-26, the Fire Temple at serious): climbs while the clock was down raised the learned level 36, 44, 61, 73, 88 %; held there while
+    // the CPU looked light, iOS put the game's CPU work on the efficiency cores (0-5 % of it on the performance cores), its threads spun waiting on each other (2.2-2.8 cores)
+    // and the frame rate fell to 20-22 fps with the interpolation at 5-6 ms (the clock up); the item menu let the slide go down, the fast cores came back and it ran 30 fps,
+    // until the slide went back up to its learned level. So with the CPU's share on the performance cores (task_ptime) under 15 % (26-49 % where it ran well) and the clock
+    // up, the slide comes down 10 points every 1.5 s, the learned level with it, whatever the load; and light and busy part at DM_GPU_KEEPWARM_CPU -0.2 / +0.2 cores (the load sat on 1.8 and the slide flapped)
     // Lon Lon Ranch's night-to-day change (2026-11-25): the GPU time stayed at 28-31 ms while the slide climbed 18, 26, 38, 52 and 65 %, then 60 % went on to the 2 minutes after,
     // the ranch's GPU time sitting at 19.6-21.0 ms from 10 to 60 % (its work, not the clock), the way down waiting for under 21 ms; at 30-60 % 25-38 % of the CPU time on
     // performance cores and 24-26 fps, at 10-20 % 44-48 % and 27-29. A busy GPU leaves the keep-warm no idle time to fill, so a further step in a climb needs the last one to have
@@ -10858,10 +10863,13 @@ static void *kw_thread(void *arg) {
                     int clk_low = fgm > 0 && kw_fg_min > 0 && fgm >= kw_fg_min * 1.6;   // the interpolation taking 1.6 times its lowest: the GPU clock is down
                     double ge = clk_low && kw_tot_ms > 0 && g + fgm - (kw_tot_ms - hi_ms) > g ? g + fgm - (kw_tot_ms - hi_ms) : g;   // the climb's look: the game's GPU time, or the whole frame's past its own line
                     int d = duty; uint64_t since = kw_look - kw_change; const char *why = NULL; char whyb[160];
-                    { struct rusage ru; if (getrusage(RUSAGE_SELF, &ru) == 0) {   // the process's CPU load in cores, averaged over about 2 s
-                        uint64_t c = (uint64_t)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000000000ull + (uint64_t)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) * 1000ull;
-                        if (kw_ru_at && kw_look > kw_ru_at) { double x = (double)(c - kw_ru_ns) / (double)(kw_look - kw_ru_at); kw_cores = kw_cores < 0 ? x : kw_cores * 0.75 + x * 0.25; }
-                        kw_ru_ns = c; kw_ru_at = kw_look; } }
+                    { task_power_info_v2_data_t pw; mach_msg_type_number_t pn = TASK_POWER_INFO_V2_COUNT; static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
+                      if (task_info(mach_task_self(), TASK_POWER_INFO_V2, (task_info_t)&pw, &pn) == KERN_SUCCESS) {   // the process's CPU load in cores and its share on the performance cores, averaged over about 2 s
+                        uint64_t c = (pw.cpu_energy.total_user + pw.cpu_energy.total_system) * tb.numer / tb.denom, pc = pw.task_ptime * tb.numer / tb.denom;
+                        if (kw_ru_at && kw_look > kw_ru_at && c > kw_ru_ns) { double x = (double)(c - kw_ru_ns) / (double)(kw_look - kw_ru_at), fs = pc >= kw_ru_p ? (double)(pc - kw_ru_p) / (double)(c - kw_ru_ns) : 0;
+                            kw_cores = kw_cores < 0 ? x : kw_cores * 0.75 + x * 0.25; kw_fast = kw_fast < 0 ? fs : kw_fast * 0.75 + fs * 0.25; }
+                        kw_ru_ns = c; kw_ru_p = pc; kw_ru_at = kw_look; } }
+                    if (kw_cores >= 0) { if (kw_cores < kw_cpu_min - 0.2) kw_light = 1; else if (kw_cores > kw_cpu_min + 0.2) kw_light = 0; }
                     if (ge >= hi_ms) {
                         int settle = kw_last_up && since < 1500000000ull && ge < hi_ms + 6;
                         if (kw_climb && ge <= kw_up_g - 1.0) kw_helped = 1;
@@ -10874,8 +10882,11 @@ static void *kw_thread(void *arg) {
                     } else { streak = 0;
                         if (kw_climb) { kw_climb = 0; if (kw_helped || kw_clk_climb || (kw_steps == 1 && since < 4000000000ull)) kw_need = kw_need ? (kw_need * 3 + duty + 2) / 4 : duty; }   // the level that brought it back under the line
                         uint64_t gap = g < lo_ms - 4 ? 1000000000ull : st_ns;
-                        int light = kw_cores >= 0 && kw_cores < kw_cpu_min && kw_cpu_min > 0;
+                        int light = kw_light && kw_cpu_min > 0;
+                        int starved = kw_fast >= 0 && kw_fast < 0.15 && !clk_low && duty > duty_base && kw_cpu_min > 0;   // light or busy: on the efficiency cores it read 1.0-2.8 cores
                         double down_ms = light || kw_cpu_min <= 0 || hi_ms - 3 < lo_ms ? lo_ms : hi_ms - 3;
+                        if (starved && since >= 1500000000ull) { d = duty - 2 * st_dn < duty_base ? duty_base : duty - 2 * st_dn; if (kw_need > d) kw_need = d;
+                            snprintf(whyb, sizeof whyb, "the CPU on the efficiency cores (%.0f %% on the performance cores, %.1f cores)", kw_fast * 100, kw_cores); why = whyb; } else
                         if (light && g >= 8 && kw_need > duty && since >= 1500000000ull) { d = kw_need; snprintf(whyb, sizeof whyb, "back to the learned level, the CPU light (%.1f cores)", kw_cores); why = whyb; } else
                         if (g < down_ms && since >= gap) { d = duty - st_dn < duty_base ? duty_base : duty - st_dn; why = g < lo_ms - 4 ? "the GPU keeps up with room" : "the GPU keeps up";
                             if (g >= lo_ms) { snprintf(whyb, sizeof whyb, "the GPU keeps up; the CPU busy (%.1f cores) wants the fast cores", kw_cores); why = whyb; }
