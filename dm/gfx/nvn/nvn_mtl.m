@@ -10775,6 +10775,12 @@ int dm_thermal_now(void);   // front_ios.m: NSProcessInfo's thermalState; hle_nv
 // until the item menu reset it. The duty follows the game's GPU time a frame (hle_nvn.c, 8 frames late), averaged: up at DM_GPU_KEEPWARM_HI_MS's first value (27 ms: with frame generation about
 // 6-7 ms of a 33 ms frame go to its frames), back down under its second (21 ms; the ranch at 10 % ran 21-24 ms) after at least 15 s at the higher duty, each after two looks 0.5 s apart
 static _Atomic uint64_t g_kw_gpu_us;   // the game's GPU time a frame, averaged over about 16 frames, in µs
+// Frame generation's interpolation, its GPU time each generated frame averaged the same way, and when it was last noted (fg_gpu_note): the slide's whole-frame look
+static _Atomic uint64_t g_kw_fg_us, g_kw_fg_at;
+void mtl_kw_fg_note(double ms) {
+    uint64_t o = atomic_load_explicit(&g_kw_fg_us, memory_order_relaxed), v = (uint64_t)(ms * 1000);
+    atomic_store_explicit(&g_kw_fg_us, o ? (o * 15 + v) / 16 : v, memory_order_relaxed); atomic_store_explicit(&g_kw_fg_at, bp_now(), memory_order_relaxed);
+}
 void mtl_kw_gpu_note(double ms) {
     uint64_t o = atomic_load_explicit(&g_kw_gpu_us, memory_order_relaxed), v = (uint64_t)(ms * 1000);
     atomic_store_explicit(&g_kw_gpu_us, o ? (o * 15 + v) / 16 : v, memory_order_relaxed);
@@ -10812,6 +10818,13 @@ static void *kw_thread(void *arg) {
     // performance cores and 24-26 fps, at 10-20 % 44-48 % and 27-29. A busy GPU leaves the keep-warm no idle time to fill, so a further step in a climb needs the last one to have
     // lowered the GPU time by 1 ms (or, once a climb, 6 s), and a climb is learned only if a step lowered it or its first step ended it within 4 s; and with the CPU busy (DM_GPU_KEEPWARM_CPU cores or more) the way down starts 3 ms under DM_GPU_KEEPWARM_HI_MS's first value
     double kw_up_g = 0; int kw_helped = 0, kw_steps = 0, kw_futile = 0;
+    // The whole frame (2026-11-26, Death Mountain and the Lost Woods at Fair): the GPU clock sank with the game's GPU time at 20-21 ms, under the line, while frame generation's
+    // interpolation took 10-11 ms a frame where 5 at the clock's top; the frame rate stayed at 20-22 fps, the slide held at 23 %, until the item menu lifted the clock. The
+    // interpolation's work is the same each frame, so its time tells the clock: 1.6 times its lowest (kw_fg_min, which creeps up 0.1 % a look) or more is a low clock. Then the
+    // climb looks at the game's GPU time plus the interpolation's too, at DM_GPU_KEEPWARM_TOTAL_MS (default 30; 0 off) or more counting as the line (27 ms), and a step that
+    // left the GPU time where it was is no reason to stop, the climb learned once the clock is back up (a busy GPU at a good clock still is: the ranch's dawn, 6 ms interpolations). And while the CPU is light the slide
+    // comes back up to the learned level once a menu's quiet (under 8 ms a frame) is over: the sink came again within a minute of each menu at 10 %
+    double kw_fg_min = 0, kw_tot_ms = 30; int kw_clk_climb = 0; { const char *tv = getenv("DM_GPU_KEEPWARM_TOTAL_MS"); if (tv && *tv) kw_tot_ms = atof(tv); }
     { const char *cv = getenv("DM_GPU_KEEPWARM_CPU"); if (cv && *cv) kw_cpu_min = atof(cv); }
     { const char *sv = getenv("DM_GPU_KEEPWARM_STEP"); if (!(sv && *sv) && *pf_step) sv = pf_step; if (sv && *sv && duty_hi) { st_up = atoi(sv); const char *c = strchr(sv, ','); st_dn = c ? atoi(c + 1) : st_up / 2; c = c ? strchr(c + 1, ',') : NULL;
         double secs = c ? atof(c + 1) : 5; st_ns = (uint64_t)((secs < 0.5 ? 0.5 : secs) * 1e9); if (st_up < 1) st_up = 0; if (st_dn < 1) st_dn = 1; } }
@@ -10839,25 +10852,30 @@ static void *kw_thread(void *arg) {
                 if (st_up && bp_now() - kw_look >= 500000000ull) {   // the sliding duty: up fast, down slowly
                     kw_look = bp_now();
                     double g = atomic_load_explicit(&g_kw_gpu_us, memory_order_relaxed) / 1000.0;
+                    double fgm = 0; { uint64_t at = atomic_load_explicit(&g_kw_fg_at, memory_order_relaxed); if (at && kw_look - at < 1000000000ull) fgm = atomic_load_explicit(&g_kw_fg_us, memory_order_relaxed) / 1000.0; }
+                    if (fgm > 0) kw_fg_min = kw_fg_min <= 0 || fgm < kw_fg_min ? fgm : kw_fg_min * 1.001;
+                    int clk_low = fgm > 0 && kw_fg_min > 0 && fgm >= kw_fg_min * 1.6;   // the interpolation taking 1.6 times its lowest: the GPU clock is down
+                    double ge = clk_low && kw_tot_ms > 0 && g + fgm - (kw_tot_ms - hi_ms) > g ? g + fgm - (kw_tot_ms - hi_ms) : g;   // the climb's look: the game's GPU time, or the whole frame's past its own line
                     int d = duty; uint64_t since = kw_look - kw_change; const char *why = NULL; char whyb[160];
                     { struct rusage ru; if (getrusage(RUSAGE_SELF, &ru) == 0) {   // the process's CPU load in cores, averaged over about 2 s
                         uint64_t c = (uint64_t)(ru.ru_utime.tv_sec + ru.ru_stime.tv_sec) * 1000000000ull + (uint64_t)(ru.ru_utime.tv_usec + ru.ru_stime.tv_usec) * 1000ull;
                         if (kw_ru_at && kw_look > kw_ru_at) { double x = (double)(c - kw_ru_ns) / (double)(kw_look - kw_ru_at); kw_cores = kw_cores < 0 ? x : kw_cores * 0.75 + x * 0.25; }
                         kw_ru_ns = c; kw_ru_at = kw_look; } }
-                    if (g >= hi_ms) {
-                        int settle = kw_last_up && since < 1500000000ull && g < hi_ms + 6;
-                        if (kw_climb && g <= kw_up_g - 1.0) kw_helped = 1;
-                        int futile = kw_climb && g > kw_up_g - 1.0; if (futile && !settle && (since < 6000000000ull || kw_futile)) settle = 1;   // the last step did not lower it: the GPU is busy, not slow
+                    if (ge >= hi_ms) {
+                        int settle = kw_last_up && since < 1500000000ull && ge < hi_ms + 6;
+                        if (kw_climb && ge <= kw_up_g - 1.0) kw_helped = 1;
+                        int futile = kw_climb && ge > kw_up_g - 1.0 && !clk_low; if (futile && !settle && (since < 6000000000ull || kw_futile)) settle = 1;   // the last step did not lower it: the GPU is busy, not slow
                         if (++streak >= 2 && !settle) { streak = 0;
-                            double f = (g - hi_ms + 1) / 5; if (f > 1) f = 1; int step = (int)(st_up * f + 0.5), smin = st_up / 3 < 1 ? 1 : st_up / 3; if (step < smin) step = smin;
-                            d = duty + step; why = "the GPU is the limit";
+                            double f = (ge - hi_ms + 1) / 5; if (f > 1) f = 1; int step = (int)(st_up * f + 0.5), smin = st_up / 3 < 1 ? 1 : st_up / 3; if (step < smin) step = smin;
+                            d = duty + step; why = ge > g ? "the GPU clock is down: the game's GPU time and frame generation's" : clk_low ? "the GPU is the limit, its clock down" : "the GPU is the limit";
                             if (!kw_climb && kw_need > d) { d = kw_need; why = "the GPU is the limit; straight to the level that worked before"; }
-                            if (d > duty_hi) d = duty_hi; if (!kw_climb) kw_helped = 0, kw_steps = 0, kw_futile = 0; else if (futile) kw_futile = 1; kw_climb = 1; kw_steps++; kw_up_g = g; }
+                            if (d > duty_hi) d = duty_hi; if (!kw_climb) kw_helped = 0, kw_steps = 0, kw_futile = 0, kw_clk_climb = 0; else if (futile) kw_futile = 1; if (clk_low) kw_clk_climb = 1; kw_climb = 1; kw_steps++; kw_up_g = ge; }
                     } else { streak = 0;
-                        if (kw_climb) { kw_climb = 0; if (kw_helped || (kw_steps == 1 && since < 4000000000ull)) kw_need = kw_need ? (kw_need * 3 + duty + 2) / 4 : duty; }   // the level that brought it back under the line
+                        if (kw_climb) { kw_climb = 0; if (kw_helped || kw_clk_climb || (kw_steps == 1 && since < 4000000000ull)) kw_need = kw_need ? (kw_need * 3 + duty + 2) / 4 : duty; }   // the level that brought it back under the line
                         uint64_t gap = g < lo_ms - 4 ? 1000000000ull : st_ns;
                         int light = kw_cores >= 0 && kw_cores < kw_cpu_min && kw_cpu_min > 0;
                         double down_ms = light || kw_cpu_min <= 0 || hi_ms - 3 < lo_ms ? lo_ms : hi_ms - 3;
+                        if (light && g >= 8 && kw_need > duty && since >= 1500000000ull) { d = kw_need; snprintf(whyb, sizeof whyb, "back to the learned level, the CPU light (%.1f cores)", kw_cores); why = whyb; } else
                         if (g < down_ms && since >= gap) { d = duty - st_dn < duty_base ? duty_base : duty - st_dn; why = g < lo_ms - 4 ? "the GPU keeps up with room" : "the GPU keeps up";
                             if (g >= lo_ms) { snprintf(whyb, sizeof whyb, "the GPU keeps up; the CPU busy (%.1f cores) wants the fast cores", kw_cores); why = whyb; }
                             if (light && g >= 8 && duty >= kw_need && d < kw_need) { d = kw_need;
@@ -10865,7 +10883,7 @@ static void *kw_thread(void *arg) {
                                     if (d == duty) MLOG("GPU keep-warm: %d %% held (the game's GPU time %.1f ms a frame; the CPU %.1f cores, under DM_GPU_KEEPWARM_CPU %.1f)", duty, g, kw_cores, kw_cpu_min); } }
                             else kw_held = 0; } }
                     if (d != duty) { kw_last_up = d > duty; duty = d; kw_change = kw_look; kw_switches++;
-                        if (kw_switches <= 60 || kw_switches % 50 == 0) MLOG("GPU keep-warm: %d %% (the game's GPU time %.1f ms a frame: %s; learned level %d %%) (#%llu)", duty, g, why, kw_need, (unsigned long long)kw_switches); }
+                        if (kw_switches <= 60 || kw_switches % 50 == 0) MLOG("GPU keep-warm: %d %% (the game's GPU time %.1f ms a frame, frame generation %.1f: %s; learned level %d %%) (#%llu)", duty, g, fgm, why, kw_need, (unsigned long long)kw_switches); }
                 } else if (duty_hi && bp_now() - kw_look >= 500000000ull) {   // looked at every 0.5 s; a change needs two looks in a row
                     kw_look = bp_now();
                     double g = atomic_load_explicit(&g_kw_gpu_us, memory_order_relaxed) / 1000.0;
@@ -22776,7 +22794,7 @@ static int fg_scale(id<MTL4CommandBuffer> cb, int k, id<MTLTexture> src, id<MTLT
 // device it runs on (log.txt on an iPhone)
 static void fg_gpu_note(double s) {
     g_fg_gpu_last = s;
-    if (s > 0 && s < 1) { uint64_t a = atomic_load(&g_fg_gpu_avg_us), us = (uint64_t)(s * 1e6); atomic_store(&g_fg_gpu_avg_us, a ? (a * 15 + us) / 16 : us); }
+    if (s > 0 && s < 1) { uint64_t a = atomic_load(&g_fg_gpu_avg_us), us = (uint64_t)(s * 1e6); atomic_store(&g_fg_gpu_avg_us, a ? (a * 15 + us) / 16 : us); mtl_kw_fg_note(s * 1e3); }
     static pthread_mutex_t mu = PTHREAD_MUTEX_INITIALIZER; static double v[600]; static int n;
     if (!(s > 0 && s < 1)) return;
     pthread_mutex_lock(&mu);
