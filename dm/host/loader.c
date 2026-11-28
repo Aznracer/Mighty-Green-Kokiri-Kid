@@ -515,6 +515,14 @@ void dm_fps_state_apply(void) {
     const char *dl = getenv("DM_DRS_LEVEL"); uint32_t lvl = 0;
     if (dl && *dl) { char *end; long v = strtol(dl, &end, 10); if (end == dl || *end || v < 0 || v > 15) LOG("[RED] DM_DRS_LEVEL=%s: must be 0 to 15; keeping level 0", dl); else { lvl = (uint32_t)v; if (lvl) LOG("DM_DRS_LEVEL=%u: the game's dynamic resolution held at that level (with DM_DYNAMIC_RESOLUTION=0)", lvl); } }
     memcpy(dm_fps_state + 0x290, &lvl, sizeof lvl);
+    // Ocarina of Time's infinite health / magic stubs (patches.py inf_health_magic): state +0x2a0 u32 quarter hearts written into Link's max and current hearts every frame
+    // (DM_OOT_INF_HEALTH=1: 20 hearts; 3 to 20: that many), +0x2a4 u32 1 = the magic meter stays full (DM_OOT_INF_MAGIC=1). 0 = the game's own. Other builds ignore both
+    { const char *ih = getenv("DM_OOT_INF_HEALTH"); uint32_t q = 0;
+      if (ih && *ih && strcmp(ih, "0")) { char *end; long v = strtol(ih, &end, 10); if (end == ih || *end || !(v == 1 || (v >= 3 && v <= 20))) LOG("[RED] DM_OOT_INF_HEALTH=%s: 1 (20 hearts) or 3 to 20 hearts; off", ih); else { q = (uint32_t)(v == 1 ? 20 : v) * 4; LOG("DM_OOT_INF_HEALTH: %u hearts, always full", q / 4); } }
+      memcpy(dm_fps_state + 0x2a0, &q, 4); }
+    { const char *im = getenv("DM_OOT_INF_MAGIC"); uint32_t on = im && !strcmp(im, "1");
+      if (im && *im && strcmp(im, "0") && strcmp(im, "1")) LOG("[RED] DM_OOT_INF_MAGIC=%s: must be 0 or 1; off", im); else if (on) LOG("DM_OOT_INF_MAGIC: magic meter always full");
+      memcpy(dm_fps_state + 0x2a4, &on, 4); }
     // Screen shape: DM_SCREEN_ASPECT, the screen's width / height between 1.3 and 1.77, makes the builds with screen-shape stubs
     // (Breath of the Wild 1.9.0's patches.py) render that shape: the output keeps its width (1920) and takes the height that gives the ratio, a multiple of 48 so the
     // 2/3-size layout space (1280 wide) stays whole: 1.43 → 1920x1344 and 1280x896. State +0x48 u32 output height, +0x4c u32 layout height, +0x50 its float; 0 = 16:9

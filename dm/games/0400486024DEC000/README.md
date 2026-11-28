@@ -144,6 +144,10 @@ From the same Kakariko save, walk into Hyrule Field and continue towards Castle 
 
   Dynamic resolution gave a two-vsync cadence at about 30 fps in both comparisons. The first dynamic-resolution pair recorded zero dropped frames. On `7ef83394`, 11 of 12–13 probes to one vsync failed in each run.
 
+## Infinite health and magic
+
+Built-in stubs of XIIYAZ's live cheats (PR #2570), v131072 only, off unless set: `DM_OOT_INF_HEALTH=1` keeps Link at 20 hearts, always full (`=<3..20>`: that many hearts), and `DM_OOT_INF_MAGIC=1` keeps the magic meter full. The stubs are in the build (patches.py `inf_health_magic`), so nothing writes code at run time, which iOS refuses. Health: before Link's status update (main+0xBABFF0) the stub writes the hearts (state page +0x2a0, quarter hearts) into his max and current hearts (+0x750..+0x75c of the status object), as XIIYAZ's cave did; a save made while it is on keeps that max. Magic: the clamp in his magic component (main+0x163A80, +0x163A88) takes the meter's size while state +0x2a4 is set.
+
 ## Memory
 
 - Loading the same v131072 save into Kokiri Forest outside Link's house peaked at 9.777 GiB of macOS physical footprint on `f76fe0c1` and 9.793 GiB on `de348580` (+16 MiB, +0.16%). Both runs on the 48 GB M4 Pro MacBook Pro (macOS 27.2.1) used the warmed system Metal cache, the same route shader image with conservative uniform-buffer defaults, and frames 2000–3100. Pipeline archives, prewarm and shader prefetch were off. Other shader compiles were active on the Mac in both runs. A second fixed-build run peaked at 9.863 GiB. The matched difference is smaller than that run-to-run spread, so the change in peak footprint is inconclusive for this load. [PR #2714](https://github.com/seedds/nxnative/pull/2714)

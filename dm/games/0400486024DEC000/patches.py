@@ -42,6 +42,40 @@ def frame_step(ctx):
     if base == 0x6e6be0:   # v131072 main: the stubs below write that build's own addresses (their sites' bytes are checked)
         heap_retry(ctx)   # a full model heap (PR #2497)
         screen_shape(ctx)   # DM_SCREEN_ASPECT: the iPhone Duo's 1.43:1 picture (v4's stubs again in v9: upstream's #3037 left the window crop and the drawn picture at 1920x1080 here)
+        inf_health_magic(ctx)   # DM_OOT_INF_HEALTH / DM_OOT_INF_MAGIC (off unless set)
+
+# Infinite health and magic (XIIYAZ's live cheats, PR #2570, built in so they need no code writes at run time, which iOS refuses). Off unless the loader writes the flags.
+# Health: Link's status update (main+0xBABFF0, pacibsp at its entry, x0 his status object) writes his hearts into the game data every frame. Before it runs the stub
+# stores state +0x2a0 (quarter hearts: 80 = 20 hearts, DM_OOT_INF_HEALTH) as float and int into max and current (+0x750 / +0x754 / +0x758 / +0x75c), as XIIYAZ's cave does.
+# At the entry x16 / x17 / s16 are free. Magic: his magic component (main+0x1639B0) clamps its value to the meter's size; with state +0x2a4 set (DM_OOT_INF_MAGIC) the
+# clamp is "always the size" (main+0x163A80 nop instead of csel w8,w9,w8,lt; main+0x163A88 mov w1,w8 instead of csel w1,wzr,w8,lt). Mid-function, so x16 / x17 are pushed
+# and the flags (lt) are left alone: ldr / cbnz / ldp change none
+def inf_health_magic(ctx):
+    here, emit, fs_site, fs_put, FS_STATE_OFF = ctx.here, ctx.emit, ctx.site, ctx.put, ctx.state
+    site = 0xbabff0
+    fs_site(site, '7f2303d5')   # pacibsp
+    start = here(); emit(ADRP(16, here(), FS_STATE_OFF))
+    for w in (0xb942a211,    # ldr w17,[x16,#0x2a0]   quarter hearts (0 = off)
+              0x340000d1,    # cbz w17,+6
+              0x1e220230,    # scvtf s16,w17
+              0xbd075810,    # str s16,[x0,#0x758]
+              0xb9075c11,    # str w17,[x0,#0x75c]
+              0xbd075010,    # str s16,[x0,#0x750]
+              0xb9075411,    # str w17,[x0,#0x754]
+              0xd503237f):   # orig: pacibsp
+        emit(w)
+    emit(B(here(), site + 4))
+    fs_put(site, [B(site, start)], 'infinite health: max and current hearts set to state +0x2a0 quarter hearts before Link\'s status update (DM_OOT_INF_HEALTH; 0 = the game\'s)')
+    for site, orig, alt in ((0x163a80, 0x1a88b128, 0xd503201f), (0x163a88, 0x1a88b3e1, 0x2a0803e1)):
+        fs_site(site, orig.to_bytes(4, 'little').hex())
+        start = here()
+        emit(0xa9bf47f0)                          # stp x16,x17,[sp,#-16]!
+        emit(ADRP(16, here(), FS_STATE_OFF))
+        emit(0xb942a610)                          # ldr w16,[x16,#0x2a4]
+        emit(0x35000090)                          # cbnz w16,+4
+        emit(0xa8c147f0); emit(orig); emit(B(here(), site + 4))   # ldp x16,x17,[sp],#16; the game's clamp; back
+        emit(0xa8c147f0); emit(alt); emit(B(here(), site + 4))    # ldp; always the meter's size; back
+        fs_put(site, [B(site, start)], 'infinite magic: the magic clamp keeps the meter full with state +0x2a4 set (DM_OOT_INF_MAGIC; 0 = the game\'s)')
 
 # The game's dynamic resolution (game__gfx__DynamicResolutionParam: LoadThreshold, ReduceCounterMax, IncreaseCounterMax and a list of levels, each a ResolutionReduceScale and a
 # Priority; on v131072 levels 0..9 at 0.75..0.333 of 2048x1152, 1536x864 to 683x384). Its update (main+0x805aa0) reads the frame's GPU load (about 0.2 ms a unit) into +0x8, subtracts
