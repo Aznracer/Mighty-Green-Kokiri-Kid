@@ -101,6 +101,8 @@ SWITCH_BINDING = [
      'why': "the game maps more than its pool while the time travel plays (iPhone Duo); the room is measured per game"}),
     ('yield_storm', '', {'what': 'yield storms of workers sleep', 'now': 'game', 'goal': 'host', 'purpose': 'power',
      'why': 'measured per game first (NX18, Ocarina of Time on an iPhone 18 Pro Max); a default for every game needs runs of others'}),
+    ('pso_reserve', '', {'what': 'address space left beside the Metal 4 pipeline archive', 'now': 'game', 'goal': 'host', 'purpose': 'stability',
+     'why': 'the room a run needs beside its archives depends on the game (GPU allocations, guest region, shader image): measured on Ocarina of Time on an iPhone Duo'}),
     ('keepwarm', '', {'what': 'GPU keep-warm duty and slide', 'now': 'game', 'goal': 'host', 'purpose': 'performance',
      'why': 'measured per game and phone (Ocarina of Time on an iPhone Duo): how much the GPU clock sinks and the CPU loses the fast cores differs by game; a default for every game needs runs of others'}),
     ('pad_theme', '', {'what': 'pad theme (this fork)', 'now': 'game', 'goal': 'game', 'purpose': 'runtime', 'why': 'a fork setting for this game'}),

@@ -169,6 +169,8 @@ def header_one(g):
     if fm not in ('60', '120'): sys.exit(f'{g.id}: fps_max must be 60 or 120: {fm}')
     kwp = g.get('keepwarm', '')   # GPU keep-warm tuning: <duty %>,<high duty %>,<step up>,<step down>,<seconds> (nvn_mtl.m kw_thread; the DM_GPU_KEEPWARM_DUTY / _HI / _STEP env lines override)
     if kwp and not re.fullmatch(r'\d+,\d+,\d+,\d+,\d+(\.\d+)?(,[0-3])?', kwp): sys.exit(f'{g.id}: keepwarm must be <duty>,<high>,<up>,<down>,<seconds>[,<thermal state>]: {kwp}')
+    prs = g.get('pso_reserve', '')   # address space (GiB) the Metal 4 pipeline archive leaves for the run beside its files (nvn_mtl.m arch_admit; DM_PSO_ARCHIVE_RESERVE_MB overrides); empty: 2
+    if prs and not re.fullmatch(r'\d+', prs): sys.exit(f'{g.id}: pso_reserve must be whole GiB: {prs}')
     yst = g.get('yield_storm', 'count')   # runs of yields with no other work past 500 µs (hle_thread.c ystorm_note; DM_YIELD_STORM overrides): count (counted for the power line) / sleep (each further yield of a worker sleeps up to 50 µs)
     if yst not in ('count', 'sleep'): sys.exit(f'{g.id}: yield_storm must be count or sleep: {yst}')
     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
@@ -257,7 +259,8 @@ def header_one(g):
          f'#define DM_GAME_LAUNCH_PARAM {q(g.get("launch_param", ""))}',   # what oe::TryPopLaunchParameter hands over once (hle_oe.c; a program another program of the application launches: Super Mario 3D All-Stars)
          f'#define DM_GAME_MEM_MAP_LIMIT {-1 if not mml else int(mml == "on")}',
          f'#define DM_GAME_YIELD_STORM {int(yst == "sleep")}',
-         f'#define DM_GAME_KEEPWARM {q(kwp)}',   # the GPU keep-warm's duty, high duty and slide when DM_GPU_KEEPWARM is on (nvn_mtl.m kw_thread); empty: the env lines or the defaults
+         f'#define DM_GAME_KEEPWARM {q(kwp)}',
+         f'#define DM_GAME_PSO_RESERVE_GB {int(prs or 2)}',   # the address space the Metal 4 pipeline archive leaves beside its files (nvn_mtl.m arch_admit)   # the GPU keep-warm's duty, high duty and slide when DM_GPU_KEEPWARM is on (nvn_mtl.m kw_thread); empty: the env lines or the defaults
          f'#define DM_GAME_MEM_MAP_ROOM {int(g.get("mem_map_room", "0"), 0):#x}ull',   # with mem_map_limit: how far past the application pool the guest's maps may go (hle_svc.c; DM_MAP_ROOM_MB overrides)
          f'#define DM_GAME_STDALLOC_CAP {int(g.get("stdalloc_cap", "0"), 0):#x}ull',   # StandardAllocator's address space with virtual address memory (hle_svc.c); 0 = what the alias region has room for
          f'#define DM_GAME_SCREEN_ASPECT {("off", "on").index(g.get("screen_aspect", "off"))}',   # stubs that follow a screen taller than 16:9 (DM_SCREEN_ASPECT): off / on

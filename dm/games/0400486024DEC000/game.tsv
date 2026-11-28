@@ -48,6 +48,10 @@ yield_storm	sleep
 # at serious the clock was not capped, it sank (Death Mountain Crater: 16-17 fps, frame generation 15.4 ms a frame, back to 30 fps and 5 ms after the item menu), and with it on there
 # the Fire Temple held 29.0 fps on average for 47 minutes, 37 of them at serious. The env lines DM_GPU_KEEPWARM_DUTY, _HI, _STEP, _THERMAL override
 keepwarm	10,100,15,5,3,3
+# Metal 4 pipeline archive (the launcher's Metal 4 pipelines on): 7 GiB of address space left beside the archive files. With 13.3 GB of archives in a 17.8 GB gap
+# MTLTexture creation failed after 3 minutes (a black frame) and the uniform ring's 1 MB allocation aborted; with 11.7 GB it ran 16 minutes; the GPU allocates 4.1-5.0 GB.
+# Bigger archives fall back to pipelines through the MTLDevice (a slower start, no failures)
+pso_reserve	7
 app_pool	0x240000000
 sys_resource	0x3000000
 

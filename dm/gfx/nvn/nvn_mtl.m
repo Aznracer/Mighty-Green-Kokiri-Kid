@@ -11864,6 +11864,16 @@ static int arch_vm_room(uint64_t *free, uint64_t *largest) {
     if (prev < hi) { uint64_t gap = hi - prev; *free += gap; *largest = MAX(*largest, gap); }
     return 1;
 }
+// The address space a run leaves beside its archives. Ocarina of Time on an iPhone Duo (2026-11-27) took more than 2 GiB: GPU allocations of 4.1-5.0 GB beside a 40 GB
+// guest region and a 5 GB shader image; with 13.3 GB of archives in a 17.8 GB gap MTLTexture creation failed after 3 minutes (a black frame, the world not drawn) and
+// then the uniform ring's 1 MB (an abort); with 11.7 GB it ran 16 minutes. The profile's pso_reserve (GiB) or DM_PSO_ARCHIVE_RESERVE_MB sets it per game
+#ifndef DM_GAME_PSO_RESERVE_GB
+#define DM_GAME_PSO_RESERVE_GB 2
+#endif
+static uint64_t arch_reserve(void) {
+    const char *rv = getenv("DM_PSO_ARCHIVE_RESERVE_MB");
+    return rv && *rv ? (uint64_t)strtoull(rv, NULL, 10) << 20 : (uint64_t)DM_GAME_PSO_RESERVE_GB << 30;
+}
 static int arch_admit(ArchPlan *plan, NSString *device) {
     NSMutableArray<NSString *> *paths = [NSMutableArray array];
     if (plan->bundle) [paths addObject:plan->bundle];
@@ -11886,7 +11896,7 @@ static int arch_admit(ArchPlan *plan, NSString *device) {
     // Leave 2 GiB for growth after this early reading: the #2444 BotW Mac census held about 1.8 GiB in Metal shader caches, shared GPU buffers, malloc and stacks beside
     // the guest and archives. This is a conservative host policy, not a measured phone requirement. Requiring the entire set plus that reserve in one gap also bounds the
     // simultaneous opens without assuming that fragmented free space can fit their mappings. Even an empty cache must leave room for the compiler and its later captures.
-    const uint64_t reserve = 2ull << 30;
+    const uint64_t reserve = arch_reserve();
     int ok = bytes <= largest && reserve <= largest - bytes;
     MLOG("archive admission: %u files, %.1f MiB; free address space %.1f MiB, largest gap %.1f MiB, runtime reserve %.1f MiB: %s", files, bytes / 1048576.0,
          free / 1048576.0, largest / 1048576.0, reserve / 1048576.0, ok ? "Metal 4" : "pipelines through the MTLDevice, no archives, prebuild or captures");
@@ -13922,7 +13932,7 @@ static void arch_adopt_prebuilt(void) {
     }
     if (!files) return;
     uint64_t free_va = 0, largest = 0;
-    const uint64_t reserve = 2ull << 30;
+    const uint64_t reserve = arch_reserve();
     int have_vm = arch_vm_room(&free_va, &largest);
     if (!have_vm || bytes > largest || reserve > largest - bytes) {
         if (!have_vm) MLOG("pipeline archive %s: %u newly prebuilt files (%.1f MiB) not opened in this run (address-space bounds unavailable): taken at the next start",
