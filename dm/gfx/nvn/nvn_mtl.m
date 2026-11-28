@@ -10848,6 +10848,13 @@ static void *kw_thread(void *arg) {
     // climb looks at the game's GPU time plus the interpolation's too, at DM_GPU_KEEPWARM_TOTAL_MS (default 30; 0 off) or more counting as the line (27 ms), and a step that
     // left the GPU time where it was is no reason to stop, the climb learned once the clock is back up (a busy GPU at a good clock still is: the ranch's dawn, 6 ms interpolations). And while the CPU is light the slide
     // comes back up to the learned level once a menu's quiet (under 8 ms a frame) is over: the sink came again within a minute of each menu at 10 %
+    // The learned level kept across launches (2026-11-27): each session began at 0 and learned the Fire Temple's 45-48 % only from its first slowdown, the first minutes the
+    // roughest; it is read from keepwarm_learned.txt beside pso_user.tsv at the start and written there when it changes (at most every 10 s). DM_GPU_KEEPWARM_LEARN=0: not kept
+    char kw_lpath[1024] = ""; int kw_saved = -1; uint64_t kw_saved_at = 0;
+    { const char *lv = getenv("DM_GPU_KEEPWARM_LEARN"); NSString *up = (lv && *lv == '0') ? nil : pso_user_path();
+      if (up) snprintf(kw_lpath, sizeof kw_lpath, "%s", [[up stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"keepwarm_learned.txt"].UTF8String);
+      FILE *lf = *kw_lpath && duty_hi ? fopen(kw_lpath, "r") : NULL; int lv2 = 0;
+      if (lf) { if (fscanf(lf, "%d", &lv2) == 1 && lv2 > duty_base && lv2 <= duty_hi) { kw_need = kw_saved = lv2; MLOG("GPU keep-warm: learned level %d %% from the last session (%s)", lv2, kw_lpath); } fclose(lf); } }
     double kw_fg_min = 0, kw_tot_ms = 30; int kw_clk_climb = 0; { const char *tv = getenv("DM_GPU_KEEPWARM_TOTAL_MS"); if (tv && *tv) kw_tot_ms = atof(tv); }
     { const char *cv = getenv("DM_GPU_KEEPWARM_CPU"); if (cv && *cv) kw_cpu_min = atof(cv); }
     { const char *sv = getenv("DM_GPU_KEEPWARM_STEP"); if (!(sv && *sv) && *pf_step) sv = pf_step; if (sv && *sv && duty_hi) { st_up = atoi(sv); const char *c = strchr(sv, ','); st_dn = c ? atoi(c + 1) : st_up / 2; c = c ? strchr(c + 1, ',') : NULL;
@@ -10912,6 +10919,8 @@ static void *kw_thread(void *arg) {
                                 if (!kw_held) { kw_held = 1; snprintf(whyb, sizeof whyb, "the GPU keeps up; held at the learned level, the CPU light (%.1f cores)", kw_cores); why = whyb;
                                     if (d == duty) MLOG("GPU keep-warm: %d %% held (the game's GPU time %.1f ms a frame; the CPU %.1f cores, under DM_GPU_KEEPWARM_CPU %.1f)", duty, g, kw_cores, kw_cpu_min); } }
                             else kw_held = 0; } }
+                    if (*kw_lpath && kw_need != kw_saved && kw_look - kw_saved_at >= 10000000000ull) {   // keep the learned level for the next launch
+                        FILE *lf = fopen(kw_lpath, "w"); if (lf) { fprintf(lf, "%d\n", kw_need); fclose(lf); kw_saved = kw_need; } kw_saved_at = kw_look; }
                     if (d != duty) { kw_last_up = d > duty; duty = d; kw_change = kw_look; kw_switches++;
                         if (kw_switches <= 60 || kw_switches % 50 == 0) MLOG("GPU keep-warm: %d %% (the game's GPU time %.1f ms a frame, frame generation %.1f: %s; learned level %d %%) (#%llu)", duty, g, fgm, why, kw_need, (unsigned long long)kw_switches); }
                 } else if (duty_hi && bp_now() - kw_look >= 500000000ull) {   // looked at every 0.5 s; a change needs two looks in a row
