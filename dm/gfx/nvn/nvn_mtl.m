@@ -23245,15 +23245,22 @@ uint64_t mtl_snap_acquire_wait(void) {
 // or above it start it again (its history restarts: generated frames show from the third, fg_encode). Only once the game has drawn FG_MENU_ARM presents at or above it (about
 // 30 s of play), so the title screen and the opening cutscene keep their generated frames (the owner's wish)
 enum { FG_MENU_DRAWS = 300, FG_MENU_IN = 6, FG_MENU_OUT = 2, FG_MENU_ARM = 900 };
+int dm_movie_hz(void);   // hle_movie.c (weak 0 in hle_nvn.c): the picture rate of the movie playing, 0 when none
 static int g_fg_paused; static uint64_t g_fg_pd_last, g_fg_pauses; static int g_fg_low, g_fg_high, g_fg_armed;
 static int fg_menu_pause(void) {
-    static int on = -1; if (on < 0) { const char *e = getenv("DM_FRAMEGEN_MENU_PAUSE"); on = !e || atoi(e) != 0; MLOG("frame generation: %s (DM_FRAMEGEN_MENU_PAUSE)", on ? "pauses in the game's menus (under 300 draws a frame, after 30 s of play)" : "never pauses in menus"); }
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_FRAMEGEN_MENU_PAUSE"); on = !e || atoi(e) != 0; MLOG("frame generation: %s (DM_FRAMEGEN_MENU_PAUSE)", on ? "pauses in the game's menus (under 300 draws a frame, after 30 s of play; never during a movie)" : "never pauses in menus"); }
     uint64_t d = __atomic_load_n(&g_stat_draw, __ATOMIC_RELAXED), n = d - g_fg_pd_last; g_fg_pd_last = d;   // draws since the last present (the replay thread counts them)
     if (!on) return 0;
     uint64_t f = atomic_load(&g_cur_frame);
     if (n >= FG_MENU_DRAWS) {
         g_fg_low = 0; if (g_fg_armed < FG_MENU_ARM && ++g_fg_armed == FG_MENU_ARM) MLOG("frame generation: menu pause armed at frame %llu (30 s of play)", (unsigned long long)f);
         if (g_fg_paused && ++g_fg_high >= FG_MENU_OUT) { g_fg_paused = 0; g_fg_high = 0; if (g_fg_pauses <= 200) MLOG("frame generation: resumed at frame %llu (%llu draws a frame)", (unsigned long long)f, (unsigned long long)n); }
+    } else if (dm_movie_hz()) {
+        // A movie (hle_movie.c dm_movie_hz) is drawn in a few draws, yet it is no menu: Ocarina of Time's sage cutscenes are 60-picture AV1 movies whose enhancement network
+        // took 23-24 ms of GPU a frame at thermal state 2 (iPhone Duo, 2026-11-28), so the step held 3 ticks and, paused as a menu, the movie showed at 40 fps. It keeps its
+        // generated frames, as the opening movie did before the pause was armed; it does not arm the pause (the title screen keeps its generated frames)
+        g_fg_low = 0;
+        if (g_fg_paused && ++g_fg_high >= FG_MENU_OUT) { g_fg_paused = 0; g_fg_high = 0; if (g_fg_pauses <= 200) MLOG("frame generation: resumed at frame %llu (a movie of %d pictures a second)", (unsigned long long)f, dm_movie_hz()); }
     } else {
         g_fg_high = 0;
         if (!g_fg_paused && g_fg_armed >= FG_MENU_ARM && ++g_fg_low >= FG_MENU_IN) { g_fg_paused = 1; g_fg_low = 0; if (++g_fg_pauses <= 200) MLOG("frame generation: paused at frame %llu, a menu (%llu draws a frame); pause %llu", (unsigned long long)f, (unsigned long long)n, (unsigned long long)g_fg_pauses); }
